@@ -1,0 +1,47 @@
+mod app;
+mod capture;
+mod config;
+mod hotkey;
+mod logging;
+mod output;
+mod overlay;
+mod tray;
+
+use anyhow::Result;
+use std::env;
+use tracing::info;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupMode {
+    Run,
+    CaptureTest,
+    OverlayTest,
+}
+
+fn main() -> Result<()> {
+    let startup_mode = parse_startup_mode(env::args().nth(1).as_deref());
+    let (config, paths) = config::load_or_create()?;
+    let _logging_guard = logging::init(&paths.log_dir)?;
+
+    info!(?startup_mode, "OpenCapt starting");
+
+    match startup_mode {
+        StartupMode::CaptureTest => {
+            let image = capture::capture_current_monitor_region(None)?;
+            let result = output::process_capture(image, &config)?;
+            info!(path = ?result.saved_path, "capture-test completed");
+            Ok(())
+        }
+        StartupMode::Run | StartupMode::OverlayTest => {
+            app::run(config, paths, startup_mode);
+        }
+    }
+}
+
+fn parse_startup_mode(arg: Option<&str>) -> StartupMode {
+    match arg {
+        Some("capture-test") => StartupMode::CaptureTest,
+        Some("overlay-test") => StartupMode::OverlayTest,
+        _ => StartupMode::Run,
+    }
+}
