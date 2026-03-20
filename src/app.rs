@@ -30,6 +30,7 @@ pub(crate) enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     TrayMenu(MenuEvent),
     Overlay(OverlaySignal),
+    AnnotationPresented,
     Annotation(annotate::EditorOutcome),
 }
 
@@ -69,8 +70,6 @@ struct App {
     overlay: Option<OverlaySession>,
     editor: Option<annotate::PersistentEditorClient>,
     pending_target: Option<capture::CaptureTarget>,
-    pending_annotation_fallback: Option<image::RgbaImage>,
-    pending_annotation_temp_dir: Option<std::path::PathBuf>,
     overlay_requested_on_startup: bool,
 }
 
@@ -92,8 +91,6 @@ impl App {
             overlay: None,
             editor: None,
             pending_target: None,
-            pending_annotation_fallback: None,
-            pending_annotation_temp_dir: None,
             overlay_requested_on_startup: matches!(startup_mode, StartupMode::OverlayTest),
         }
     }
@@ -112,6 +109,7 @@ impl App {
                 self.handle_tray_menu_event(control_flow, event)
             }
             Event::UserEvent(UserEvent::Overlay(signal)) => self.handle_overlay_signal(signal),
+            Event::UserEvent(UserEvent::AnnotationPresented) => self.handle_annotation_presented(),
             Event::UserEvent(UserEvent::Annotation(result)) => {
                 self.handle_annotation_result(result)
             }
@@ -163,8 +161,15 @@ impl App {
             Ok((editor, outcome_rx)) => {
                 let proxy = self.event_proxy.clone();
                 std::thread::spawn(move || {
-                    while let Ok(outcome) = outcome_rx.recv() {
-                        let _ = proxy.send_event(UserEvent::Annotation(outcome));
+                    while let Ok(event) = outcome_rx.recv() {
+                        let _ = match event {
+                            annotate::EditorEvent::Presented => {
+                                proxy.send_event(UserEvent::AnnotationPresented)
+                            }
+                            annotate::EditorEvent::Outcome(outcome) => {
+                                proxy.send_event(UserEvent::Annotation(outcome))
+                            }
+                        };
                     }
                 });
                 self.editor = Some(editor);
@@ -236,6 +241,7 @@ impl App {
                 }
             }
             TrayAction::Exit => {
+                self.hide_overlay();
                 self.shutdown_editor();
                 self.state = AppState::Exiting;
                 *control_flow = ControlFlow::Exit;
@@ -305,34 +311,29 @@ impl App {
                     return;
                 };
 
-                match capture::capture_region(&target, rect) {
-                    Ok(fallback_image) => {
-                        let placement = annotate::EditorPlacement {
-                            screen_x: target.origin_x + rect.x,
-                            screen_y: target.origin_y + rect.y,
-                            monitor_x: target.origin_x,
-                            monitor_y: target.origin_y,
-                            monitor_width: target.width,
-                            monitor_height: target.height,
-                            selection_width: rect.width,
-                            selection_height: rect.height,
-                            scale_milli: (target.scale_factor * 1000.0).round() as u32,
-                        };
-                        if let Err(error) = self.launch_annotation(
-                            target.background.clone(),
-                            placement,
-                            fallback_image.clone(),
-                        ) {
-                            error!(
-                                ?error,
-                                "failed to launch annotation editor; falling back to direct output"
-                            );
-                            self.finish_capture(fallback_image);
+                let placement = annotate::EditorPlacement {
+                    screen_x: target.origin_x + rect.x,
+                    screen_y: target.origin_y + rect.y,
+                    monitor_x: target.origin_x,
+                    monitor_y: target.origin_y,
+                    monitor_width: target.width,
+                    monitor_height: target.height,
+                    selection_width: rect.width,
+                    selection_height: rect.height,
+                    scale_milli: (target.scale_factor * 1000.0).round() as u32,
+                };
+                if let Err(error) = self.launch_annotation(target.background.clone(), placement) {
+                    self.hide_overlay();
+                    error!(
+                        ?error,
+                        "failed to launch annotation editor; falling back to direct output"
+                    );
+                    match capture::capture_region(&target, rect) {
+                        Ok(image) => self.finish_capture(image),
+                        Err(capture_error) => {
+                            error!(?capture_error, "failed to capture selected region after editor launch failure");
+                            self.state = AppState::Idle;
                         }
-                    }
-                    Err(error) => {
-                        error!(?error, "failed to capture selected region");
-                        self.state = AppState::Idle;
                     }
                 }
             }
@@ -343,7 +344,6 @@ impl App {
         &mut self,
         monitor_image: image::RgbaImage,
         placement: annotate::EditorPlacement,
-        fallback_image: image::RgbaImage,
     ) -> anyhow::Result<()> {
         if self.editor.is_none() {
             self.prewarm_editor();
@@ -353,49 +353,37 @@ impl App {
             .editor
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("persistent annotation editor unavailable"))?;
-        let temp_dir = editor.request_edit(&monitor_image, placement)?;
-        self.pending_annotation_fallback = Some(fallback_image);
-        self.pending_annotation_temp_dir = Some(temp_dir);
+        editor.request_edit(&monitor_image, placement)?;
         self.state = AppState::Annotating;
         info!("annotation editor requested");
         Ok(())
     }
 
+    fn handle_annotation_presented(&mut self) {
+        self.hide_overlay();
+    }
+
     fn handle_annotation_result(&mut self, result: annotate::EditorOutcome) {
+        self.hide_overlay();
         match result {
-            annotate::EditorOutcome::Confirmed {
-                output_path,
-                temp_dir,
-            } => {
-                self.pending_annotation_fallback = None;
-                self.pending_annotation_temp_dir = None;
-                match annotate::load_output_image(&output_path) {
-                    Ok(image) => self.finish_capture(image),
-                    Err(error) => {
-                        error!(?error, output = ?output_path, "failed to load annotated output")
-                    }
-                }
-                annotate::cleanup_temp_dir(&temp_dir);
+            annotate::EditorOutcome::Confirmed { image } => {
+                self.finish_capture(image);
                 self.state = AppState::Idle;
             }
-            annotate::EditorOutcome::Cancelled { temp_dir } => {
-                self.pending_annotation_fallback = None;
-                self.pending_annotation_temp_dir = None;
+            annotate::EditorOutcome::Cancelled => {
                 info!("annotation cancelled");
-                annotate::cleanup_temp_dir(&temp_dir);
                 self.state = AppState::Idle;
             }
-            annotate::EditorOutcome::Failed { message, temp_dir } => {
+            annotate::EditorOutcome::Failed { message } => {
                 error!(message = %message, "annotation editor failed");
-                if let Some(image) = self.pending_annotation_fallback.take() {
-                    self.finish_capture(image);
-                }
-                let cleanup_dir = temp_dir.or_else(|| self.pending_annotation_temp_dir.take());
-                if let Some(temp_dir) = cleanup_dir {
-                    annotate::cleanup_temp_dir(&temp_dir);
-                }
                 self.state = AppState::Idle;
             }
+        }
+    }
+
+    fn hide_overlay(&mut self) {
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.hide();
         }
     }
 

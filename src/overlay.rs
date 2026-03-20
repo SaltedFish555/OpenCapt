@@ -69,6 +69,7 @@ struct OverlayState {
     surface: LayeredSurface,
     drag_start: Option<CursorPoint>,
     drag_current: Option<CursorPoint>,
+    frozen_selection: Option<SelectionRect>,
     last_cursor: CursorPoint,
 }
 
@@ -97,6 +98,7 @@ impl OverlaySession {
             target,
             drag_start: None,
             drag_current: None,
+            frozen_selection: None,
             last_cursor: CursorPoint { x: 0, y: 0 },
         });
 
@@ -131,6 +133,7 @@ impl OverlaySession {
         state.target = target;
         state.drag_start = None;
         state.drag_current = None;
+        state.frozen_selection = None;
         state
             .surface
             .resize(state.target.width as i32, state.target.height as i32)?;
@@ -168,6 +171,17 @@ impl OverlaySession {
             let _ = SetFocus(Some(hwnd));
         }
         Ok(())
+    }
+
+    pub fn hide(&mut self) {
+        let state = self.state_mut();
+        state.drag_start = None;
+        state.drag_current = None;
+        state.frozen_selection = None;
+        unsafe {
+            let _ = ReleaseCapture();
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
     }
 
     fn state_mut(&mut self) -> &mut OverlayState {
@@ -339,6 +353,9 @@ unsafe extern "system" fn overlay_wndproc(
         WM_ERASEBKGND => LRESULT(1),
         WM_MOUSEMOVE => {
             if let Some(state) = overlay_state(hwnd) {
+                if state.frozen_selection.is_some() {
+                    return LRESULT(0);
+                }
                 let point = point_from_lparam(lparam).clamp(
                     state.target.width.saturating_sub(1) as i32,
                     state.target.height.saturating_sub(1) as i32,
@@ -353,6 +370,9 @@ unsafe extern "system" fn overlay_wndproc(
         }
         WM_LBUTTONDOWN => {
             if let Some(state) = overlay_state(hwnd) {
+                if state.frozen_selection.is_some() {
+                    return LRESULT(0);
+                }
                 let point = point_from_lparam(lparam).clamp(
                     state.target.width.saturating_sub(1) as i32,
                     state.target.height.saturating_sub(1) as i32,
@@ -369,6 +389,9 @@ unsafe extern "system" fn overlay_wndproc(
         }
         WM_LBUTTONUP => {
             if let Some(state) = overlay_state(hwnd) {
+                if state.frozen_selection.is_some() {
+                    return LRESULT(0);
+                }
                 let point = point_from_lparam(lparam).clamp(
                     state.target.width.saturating_sub(1) as i32,
                     state.target.height.saturating_sub(1) as i32,
@@ -378,26 +401,38 @@ unsafe extern "system" fn overlay_wndproc(
                 unsafe {
                     let _ = ReleaseCapture();
                 }
-                let outcome = match (state.drag_start, state.drag_current) {
-                    (Some(start), Some(end)) => SelectionRect::from_points(start, end)
-                        .map(OverlaySignal::Confirmed)
-                        .unwrap_or(OverlaySignal::Cancelled),
-                    _ => OverlaySignal::Cancelled,
+                let selection = match (state.drag_start, state.drag_current) {
+                    (Some(start), Some(end)) => SelectionRect::from_points(start, end),
+                    _ => None,
                 };
                 state.drag_start = None;
                 state.drag_current = None;
-                unsafe {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
+                match selection {
+                    Some(rect) => {
+                        state.frozen_selection = Some(rect);
+                        let _ = render_overlay(hwnd, state);
+                        (state.emitter)(OverlaySignal::Confirmed(rect));
+                    }
+                    None => {
+                        state.frozen_selection = None;
+                        unsafe {
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                        }
+                        (state.emitter)(OverlaySignal::Cancelled);
+                    }
                 }
-                (state.emitter)(outcome);
             }
             LRESULT(0)
         }
         WM_KEYDOWN => {
             if wparam.0 as u32 == u32::from(VK_ESCAPE.0) {
                 if let Some(state) = overlay_state(hwnd) {
+                    if state.frozen_selection.is_some() {
+                        return LRESULT(0);
+                    }
                     state.drag_start = None;
                     state.drag_current = None;
+                    state.frozen_selection = None;
                     unsafe {
                         let _ = ReleaseCapture();
                         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -441,10 +476,10 @@ fn register_overlay_class() -> Result<()> {
 }
 
 fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
-    let selection = match (state.drag_start, state.drag_current) {
+    let selection = state.frozen_selection.or_else(|| match (state.drag_start, state.drag_current) {
         (Some(start), Some(end)) => SelectionRect::from_points(start, end),
         _ => None,
-    };
+    });
 
     compose_preview_frame(
         &state.target.base_frame,
