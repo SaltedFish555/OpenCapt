@@ -4,7 +4,7 @@ use eframe::egui::{
     Frame, Id, Key, Layout, Margin, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke,
     StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportCommand,
 };
-use image::RgbaImage;
+use image::{RgbaImage, imageops};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -46,6 +46,7 @@ const TOOLBAR_GAP: f32 = 10.0;
 const CANVAS_FRAME_PADDING: f32 = 2.0;
 const RESIZE_HANDLE_RADIUS: f32 = 4.0;
 const RESIZE_HANDLE_HIT_RADIUS: f32 = 9.0;
+const SELECTION_BORDER_HIT_WIDTH: f32 = 8.0;
 const MIN_RESIZE_SIDE: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,8 @@ pub struct EditorPlacement {
     pub monitor_y: i32,
     pub monitor_width: u32,
     pub monitor_height: u32,
+    pub selection_width: u32,
+    pub selection_height: u32,
     pub scale_milli: u32,
 }
 
@@ -90,6 +93,7 @@ pub enum EditorOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnotationTool {
+    Select,
     Rectangle,
     Arrow,
 }
@@ -140,9 +144,7 @@ struct NormalizedRect {
 struct InlineLayout {
     window_pos: Pos2,
     window_size: Vec2,
-    image_frame_rect: Rect,
     image_rect: Rect,
-    toolbar_rect: Rect,
     pixels_per_point: f32,
 }
 
@@ -174,16 +176,32 @@ struct ResizeDrag {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionMoveDrag {
+    anchor: ImagePoint,
+    original_rect: NormalizedRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionResizeDrag {
+    handle: ResizeHandle,
+    original_rect: NormalizedRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanvasHoverAction {
-    Resize(ResizeHandle),
+    ResizeSelection(ResizeHandle),
+    MoveSelection,
+    ResizeShape(ResizeHandle),
     MoveShape(usize),
 }
 
 impl CanvasHoverAction {
     fn cursor_icon(self) -> CursorIcon {
         match self {
-            CanvasHoverAction::Resize(handle) => handle.cursor_icon(),
-            CanvasHoverAction::MoveShape(_) => CursorIcon::Grab,
+            CanvasHoverAction::ResizeSelection(handle) | CanvasHoverAction::ResizeShape(handle) => {
+                handle.cursor_icon()
+            }
+            CanvasHoverAction::MoveSelection | CanvasHoverAction::MoveShape(_) => CursorIcon::Grab,
         }
     }
 }
@@ -196,10 +214,13 @@ struct AnnotationEditorApp {
     color_index: usize,
     stroke_index: usize,
     shapes: Vec<AnnotationShape>,
+    selection: NormalizedRect,
     draft: Option<DraftShape>,
     selected_shape: Option<usize>,
     move_drag: Option<MoveDrag>,
     resize_drag: Option<ResizeDrag>,
+    selection_move_drag: Option<SelectionMoveDrag>,
+    selection_resize_drag: Option<SelectionResizeDrag>,
     hover_action: Option<CanvasHoverAction>,
     image_rect: Option<Rect>,
     inline_layout: Option<InlineLayout>,
@@ -215,6 +236,8 @@ impl AnnotateCli {
         let mut monitor_y = None;
         let mut monitor_width = None;
         let mut monitor_height = None;
+        let mut selection_width = None;
+        let mut selection_height = None;
         let mut scale_milli = None;
 
         while let Some(arg) = args.next() {
@@ -230,6 +253,12 @@ impl AnnotateCli {
                 }
                 "--monitor-height" => {
                     monitor_height = Some(parse_u32_arg("--monitor-height", args.next())?)
+                }
+                "--selection-width" => {
+                    selection_width = Some(parse_u32_arg("--selection-width", args.next())?)
+                }
+                "--selection-height" => {
+                    selection_height = Some(parse_u32_arg("--selection-height", args.next())?)
                 }
                 "--scale-milli" => scale_milli = Some(parse_u32_arg("--scale-milli", args.next())?),
                 other => {
@@ -247,9 +276,11 @@ impl AnnotateCli {
             monitor_y,
             monitor_width,
             monitor_height,
+            selection_width,
+            selection_height,
             scale_milli,
         ) {
-            (None, None, None, None, None, None, None) => None,
+            (None, None, None, None, None, None, None, None, None) => None,
             (
                 Some(screen_x),
                 Some(screen_y),
@@ -257,6 +288,8 @@ impl AnnotateCli {
                 Some(monitor_y),
                 Some(monitor_width),
                 Some(monitor_height),
+                Some(selection_width),
+                Some(selection_height),
                 Some(scale_milli),
             ) => Some(EditorPlacement {
                 screen_x,
@@ -265,6 +298,8 @@ impl AnnotateCli {
                 monitor_y,
                 monitor_width,
                 monitor_height,
+                selection_width,
+                selection_height,
                 scale_milli,
             }),
             _ => {
@@ -339,6 +374,10 @@ pub fn spawn_editor(image: &RgbaImage, placement: EditorPlacement) -> Result<Edi
         .arg(placement.monitor_width.to_string())
         .arg("--monitor-height")
         .arg(placement.monitor_height.to_string())
+        .arg("--selection-width")
+        .arg(placement.selection_width.to_string())
+        .arg("--selection-height")
+        .arg(placement.selection_height.to_string())
         .arg("--scale-milli")
         .arg(placement.scale_milli.to_string());
     #[cfg(windows)]
@@ -388,6 +427,10 @@ pub fn run(cli: AnnotateCli) -> Result<()> {
     let inline_layout = cli
         .placement
         .map(|placement| build_inline_layout(&image, placement));
+    let initial_selection = cli
+        .placement
+        .map(|placement| selection_rect_from_placement(&image, placement))
+        .unwrap_or_else(|| full_image_selection(&image));
     let viewport = if let Some(layout) = inline_layout {
         ViewportBuilder::default()
             .with_title("OpenCapt Annotate")
@@ -427,6 +470,7 @@ pub fn run(cli: AnnotateCli) -> Result<()> {
                 image.clone(),
                 output_path.clone(),
                 inline_layout,
+                initial_selection,
             )))
         }),
     )
@@ -493,79 +537,48 @@ fn snap_rect(rect: Rect, pixels_per_point: f32) -> Rect {
         snap_pos(rect.max, pixels_per_point),
     )
 }
-fn toolbar_size_for_content_width(content_width: f32) -> Vec2 {
-    Vec2::new(
-        content_width.clamp(TOOLBAR_MIN_WIDTH, TOOLBAR_IDEAL_WIDTH),
-        TOOLBAR_HEIGHT,
-    )
+fn selection_rect_from_placement(image: &RgbaImage, placement: EditorPlacement) -> NormalizedRect {
+    let max_x = image.width().saturating_sub(1) as i32;
+    let max_y = image.height().saturating_sub(1) as i32;
+    let left =
+        (placement.screen_x - placement.monitor_x).clamp(0, max_x.saturating_sub(MIN_RESIZE_SIDE));
+    let top =
+        (placement.screen_y - placement.monitor_y).clamp(0, max_y.saturating_sub(MIN_RESIZE_SIDE));
+    let width = placement.selection_width.max(MIN_RESIZE_SIDE as u32) as i32;
+    let height = placement.selection_height.max(MIN_RESIZE_SIDE as u32) as i32;
+    let right = (left + width).clamp(left + MIN_RESIZE_SIDE, max_x);
+    let bottom = (top + height).clamp(top + MIN_RESIZE_SIDE, max_y);
+    NormalizedRect {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+fn full_image_selection(image: &RgbaImage) -> NormalizedRect {
+    NormalizedRect {
+        left: 0,
+        top: 0,
+        right: image.width().saturating_sub(1) as i32,
+        bottom: image.height().saturating_sub(1) as i32,
+    }
 }
 
 fn build_inline_layout(image: &RgbaImage, placement: EditorPlacement) -> InlineLayout {
     let pixels_per_point = placement.scale_factor();
     let scale = pixels_per_point;
-    let image_size = Vec2::new(image.width() as f32 / scale, image.height() as f32 / scale);
-    let image_frame_size = image_size + Vec2::splat(CANVAS_FRAME_PADDING * 2.0);
-    let outer_padding = 8.0;
-    let content_width = image_frame_size.x.max(220.0);
-    let toolbar_size = toolbar_size_for_content_width(content_width);
-    let full_content_width = image_frame_size.x.max(toolbar_size.x);
-    let image_frame_x = outer_padding + (full_content_width - image_frame_size.x) * 0.5;
-    let toolbar_x = outer_padding + (full_content_width - toolbar_size.x) * 0.5;
-
-    let monitor_left = placement.monitor_x as f32 / scale;
-    let monitor_top = placement.monitor_y as f32 / scale;
-    let monitor_right = (placement.monitor_x as f32 + placement.monitor_width as f32) / scale;
-    let monitor_bottom = (placement.monitor_y as f32 + placement.monitor_height as f32) / scale;
-    let selection_top = placement.screen_y as f32 / scale;
-    let selection_bottom = (placement.screen_y as f32 + image.height() as f32) / scale;
-    let below_fits =
-        selection_bottom + toolbar_size.y + TOOLBAR_GAP + outer_padding <= monitor_bottom;
-    let toolbar_above =
-        !below_fits && selection_top - toolbar_size.y - TOOLBAR_GAP - outer_padding >= monitor_top;
-
-    let (toolbar_y, image_frame_y) = if toolbar_above {
-        (outer_padding, outer_padding + toolbar_size.y + TOOLBAR_GAP)
-    } else {
-        (
-            outer_padding + image_frame_size.y + TOOLBAR_GAP,
-            outer_padding,
-        )
-    };
-
-    let image_frame_rect =
-        Rect::from_min_size(Pos2::new(image_frame_x, image_frame_y), image_frame_size);
-    let image_rect = Rect::from_min_size(
-        image_frame_rect.min + Vec2::splat(CANVAS_FRAME_PADDING),
-        image_size,
+    let window_pos = Pos2::new(
+        placement.monitor_x as f32 / scale,
+        placement.monitor_y as f32 / scale,
     );
-    let toolbar_rect = Rect::from_min_size(Pos2::new(toolbar_x, toolbar_y), toolbar_size);
-    let window_size = Vec2::new(
-        full_content_width + outer_padding * 2.0,
-        image_frame_size.y + toolbar_size.y + TOOLBAR_GAP + outer_padding * 2.0,
-    );
-    let selection_origin = Pos2::new(
-        placement.screen_x as f32 / scale,
-        placement.screen_y as f32 / scale,
-    );
-    let desired_window_pos = selection_origin - image_rect.min.to_vec2();
-    let clamped_window_pos = Pos2::new(
-        desired_window_pos.x.clamp(
-            monitor_left,
-            (monitor_right - window_size.x).max(monitor_left),
-        ),
-        desired_window_pos.y.clamp(
-            monitor_top,
-            (monitor_bottom - window_size.y).max(monitor_top),
-        ),
-    );
-    let content_shift = desired_window_pos - clamped_window_pos;
+    let window_size = Vec2::new(image.width() as f32 / scale, image.height() as f32 / scale);
+    let image_rect = Rect::from_min_size(Pos2::ZERO, window_size);
 
     InlineLayout {
-        window_pos: snap_pos(clamped_window_pos, pixels_per_point),
+        window_pos: snap_pos(window_pos, pixels_per_point),
         window_size: snap_vec(window_size, pixels_per_point),
-        image_frame_rect: snap_rect(image_frame_rect.translate(content_shift), pixels_per_point),
-        image_rect: snap_rect(image_rect.translate(content_shift), pixels_per_point),
-        toolbar_rect: snap_rect(toolbar_rect.translate(content_shift), pixels_per_point),
+        image_rect: snap_rect(image_rect, pixels_per_point),
         pixels_per_point,
     }
 }
@@ -576,6 +589,7 @@ impl AnnotationEditorApp {
         image: RgbaImage,
         output_path: PathBuf,
         inline_layout: Option<InlineLayout>,
+        selection: NormalizedRect,
     ) -> Self {
         configure_theme(&ctx, inline_layout.is_some());
         if let Some(layout) = inline_layout {
@@ -585,14 +599,17 @@ impl AnnotationEditorApp {
             image,
             output_path,
             texture: None,
-            tool: AnnotationTool::Rectangle,
+            tool: AnnotationTool::Select,
             color_index: 0,
             stroke_index: 1,
             shapes: Vec::new(),
+            selection,
             draft: None,
             selected_shape: None,
             move_drag: None,
             resize_drag: None,
+            selection_move_drag: None,
+            selection_resize_drag: None,
             hover_action: None,
             image_rect: inline_layout.map(|layout| layout.image_rect),
             inline_layout,
@@ -615,6 +632,9 @@ impl AnnotationEditorApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &EguiContext) {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::V)) {
+            self.tool = AnnotationTool::Select;
+        }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::R)) {
             self.tool = AnnotationTool::Rectangle;
         }
@@ -672,29 +692,41 @@ impl AnnotationEditorApp {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
-    fn show_toolbar(&mut self, ctx: &EguiContext, anchor: Rect) {
-        let toolbar_rect = if let Some(layout) = self.inline_layout {
-            layout.toolbar_rect
-        } else {
-            let screen_rect = ctx.content_rect();
-            let max_width = (screen_rect.width() - WINDOW_PADDING * 2.0).max(TOOLBAR_MIN_WIDTH);
-            let toolbar_width = max_width.clamp(TOOLBAR_MIN_WIDTH, TOOLBAR_IDEAL_WIDTH);
-            let toolbar_x = (anchor.center().x - toolbar_width * 0.5).clamp(
-                screen_rect.left() + WINDOW_PADDING,
-                screen_rect.right() - WINDOW_PADDING - toolbar_width,
-            );
-            let below_y = anchor.bottom() + TOOLBAR_GAP;
-            let toolbar_y = if below_y + TOOLBAR_HEIGHT <= screen_rect.bottom() - WINDOW_PADDING {
-                below_y
-            } else {
-                (anchor.top() - TOOLBAR_HEIGHT - TOOLBAR_GAP)
-                    .max(screen_rect.top() + WINDOW_PADDING)
-            };
-            Rect::from_min_size(
-                Pos2::new(toolbar_x, toolbar_y),
-                Vec2::new(toolbar_width, TOOLBAR_HEIGHT),
+    fn toolbar_anchor_rect(&self) -> Option<Rect> {
+        let image_rect = self.image_rect?;
+        if self.inline_layout.is_some() {
+            Some(
+                self.selection_preview_rect(image_rect)
+                    .expand(CANVAS_FRAME_PADDING),
             )
+        } else {
+            Some(image_rect.expand(CANVAS_FRAME_PADDING))
+        }
+    }
+
+    fn show_toolbar(&mut self, ctx: &EguiContext, anchor: Rect) {
+        let screen_rect = ctx.content_rect();
+        let available_width = (screen_rect.width() - WINDOW_PADDING * 2.0).max(220.0);
+        let min_width = TOOLBAR_MIN_WIDTH.min(available_width);
+        let ideal_width = TOOLBAR_IDEAL_WIDTH.min(available_width);
+        let toolbar_width = anchor.width().clamp(min_width, ideal_width);
+        let toolbar_x = (anchor.center().x - toolbar_width * 0.5).clamp(
+            screen_rect.left() + WINDOW_PADDING.min(screen_rect.width() * 0.25),
+            screen_rect.right() - toolbar_width - WINDOW_PADDING.min(screen_rect.width() * 0.25),
+        );
+        let below_y = anchor.bottom() + TOOLBAR_GAP;
+        let toolbar_y = if below_y + TOOLBAR_HEIGHT
+            <= screen_rect.bottom() - WINDOW_PADDING.min(screen_rect.height() * 0.2)
+        {
+            below_y
+        } else {
+            (anchor.top() - TOOLBAR_HEIGHT - TOOLBAR_GAP)
+                .max(screen_rect.top() + WINDOW_PADDING.min(screen_rect.height() * 0.2))
         };
+        let toolbar_rect = Rect::from_min_size(
+            Pos2::new(toolbar_x, toolbar_y),
+            Vec2::new(toolbar_width, TOOLBAR_HEIGHT),
+        );
 
         egui::Area::new(Id::new("annotate-toolbar"))
             .order(egui::Order::Foreground)
@@ -719,6 +751,14 @@ impl AnnotationEditorApp {
                         ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
                         ui.horizontal_centered(|ui| {
                             toolbar_group(ui, |ui| {
+                                glyph_button(
+                                    ui,
+                                    ToolbarGlyph::Select,
+                                    self.tool == AnnotationTool::Select,
+                                    None,
+                                    false,
+                                    || self.tool = AnnotationTool::Select,
+                                );
                                 glyph_button(
                                     ui,
                                     ToolbarGlyph::Rectangle,
@@ -785,9 +825,10 @@ impl AnnotationEditorApp {
                     });
             });
     }
+
     fn show_canvas(&mut self, ui: &mut Ui) {
-        let (image_frame, image_rect) = if let Some(layout) = self.inline_layout {
-            (layout.image_frame_rect, layout.image_rect)
+        let image_rect = if let Some(layout) = self.inline_layout {
+            layout.image_rect
         } else {
             let max_rect = ui.max_rect();
             let canvas_rect = max_rect.shrink2(Vec2::new(WINDOW_PADDING, WINDOW_PADDING));
@@ -803,26 +844,21 @@ impl AnnotationEditorApp {
                 self.image.width() as f32 * scale,
                 self.image.height() as f32 * scale,
             );
-            let image_frame = Rect::from_center_size(
+            Rect::from_center_size(
                 Pos2::new(
                     canvas_rect.center().x,
                     canvas_rect.top() + image_size.y * 0.5 + 18.0,
                 ),
-                image_size + Vec2::splat(CANVAS_FRAME_PADDING * 2.0),
-            );
-            let image_rect = Rect::from_center_size(image_frame.center(), image_size);
-            (image_frame, image_rect)
+                image_size,
+            )
         };
         self.image_rect = Some(image_rect);
 
-        if self.inline_layout.is_some() {
-            ui.painter().rect_stroke(
-                image_rect.expand(1.0),
-                egui::CornerRadius::same(3),
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(22, 30, 40, 200)),
-                StrokeKind::Outside,
+        if self.inline_layout.is_none() {
+            let image_frame = Rect::from_center_size(
+                image_rect.center(),
+                image_rect.size() + Vec2::splat(CANVAS_FRAME_PADDING * 2.0),
             );
-        } else {
             paint_shadow(
                 ui.painter(),
                 image_frame.translate(Vec2::new(0.0, 12.0)),
@@ -839,6 +875,7 @@ impl AnnotationEditorApp {
             );
             paint_corner_accents(ui.painter(), image_frame, Color32::from_rgb(74, 88, 110));
         }
+
         let texture_id = self.texture(ui.ctx()).id();
         ui.painter().image(
             texture_id,
@@ -861,12 +898,18 @@ impl AnnotationEditorApp {
         }
         self.handle_canvas_interaction(&response);
         self.paint_shapes(ui.painter(), image_rect);
+        if self.inline_layout.is_some() {
+            self.paint_selection_mask(ui.painter(), image_rect);
+            self.paint_selection_preview(ui.painter(), image_rect);
+        }
     }
+
     fn handle_canvas_interaction(&mut self, response: &egui::Response) {
         if response.clicked_by(PointerButton::Primary) {
             if let Some(position) = response.interact_pointer_pos() {
                 self.selected_shape = self
                     .screen_to_image(position)
+                    .filter(|point| self.point_in_selection(*point))
                     .and_then(|image_point| self.shape_at(image_point));
             } else {
                 self.selected_shape = None;
@@ -876,7 +919,31 @@ impl AnnotationEditorApp {
             if let Some(position) = response.interact_pointer_pos() {
                 if let Some(action) = self.hover_action.or_else(|| self.hover_action_at(position)) {
                     match action {
-                        CanvasHoverAction::Resize(handle) => {
+                        CanvasHoverAction::ResizeSelection(handle) => {
+                            self.selection_resize_drag = Some(SelectionResizeDrag {
+                                handle,
+                                original_rect: self.selection,
+                            });
+                            self.selection_move_drag = None;
+                            self.move_drag = None;
+                            self.resize_drag = None;
+                            self.draft = None;
+                            return;
+                        }
+                        CanvasHoverAction::MoveSelection => {
+                            if let Some(image_point) = self.screen_to_image_clamped(position) {
+                                self.selection_move_drag = Some(SelectionMoveDrag {
+                                    anchor: image_point,
+                                    original_rect: self.selection,
+                                });
+                                self.selection_resize_drag = None;
+                                self.move_drag = None;
+                                self.resize_drag = None;
+                                self.draft = None;
+                                return;
+                            }
+                        }
+                        CanvasHoverAction::ResizeShape(handle) => {
                             if let Some((shape_index, rect, style)) =
                                 self.selected_rectangle_for_editing()
                             {
@@ -886,13 +953,17 @@ impl AnnotationEditorApp {
                                     original_rect: rect,
                                     style,
                                 });
+                                self.selection_move_drag = None;
+                                self.selection_resize_drag = None;
                                 self.move_drag = None;
                                 self.draft = None;
                                 return;
                             }
                         }
                         CanvasHoverAction::MoveShape(shape_index) => {
-                            if let Some(image_point) = self.screen_to_image(position) {
+                            if let Some(image_point) =
+                                self.screen_to_selection_image_clamped(position)
+                            {
                                 self.selected_shape = Some(shape_index);
                                 self.move_drag =
                                     self.shapes.get(shape_index).copied().map(|shape| MoveDrag {
@@ -900,6 +971,8 @@ impl AnnotationEditorApp {
                                         anchor: image_point,
                                         original: shape,
                                     });
+                                self.selection_move_drag = None;
+                                self.selection_resize_drag = None;
                                 self.resize_drag = None;
                                 self.draft = None;
                                 return;
@@ -907,32 +980,46 @@ impl AnnotationEditorApp {
                         }
                     }
                 }
-                if let Some(image_point) = self.screen_to_image(position) {
-                    if self.shape_at(image_point).is_none() {
-                        self.selected_shape = None;
-                        self.move_drag = None;
-                        self.resize_drag = None;
-                        self.draft = Some(DraftShape {
-                            tool: self.tool,
-                            start: image_point,
-                            current: image_point,
-                            style: self.current_style(),
-                        });
+                if self.tool != AnnotationTool::Select {
+                    if let Some(image_point) = self.screen_to_image(position) {
+                        if self.point_in_selection(image_point)
+                            && self.shape_at(image_point).is_none()
+                        {
+                            self.selected_shape = None;
+                            self.move_drag = None;
+                            self.resize_drag = None;
+                            self.selection_move_drag = None;
+                            self.selection_resize_drag = None;
+                            self.draft = Some(DraftShape {
+                                tool: self.tool,
+                                start: image_point,
+                                current: image_point,
+                                style: self.current_style(),
+                            });
+                        }
                     }
                 }
             }
         }
         if response.dragged_by(PointerButton::Primary) {
             if let Some(position) = response.interact_pointer_pos() {
-                if self.resize_drag.is_some() {
+                if self.selection_resize_drag.is_some() {
                     if let Some(image_point) = self.screen_to_image_clamped(position) {
+                        self.update_selection_resizing(image_point);
+                    }
+                } else if self.selection_move_drag.is_some() {
+                    if let Some(image_point) = self.screen_to_image_clamped(position) {
+                        self.update_selection_moving(image_point);
+                    }
+                } else if self.resize_drag.is_some() {
+                    if let Some(image_point) = self.screen_to_selection_image_clamped(position) {
                         self.update_resizing_shape(image_point);
                     }
                 } else if self.move_drag.is_some() {
-                    if let Some(image_point) = self.screen_to_image_clamped(position) {
+                    if let Some(image_point) = self.screen_to_selection_image_clamped(position) {
                         self.update_moving_shape(image_point);
                     }
-                } else if let Some(image_point) = self.screen_to_image_clamped(position) {
+                } else if let Some(image_point) = self.screen_to_selection_image_clamped(position) {
                     if let Some(draft) = self.draft.as_mut() {
                         draft.current = image_point;
                     }
@@ -941,23 +1028,33 @@ impl AnnotationEditorApp {
         }
         if response.drag_stopped_by(PointerButton::Primary) {
             if let Some(position) = response.interact_pointer_pos() {
-                if self.resize_drag.is_some() {
+                if self.selection_resize_drag.is_some() {
                     if let Some(image_point) = self.screen_to_image_clamped(position) {
+                        self.update_selection_resizing(image_point);
+                    }
+                } else if self.selection_move_drag.is_some() {
+                    if let Some(image_point) = self.screen_to_image_clamped(position) {
+                        self.update_selection_moving(image_point);
+                    }
+                } else if self.resize_drag.is_some() {
+                    if let Some(image_point) = self.screen_to_selection_image_clamped(position) {
                         self.update_resizing_shape(image_point);
                     }
                 } else if self.move_drag.is_some() {
-                    if let Some(image_point) = self.screen_to_image_clamped(position) {
+                    if let Some(image_point) = self.screen_to_selection_image_clamped(position) {
                         self.update_moving_shape(image_point);
                     }
-                } else if let Some(image_point) = self.screen_to_image_clamped(position) {
+                } else if let Some(image_point) = self.screen_to_selection_image_clamped(position) {
                     if let Some(draft) = self.draft.as_mut() {
                         draft.current = image_point;
                     }
                 }
             }
+            let selection_resized = self.selection_resize_drag.take().is_some();
+            let selection_moved = self.selection_move_drag.take().is_some();
             let resized = self.resize_drag.take().is_some();
             let moved = self.move_drag.take().is_some();
-            if !resized && !moved {
+            if !selection_resized && !selection_moved && !resized && !moved {
                 if let Some(draft) = self.draft.take() {
                     if let Some(shape) = draft.to_shape() {
                         let new_index = self.shapes.len();
@@ -968,6 +1065,7 @@ impl AnnotationEditorApp {
             }
         }
     }
+
     fn screen_to_image(&self, position: Pos2) -> Option<ImagePoint> {
         let rect = self.image_rect?;
         if !rect.contains(position) {
@@ -975,6 +1073,7 @@ impl AnnotationEditorApp {
         }
         self.image_point_for_position(position, rect)
     }
+
     fn screen_to_image_clamped(&self, position: Pos2) -> Option<ImagePoint> {
         let rect = self.image_rect?;
         let clamped = Pos2::new(
@@ -983,6 +1082,12 @@ impl AnnotationEditorApp {
         );
         self.image_point_for_position(clamped, rect)
     }
+
+    fn screen_to_selection_image_clamped(&self, position: Pos2) -> Option<ImagePoint> {
+        self.screen_to_image_clamped(position)
+            .map(|point| self.clamp_point_to_selection(point))
+    }
+
     fn image_point_for_position(&self, position: Pos2, rect: Rect) -> Option<ImagePoint> {
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return None;
@@ -996,6 +1101,7 @@ impl AnnotationEditorApp {
             y: y.round() as i32,
         })
     }
+
     fn image_to_screen(&self, point: ImagePoint, rect: Rect) -> Pos2 {
         let image_width = self.image.width().saturating_sub(1).max(1) as f32;
         let image_height = self.image.height().saturating_sub(1).max(1) as f32;
@@ -1004,7 +1110,58 @@ impl AnnotationEditorApp {
             rect.top() + (point.y as f32 / image_height) * rect.height(),
         )
     }
+
+    fn full_image_bounds(&self) -> NormalizedRect {
+        full_image_selection(&self.image)
+    }
+
+    fn point_in_selection(&self, point: ImagePoint) -> bool {
+        self.selection.contains_half_open(point)
+    }
+
+    fn clamp_point_to_selection(&self, point: ImagePoint) -> ImagePoint {
+        ImagePoint {
+            x: point
+                .x
+                .clamp(self.selection.left, self.selection.max_inclusive_x()),
+            y: point
+                .y
+                .clamp(self.selection.top, self.selection.max_inclusive_y()),
+        }
+    }
+
+    fn selection_preview_rect(&self, image_rect: Rect) -> Rect {
+        rectangle_preview_rect(self.selection, self, image_rect)
+    }
+
+    fn selection_resize_handle_at(&self, position: Pos2) -> Option<ResizeHandle> {
+        if self.inline_layout.is_none() {
+            return None;
+        }
+        let image_rect = self.image_rect?;
+        ResizeHandle::hit_at(self.selection_preview_rect(image_rect), position)
+    }
+
+    fn selection_move_hit_at(&self, position: Pos2) -> bool {
+        if self.inline_layout.is_none() {
+            return false;
+        }
+        let Some(image_rect) = self.image_rect else {
+            return false;
+        };
+        let preview_rect = self.selection_preview_rect(image_rect);
+        let outer = preview_rect.expand(SELECTION_BORDER_HIT_WIDTH);
+        if !outer.contains(position) {
+            return false;
+        }
+        let inner = preview_rect.shrink(SELECTION_BORDER_HIT_WIDTH.max(1.0));
+        !inner.contains(position)
+    }
+
     fn shape_at(&self, point: ImagePoint) -> Option<usize> {
+        if !self.point_in_selection(point) {
+            return None;
+        }
         self.shapes
             .iter()
             .enumerate()
@@ -1012,6 +1169,7 @@ impl AnnotationEditorApp {
             .find(|(index, shape)| shape.hit_test(point, self.selected_shape == Some(*index)))
             .map(|(index, _)| index)
     }
+
     fn selected_rectangle_for_editing(&self) -> Option<(usize, NormalizedRect, ShapeStyle)> {
         let index = self.selected_shape?;
         let shape = *self.shapes.get(index)?;
@@ -1022,19 +1180,55 @@ impl AnnotationEditorApp {
             AnnotationShape::Arrow { .. } => None,
         }
     }
+
     fn resize_handle_at(&self, position: Pos2) -> Option<ResizeHandle> {
         let (_, rect, _) = self.selected_rectangle_for_editing()?;
         let image_rect = self.image_rect?;
         let preview_rect = rectangle_preview_rect(rect, self, image_rect);
         ResizeHandle::hit_at(preview_rect, position)
     }
+
     fn hover_action_at(&self, position: Pos2) -> Option<CanvasHoverAction> {
+        if let Some(handle) = self.selection_resize_handle_at(position) {
+            return Some(CanvasHoverAction::ResizeSelection(handle));
+        }
+        if self.selection_move_hit_at(position) {
+            return Some(CanvasHoverAction::MoveSelection);
+        }
         if let Some(handle) = self.resize_handle_at(position) {
-            return Some(CanvasHoverAction::Resize(handle));
+            return Some(CanvasHoverAction::ResizeShape(handle));
         }
         let point = self.screen_to_image(position)?;
-        let shape_index = self.shape_at(point)?;
-        Some(CanvasHoverAction::MoveShape(shape_index))
+        if let Some(shape_index) = self.shape_at(point) {
+            return Some(CanvasHoverAction::MoveShape(shape_index));
+        }
+        if self.tool == AnnotationTool::Select && self.point_in_selection(point) {
+            return Some(CanvasHoverAction::MoveSelection);
+        }
+        None
+    }
+
+    fn update_selection_moving(&mut self, image_point: ImagePoint) {
+        let Some(move_drag) = self.selection_move_drag else {
+            return;
+        };
+        let dx = image_point.x - move_drag.anchor.x;
+        let dy = image_point.y - move_drag.anchor.y;
+        self.selection =
+            move_drag
+                .original_rect
+                .translated_clamped(dx, dy, self.full_image_bounds());
+    }
+
+    fn update_selection_resizing(&mut self, image_point: ImagePoint) {
+        let Some(resize_drag) = self.selection_resize_drag else {
+            return;
+        };
+        self.selection = resize_drag.handle.resized_rect_with_bounds(
+            resize_drag.original_rect,
+            image_point,
+            self.full_image_bounds(),
+        );
     }
 
     fn update_moving_shape(&mut self, image_point: ImagePoint) {
@@ -1044,24 +1238,21 @@ impl AnnotationEditorApp {
         let dx = image_point.x - move_drag.anchor.x;
         let dy = image_point.y - move_drag.anchor.y;
         if let Some(shape) = self.shapes.get_mut(move_drag.shape_index) {
-            *shape = move_drag.original.translated_clamped(
-                dx,
-                dy,
-                self.image.width(),
-                self.image.height(),
-            );
+            *shape = move_drag
+                .original
+                .translated_clamped_to_rect(dx, dy, self.selection);
         }
     }
+
     fn update_resizing_shape(&mut self, image_point: ImagePoint) {
         let Some(resize_drag) = self.resize_drag else {
             return;
         };
-        let max_x = self.image.width().saturating_sub(1) as i32;
-        let max_y = self.image.height().saturating_sub(1) as i32;
-        let rect =
-            resize_drag
-                .handle
-                .resized_rect(resize_drag.original_rect, image_point, max_x, max_y);
+        let rect = resize_drag.handle.resized_rect_with_bounds(
+            resize_drag.original_rect,
+            image_point,
+            self.selection,
+        );
         if let Some(shape) = self.shapes.get_mut(resize_drag.shape_index) {
             *shape = AnnotationShape::Rectangle {
                 start: ImagePoint {
@@ -1076,20 +1267,66 @@ impl AnnotationEditorApp {
             };
         }
     }
+
     fn pointer_cursor_icon(&self, response: &egui::Response) -> Option<CursorIcon> {
+        if let Some(resize_drag) = self.selection_resize_drag {
+            return Some(resize_drag.handle.cursor_icon());
+        }
         if let Some(resize_drag) = self.resize_drag {
             return Some(resize_drag.handle.cursor_icon());
         }
-        if self.move_drag.is_some() {
+        if self.selection_move_drag.is_some() || self.move_drag.is_some() {
             return Some(CursorIcon::Grabbing);
         }
         let position = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos())?;
-        self.hover_action
-            .or_else(|| self.hover_action_at(position))
-            .map(CanvasHoverAction::cursor_icon)
+        if let Some(action) = self.hover_action.or_else(|| self.hover_action_at(position)) {
+            return Some(action.cursor_icon());
+        }
+        let point = self.screen_to_image(position)?;
+        if self.tool != AnnotationTool::Select && self.point_in_selection(point) {
+            return Some(CursorIcon::Crosshair);
+        }
+        None
     }
+
+    fn paint_selection_mask(&self, painter: &Painter, image_rect: Rect) {
+        let selection_rect = self.selection_preview_rect(image_rect);
+        let dim = Color32::from_rgba_unmultiplied(0, 0, 0, 104);
+        let full = image_rect;
+        let top = Rect::from_min_max(full.min, Pos2::new(full.right(), selection_rect.top()));
+        let bottom = Rect::from_min_max(Pos2::new(full.left(), selection_rect.bottom()), full.max);
+        let left = Rect::from_min_max(
+            Pos2::new(full.left(), selection_rect.top()),
+            Pos2::new(selection_rect.left(), selection_rect.bottom()),
+        );
+        let right = Rect::from_min_max(
+            Pos2::new(selection_rect.right(), selection_rect.top()),
+            Pos2::new(full.right(), selection_rect.bottom()),
+        );
+        for rect in [top, bottom, left, right] {
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                painter.rect_filled(rect, egui::CornerRadius::ZERO, dim);
+            }
+        }
+    }
+
+    fn paint_selection_preview(&self, painter: &Painter, image_rect: Rect) {
+        let selection_rect = self.selection_preview_rect(image_rect);
+        let accent = Color32::from_rgba_unmultiplied(86, 156, 255, 210);
+        painter.rect_stroke(
+            selection_rect,
+            egui::CornerRadius::same(3),
+            Stroke::new(1.4, accent),
+            StrokeKind::Outside,
+        );
+        for (_, handle_center) in ResizeHandle::positions(selection_rect) {
+            painter.circle_filled(handle_center, RESIZE_HANDLE_RADIUS + 1.5, accent);
+            painter.circle_filled(handle_center, RESIZE_HANDLE_RADIUS, Color32::WHITE);
+        }
+    }
+
     fn paint_shapes(&self, painter: &Painter, image_rect: Rect) {
         for (index, shape) in self.shapes.iter().copied().enumerate() {
             paint_shape_preview(
@@ -1108,10 +1345,6 @@ impl AnnotationEditorApp {
     }
 
     fn render_annotated_image(&self) -> RgbaImage {
-        if self.shapes.is_empty() {
-            return self.image.clone();
-        }
-
         let mut framebuffer = rgba_to_framebuffer(&self.image);
         for shape in &self.shapes {
             draw_shape_image(
@@ -1121,7 +1354,15 @@ impl AnnotationEditorApp {
                 shape,
             );
         }
-        framebuffer_to_image(framebuffer, self.image.width(), self.image.height())
+        let composed = framebuffer_to_image(framebuffer, self.image.width(), self.image.height());
+        imageops::crop_imm(
+            &composed,
+            self.selection.left.max(0) as u32,
+            self.selection.top.max(0) as u32,
+            self.selection.width().max(1) as u32,
+            self.selection.height().max(1) as u32,
+        )
+        .to_image()
     }
 }
 
@@ -1144,8 +1385,8 @@ impl eframe::App for AnnotationEditorApp {
                 self.show_canvas(ui);
             });
 
-        if let Some(image_rect) = self.image_rect {
-            self.show_toolbar(ctx, image_rect.expand(CANVAS_FRAME_PADDING));
+        if let Some(anchor_rect) = self.toolbar_anchor_rect() {
+            self.show_toolbar(ctx, anchor_rect);
         }
 
         if let Some(message) = &self.error_message {
@@ -1175,6 +1416,7 @@ impl eframe::App for AnnotationEditorApp {
 impl DraftShape {
     fn to_shape(self) -> Option<AnnotationShape> {
         match self.tool {
+            AnnotationTool::Select => None,
             AnnotationTool::Rectangle => {
                 let rect = NormalizedRect::from_points(self.start, self.current)?;
                 if rect.width() < 2 || rect.height() < 2 {
@@ -1230,11 +1472,23 @@ impl NormalizedRect {
         self.bottom - self.top
     }
 
+    fn max_inclusive_x(self) -> i32 {
+        self.right.max(self.left)
+    }
+
+    fn max_inclusive_y(self) -> i32 {
+        self.bottom.max(self.top)
+    }
+
     fn contains(self, point: ImagePoint) -> bool {
         point.x >= self.left
             && point.x <= self.right
             && point.y >= self.top
             && point.y <= self.bottom
+    }
+
+    fn contains_half_open(self, point: ImagePoint) -> bool {
+        point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
     }
 
     fn expanded(self, padding: i32) -> Self {
@@ -1243,6 +1497,23 @@ impl NormalizedRect {
             top: self.top - padding,
             right: self.right + padding,
             bottom: self.bottom + padding,
+        }
+    }
+
+    fn translated_clamped(self, dx: i32, dy: i32, bounds: NormalizedRect) -> Self {
+        let dx = dx.clamp(
+            bounds.left - self.left,
+            bounds.max_inclusive_x() - self.right,
+        );
+        let dy = dy.clamp(
+            bounds.top - self.top,
+            bounds.max_inclusive_y() - self.bottom,
+        );
+        Self {
+            left: self.left + dx,
+            top: self.top + dy,
+            right: self.right + dx,
+            bottom: self.bottom + dy,
         }
     }
 }
@@ -1287,12 +1558,27 @@ impl AnnotationShape {
         }
     }
 
+    #[cfg(test)]
     fn translated_clamped(self, dx: i32, dy: i32, image_width: u32, image_height: u32) -> Self {
-        let bounds = self.bounds();
-        let max_x = image_width.saturating_sub(1) as i32;
-        let max_y = image_height.saturating_sub(1) as i32;
-        let dx = dx.clamp(-bounds.left, max_x - bounds.right);
-        let dy = dy.clamp(-bounds.top, max_y - bounds.bottom);
+        let bounds = NormalizedRect {
+            left: 0,
+            top: 0,
+            right: image_width.saturating_sub(1) as i32,
+            bottom: image_height.saturating_sub(1) as i32,
+        };
+        self.translated_clamped_to_rect(dx, dy, bounds)
+    }
+
+    fn translated_clamped_to_rect(self, dx: i32, dy: i32, bounds: NormalizedRect) -> Self {
+        let shape_bounds = self.bounds();
+        let dx = dx.clamp(
+            bounds.left - shape_bounds.left,
+            bounds.max_inclusive_x() - shape_bounds.right,
+        );
+        let dy = dy.clamp(
+            bounds.top - shape_bounds.top,
+            bounds.max_inclusive_y() - shape_bounds.bottom,
+        );
         self.translated(dx, dy)
     }
 
@@ -1424,6 +1710,7 @@ impl ResizeHandle {
         None
     }
 
+    #[cfg(test)]
     fn resized_rect(
         self,
         original: NormalizedRect,
@@ -1431,22 +1718,42 @@ impl ResizeHandle {
         max_x: i32,
         max_y: i32,
     ) -> NormalizedRect {
+        self.resized_rect_with_bounds(
+            original,
+            point,
+            NormalizedRect {
+                left: 0,
+                top: 0,
+                right: max_x,
+                bottom: max_y,
+            },
+        )
+    }
+
+    fn resized_rect_with_bounds(
+        self,
+        original: NormalizedRect,
+        point: ImagePoint,
+        bounds: NormalizedRect,
+    ) -> NormalizedRect {
         let mut left = original.left;
         let mut top = original.top;
         let mut right = original.right;
         let mut bottom = original.bottom;
+        let max_x = bounds.max_inclusive_x();
+        let max_y = bounds.max_inclusive_y();
 
         match self {
             ResizeHandle::NorthWest => {
-                left = point.x.clamp(0, right - MIN_RESIZE_SIDE);
-                top = point.y.clamp(0, bottom - MIN_RESIZE_SIDE);
+                left = point.x.clamp(bounds.left, right - MIN_RESIZE_SIDE);
+                top = point.y.clamp(bounds.top, bottom - MIN_RESIZE_SIDE);
             }
             ResizeHandle::North => {
-                top = point.y.clamp(0, bottom - MIN_RESIZE_SIDE);
+                top = point.y.clamp(bounds.top, bottom - MIN_RESIZE_SIDE);
             }
             ResizeHandle::NorthEast => {
                 right = point.x.clamp(left + MIN_RESIZE_SIDE, max_x);
-                top = point.y.clamp(0, bottom - MIN_RESIZE_SIDE);
+                top = point.y.clamp(bounds.top, bottom - MIN_RESIZE_SIDE);
             }
             ResizeHandle::East => {
                 right = point.x.clamp(left + MIN_RESIZE_SIDE, max_x);
@@ -1459,11 +1766,11 @@ impl ResizeHandle {
                 bottom = point.y.clamp(top + MIN_RESIZE_SIDE, max_y);
             }
             ResizeHandle::SouthWest => {
-                left = point.x.clamp(0, right - MIN_RESIZE_SIDE);
+                left = point.x.clamp(bounds.left, right - MIN_RESIZE_SIDE);
                 bottom = point.y.clamp(top + MIN_RESIZE_SIDE, max_y);
             }
             ResizeHandle::West => {
-                left = point.x.clamp(0, right - MIN_RESIZE_SIDE);
+                left = point.x.clamp(bounds.left, right - MIN_RESIZE_SIDE);
             }
         }
 
@@ -1518,6 +1825,7 @@ fn configure_theme(ctx: &EguiContext, transparent_window: bool) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolbarGlyph {
+    Select,
     Rectangle,
     Arrow,
     Undo,
@@ -1589,6 +1897,24 @@ fn glyph_button(
 fn paint_toolbar_glyph(painter: &Painter, rect: Rect, glyph: ToolbarGlyph, color: Color32) {
     let stroke = Stroke::new(1.5, color);
     match glyph {
+        ToolbarGlyph::Select => {
+            let center = rect.center();
+            painter.line_segment(
+                [
+                    Pos2::new(rect.left() + 6.0, center.y),
+                    Pos2::new(rect.right() - 6.0, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x, rect.top() + 6.0),
+                    Pos2::new(center.x, rect.bottom() - 6.0),
+                ],
+                stroke,
+            );
+            painter.circle_stroke(center, 5.0, stroke);
+        }
         ToolbarGlyph::Rectangle => {
             painter.rect_stroke(
                 rect.shrink2(Vec2::new(6.0, 6.0)),
@@ -2153,14 +2479,18 @@ mod tests {
                 monitor_y: 0,
                 monitor_width: 320,
                 monitor_height: 240,
+                selection_width: 120,
+                selection_height: 90,
                 scale_milli: 1000,
             },
         );
 
-        assert!(layout.window_pos.x >= 0.0);
-        assert!(layout.window_pos.y >= 0.0);
-        assert!(layout.image_rect.right() > 0.0);
-        assert!(layout.image_rect.bottom() > 0.0);
+        assert_eq!(layout.window_pos, Pos2::new(0.0, 0.0));
+        assert_eq!(layout.window_size, Vec2::new(120.0, 90.0));
+        assert_eq!(
+            layout.image_rect,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(120.0, 90.0))
+        );
     }
 
     #[test]
@@ -2175,12 +2505,15 @@ mod tests {
                 monitor_y: 0,
                 monitor_width: 360,
                 monitor_height: 240,
+                selection_width: 140,
+                selection_height: 80,
                 scale_milli: 1000,
             },
         );
 
-        assert!(layout.window_pos.x + layout.window_size.x <= 360.0 + 0.1);
-        assert!(layout.image_rect.left() < layout.window_size.x);
+        assert_eq!(layout.window_pos, Pos2::new(0.0, 0.0));
+        assert_eq!(layout.window_size, Vec2::new(140.0, 80.0));
+        assert_eq!(layout.image_rect.left(), 0.0);
     }
 
     #[test]

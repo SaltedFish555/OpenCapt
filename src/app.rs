@@ -68,6 +68,7 @@ struct App {
     hotkey: Option<RegisteredHotkey>,
     overlay: Option<OverlaySession>,
     pending_target: Option<capture::CaptureTarget>,
+    pending_annotation_fallback: Option<image::RgbaImage>,
     overlay_requested_on_startup: bool,
 }
 
@@ -88,6 +89,7 @@ impl App {
             hotkey: None,
             overlay: None,
             pending_target: None,
+            pending_annotation_fallback: None,
             overlay_requested_on_startup: matches!(startup_mode, StartupMode::OverlayTest),
         }
     }
@@ -278,7 +280,7 @@ impl App {
                 };
 
                 match capture::capture_region(&target, rect) {
-                    Ok(image) => {
+                    Ok(fallback_image) => {
                         let placement = annotate::EditorPlacement {
                             screen_x: target.origin_x + rect.x,
                             screen_y: target.origin_y + rect.y,
@@ -286,14 +288,20 @@ impl App {
                             monitor_y: target.origin_y,
                             monitor_width: target.width,
                             monitor_height: target.height,
+                            selection_width: rect.width,
+                            selection_height: rect.height,
                             scale_milli: (target.scale_factor * 1000.0).round() as u32,
                         };
-                        if let Err(error) = self.launch_annotation(image.clone(), placement) {
+                        if let Err(error) = self.launch_annotation(
+                            target.background.clone(),
+                            placement,
+                            fallback_image.clone(),
+                        ) {
                             error!(
                                 ?error,
                                 "failed to launch annotation editor; falling back to direct output"
                             );
-                            self.finish_capture(image);
+                            self.finish_capture(fallback_image);
                         }
                     }
                     Err(error) => {
@@ -307,10 +315,12 @@ impl App {
 
     fn launch_annotation(
         &mut self,
-        image: image::RgbaImage,
+        monitor_image: image::RgbaImage,
         placement: annotate::EditorPlacement,
+        fallback_image: image::RgbaImage,
     ) -> anyhow::Result<()> {
-        let launch = annotate::spawn_editor(&image, placement)?;
+        let launch = annotate::spawn_editor(&monitor_image, placement)?;
+        self.pending_annotation_fallback = Some(fallback_image);
         let proxy = self.event_proxy.clone();
         thread::spawn(move || {
             let result = annotate::wait_for_editor(launch);
@@ -327,6 +337,7 @@ impl App {
                 output_path,
                 temp_dir,
             } => {
+                self.pending_annotation_fallback = None;
                 match annotate::load_output_image(&output_path) {
                     Ok(image) => self.finish_capture(image),
                     Err(error) => {
@@ -337,22 +348,17 @@ impl App {
                 self.state = AppState::Idle;
             }
             annotate::EditorOutcome::Cancelled { temp_dir } => {
+                self.pending_annotation_fallback = None;
                 info!("annotation cancelled");
                 annotate::cleanup_temp_dir(&temp_dir);
                 self.state = AppState::Idle;
             }
             annotate::EditorOutcome::Failed { message, temp_dir } => {
                 error!(message = %message, "annotation editor failed");
+                if let Some(image) = self.pending_annotation_fallback.take() {
+                    self.finish_capture(image);
+                }
                 if let Some(temp_dir) = temp_dir {
-                    let fallback_path = temp_dir.join("input.png");
-                    if fallback_path.exists() {
-                        match image::open(&fallback_path).map(|image| image.to_rgba8()) {
-                            Ok(image) => self.finish_capture(image),
-                            Err(error) => {
-                                error!(?error, fallback = ?fallback_path, "failed to recover original capture after annotation failure")
-                            }
-                        }
-                    }
                     annotate::cleanup_temp_dir(&temp_dir);
                 }
                 self.state = AppState::Idle;
