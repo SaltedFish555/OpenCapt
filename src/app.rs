@@ -1,5 +1,5 @@
 use crate::{
-    StartupMode, annotate, capture,
+    StartupMode, capture,
     config::{AppConfig, AppPaths},
     hotkey::RegisteredHotkey,
     output,
@@ -21,7 +21,6 @@ pub enum AppState {
     Idle,
     Selecting,
     Capturing,
-    Annotating,
     Exiting,
 }
 
@@ -30,8 +29,6 @@ pub(crate) enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     TrayMenu(MenuEvent),
     Overlay(OverlaySignal),
-    AnnotationPresented,
-    Annotation(annotate::EditorOutcome),
 }
 
 pub fn run(config: AppConfig, paths: AppPaths, startup_mode: StartupMode) -> ! {
@@ -68,8 +65,6 @@ struct App {
     tray: Option<TrayHandles>,
     hotkey: Option<RegisteredHotkey>,
     overlay: Option<OverlaySession>,
-    editor: Option<annotate::PersistentEditorClient>,
-    pending_target: Option<capture::CaptureTarget>,
     overlay_requested_on_startup: bool,
 }
 
@@ -89,8 +84,6 @@ impl App {
             tray: None,
             hotkey: None,
             overlay: None,
-            editor: None,
-            pending_target: None,
             overlay_requested_on_startup: matches!(startup_mode, StartupMode::OverlayTest),
         }
     }
@@ -109,10 +102,6 @@ impl App {
                 self.handle_tray_menu_event(control_flow, event)
             }
             Event::UserEvent(UserEvent::Overlay(signal)) => self.handle_overlay_signal(signal),
-            Event::UserEvent(UserEvent::AnnotationPresented) => self.handle_annotation_presented(),
-            Event::UserEvent(UserEvent::Annotation(result)) => {
-                self.handle_annotation_result(result)
-            }
             Event::LoopDestroyed => self.state = AppState::Exiting,
             _ => {}
         }
@@ -141,42 +130,10 @@ impl App {
                 info!(hotkey = ?hotkey.hotkey(), "registered global hotkey");
                 self.hotkey = Some(hotkey);
             }
-            Err(error) => error!(
-                ?error,
-                hotkey = self.config.hotkey,
-                "failed to register hotkey"
-            ),
+            Err(error) => error!(?error, hotkey = self.config.hotkey, "failed to register hotkey"),
         }
 
         self.prewarm_overlay();
-        self.prewarm_editor();
-    }
-
-    fn prewarm_editor(&mut self) {
-        if self.editor.is_some() {
-            return;
-        }
-
-        match annotate::spawn_persistent_editor() {
-            Ok((editor, outcome_rx)) => {
-                let proxy = self.event_proxy.clone();
-                std::thread::spawn(move || {
-                    while let Ok(event) = outcome_rx.recv() {
-                        let _ = match event {
-                            annotate::EditorEvent::Presented => {
-                                proxy.send_event(UserEvent::AnnotationPresented)
-                            }
-                            annotate::EditorEvent::Outcome(outcome) => {
-                                proxy.send_event(UserEvent::Annotation(outcome))
-                            }
-                        };
-                    }
-                });
-                self.editor = Some(editor);
-                info!("persistent annotation editor prewarmed");
-            }
-            Err(error) => warn!(?error, "failed to prewarm persistent annotation editor"),
-        }
     }
 
     fn prewarm_overlay(&mut self) {
@@ -209,21 +166,13 @@ impl App {
             return;
         }
 
-        if self
-            .hotkey
-            .as_ref()
-            .is_some_and(|hotkey| hotkey.matches_event(&event))
-        {
+        if self.hotkey.as_ref().is_some_and(|hotkey| hotkey.matches_event(&event)) {
             self.start_selection();
         }
     }
 
     fn handle_tray_menu_event(&mut self, control_flow: &mut ControlFlow, event: MenuEvent) {
-        let action = self
-            .tray
-            .as_ref()
-            .and_then(|tray| tray.resolve_action(&event.id));
-
+        let action = self.tray.as_ref().and_then(|tray| tray.resolve_action(&event.id));
         let Some(action) = action else {
             return;
         };
@@ -242,7 +191,6 @@ impl App {
             }
             TrayAction::Exit => {
                 self.hide_overlay();
-                self.shutdown_editor();
                 self.state = AppState::Exiting;
                 *control_flow = ControlFlow::Exit;
             }
@@ -273,13 +221,11 @@ impl App {
             }
         };
 
-        self.pending_target = Some(target.clone());
         if self.overlay.is_none() {
             self.prewarm_overlay();
         }
 
         let Some(overlay) = self.overlay.as_mut() else {
-            self.pending_target = None;
             self.state = AppState::Idle;
             return;
         };
@@ -291,7 +237,6 @@ impl App {
             }
             Err(error) => {
                 error!(?error, "failed to activate overlay window");
-                self.pending_target = None;
                 self.state = AppState::Idle;
             }
         }
@@ -301,81 +246,10 @@ impl App {
         match signal {
             OverlaySignal::Cancelled => {
                 info!(startup = ?self.startup_mode, "selection cancelled");
-                self.pending_target = None;
                 self.state = AppState::Idle;
             }
-            OverlaySignal::Confirmed(rect) => {
-                self.state = AppState::Capturing;
-                let Some(target) = self.pending_target.take() else {
-                    self.state = AppState::Idle;
-                    return;
-                };
-
-                let placement = annotate::EditorPlacement {
-                    screen_x: target.origin_x + rect.x,
-                    screen_y: target.origin_y + rect.y,
-                    monitor_x: target.origin_x,
-                    monitor_y: target.origin_y,
-                    monitor_width: target.width,
-                    monitor_height: target.height,
-                    selection_width: rect.width,
-                    selection_height: rect.height,
-                    scale_milli: (target.scale_factor * 1000.0).round() as u32,
-                };
-                if let Err(error) = self.launch_annotation(target.background.clone(), placement) {
-                    self.hide_overlay();
-                    error!(
-                        ?error,
-                        "failed to launch annotation editor; falling back to direct output"
-                    );
-                    match capture::capture_region(&target, rect) {
-                        Ok(image) => self.finish_capture(image),
-                        Err(capture_error) => {
-                            error!(?capture_error, "failed to capture selected region after editor launch failure");
-                            self.state = AppState::Idle;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn launch_annotation(
-        &mut self,
-        monitor_image: image::RgbaImage,
-        placement: annotate::EditorPlacement,
-    ) -> anyhow::Result<()> {
-        if self.editor.is_none() {
-            self.prewarm_editor();
-        }
-
-        let editor = self
-            .editor
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("persistent annotation editor unavailable"))?;
-        editor.request_edit(&monitor_image, placement)?;
-        self.state = AppState::Annotating;
-        info!("annotation editor requested");
-        Ok(())
-    }
-
-    fn handle_annotation_presented(&mut self) {
-        self.hide_overlay();
-    }
-
-    fn handle_annotation_result(&mut self, result: annotate::EditorOutcome) {
-        self.hide_overlay();
-        match result {
-            annotate::EditorOutcome::Confirmed { image } => {
+            OverlaySignal::Completed(image) => {
                 self.finish_capture(image);
-                self.state = AppState::Idle;
-            }
-            annotate::EditorOutcome::Cancelled => {
-                info!("annotation cancelled");
-                self.state = AppState::Idle;
-            }
-            annotate::EditorOutcome::Failed { message } => {
-                error!(message = %message, "annotation editor failed");
                 self.state = AppState::Idle;
             }
         }
@@ -385,13 +259,6 @@ impl App {
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.hide();
         }
-    }
-
-    fn shutdown_editor(&mut self) {
-        if let Some(editor) = self.editor.as_mut() {
-            editor.shutdown();
-        }
-        self.editor = None;
     }
 
     fn finish_capture(&mut self, image: image::RgbaImage) {
@@ -414,10 +281,4 @@ fn open_directory(path: &std::path::Path) -> anyhow::Result<()> {
         .spawn()
         .map(|_| ())
         .map_err(Into::into)
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        self.shutdown_editor();
-    }
 }
