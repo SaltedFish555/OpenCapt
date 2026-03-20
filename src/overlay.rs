@@ -1,5 +1,5 @@
 use crate::capture::CaptureTarget;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::{
     ffi::c_void,
     mem::size_of,
@@ -8,29 +8,28 @@ use std::{
 };
 use tracing::{info, warn};
 use windows::{
-    core::w,
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
         Graphics::Gdi::{
             AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-            CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-            HBITMAP, HDC, HGDIOBJ, RGBQUAD, SelectObject,
+            CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP,
+            HDC, HGDIOBJ, RGBQUAD, SelectObject,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE},
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, IDC_CROSS,
-                LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
-                SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, ULW_ALPHA,
-                UpdateLayeredWindow, WINDOW_LONG_PTR_INDEX, WM_ERASEBKGND, WM_KEYDOWN,
+                DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LoadCursorW,
+                RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowDisplayAffinity,
+                SetWindowLongPtrW, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
+                WDA_EXCLUDEFROMCAPTURE, WINDOW_LONG_PTR_INDEX, WM_ERASEBKGND, WM_KEYDOWN,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-                WM_NCHITTEST, WDA_EXCLUDEFROMCAPTURE, WNDCLASSW, WS_EX_LAYERED,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
+    core::w,
 };
 
 const PREVIEW_BRIGHTNESS_PERCENT: u32 = 60;
@@ -132,11 +131,13 @@ impl OverlaySession {
         state.target = target;
         state.drag_start = None;
         state.drag_current = None;
-        state.surface
-            .resize(state.target.width as i32, state.target.height as i32)?;
         state
-            .frame
-            .resize(state.target.width as usize * state.target.height as usize, 0);
+            .surface
+            .resize(state.target.width as i32, state.target.height as i32)?;
+        state.frame.resize(
+            state.target.width as usize * state.target.height as usize,
+            0,
+        );
         state.last_cursor = CursorPoint {
             x: cursor_x - state.target.origin_x,
             y: cursor_y - state.target.origin_y,
@@ -168,8 +169,6 @@ impl OverlaySession {
         }
         Ok(())
     }
-
-
 
     fn state_mut(&mut self) -> &mut OverlayState {
         &mut self.state
@@ -628,11 +627,15 @@ mod tests {
             }),
         );
 
-        assert_eq!(destination[0], opaque(dim_color(source[0], PREVIEW_BRIGHTNESS_PERCENT)));
+        assert_eq!(
+            destination[0],
+            opaque(dim_color(source[0], PREVIEW_BRIGHTNESS_PERCENT))
+        );
         assert_eq!(destination[1], opaque(source[1]));
-        assert_eq!(destination[2], opaque(dim_color(source[2], PREVIEW_BRIGHTNESS_PERCENT)));
+        assert_eq!(
+            destination[2],
+            opaque(dim_color(source[2], PREVIEW_BRIGHTNESS_PERCENT))
+        );
         assert_eq!(destination[3], opaque(source[3]));
     }
 }
-
-

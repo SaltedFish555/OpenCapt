@@ -1,3 +1,4 @@
+mod annotate;
 mod app;
 mod capture;
 mod config;
@@ -11,15 +12,16 @@ use anyhow::Result;
 use std::env;
 use tracing::info;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupMode {
     Run,
     CaptureTest,
     OverlayTest,
+    Annotate(annotate::AnnotateCli),
 }
 
 fn main() -> Result<()> {
-    let startup_mode = parse_startup_mode(env::args().nth(1).as_deref());
+    let startup_mode = parse_startup_mode(env::args())?;
     let (config, paths) = config::load_or_create()?;
     let _logging_guard = logging::init(&paths.log_dir)?;
 
@@ -32,16 +34,19 @@ fn main() -> Result<()> {
             info!(path = ?result.saved_path, "capture-test completed");
             Ok(())
         }
+        StartupMode::Annotate(cli) => annotate::run(cli),
         StartupMode::Run | StartupMode::OverlayTest => {
             app::run(config, paths, startup_mode);
         }
     }
 }
 
-fn parse_startup_mode(arg: Option<&str>) -> StartupMode {
-    match arg {
+fn parse_startup_mode(mut args: impl Iterator<Item = String>) -> Result<StartupMode> {
+    let _program = args.next();
+    Ok(match args.next().as_deref() {
         Some("capture-test") => StartupMode::CaptureTest,
         Some("overlay-test") => StartupMode::OverlayTest,
+        Some("annotate") => StartupMode::Annotate(annotate::AnnotateCli::parse(args)?),
         _ => StartupMode::Run,
-    }
+    })
 }

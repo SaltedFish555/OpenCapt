@@ -1,5 +1,5 @@
 use crate::{
-    StartupMode, capture,
+    StartupMode, annotate, capture,
     config::{AppConfig, AppPaths},
     hotkey::RegisteredHotkey,
     output,
@@ -7,7 +7,7 @@ use crate::{
     tray::{TrayAction, TrayHandles},
 };
 use global_hotkey::GlobalHotKeyEvent;
-use std::process::Command;
+use std::{process::Command, thread};
 use tao::{
     event::{Event, StartCause},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
@@ -21,6 +21,7 @@ pub enum AppState {
     Idle,
     Selecting,
     Capturing,
+    Annotating,
     Exiting,
 }
 
@@ -29,6 +30,7 @@ pub(crate) enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     TrayMenu(MenuEvent),
     Overlay(OverlaySignal),
+    Annotation(annotate::EditorOutcome),
 }
 
 pub fn run(config: AppConfig, paths: AppPaths, startup_mode: StartupMode) -> ! {
@@ -80,7 +82,7 @@ impl App {
             config,
             paths,
             state: AppState::Idle,
-            startup_mode,
+            startup_mode: startup_mode.clone(),
             event_proxy,
             tray: None,
             hotkey: None,
@@ -104,6 +106,9 @@ impl App {
                 self.handle_tray_menu_event(control_flow, event)
             }
             Event::UserEvent(UserEvent::Overlay(signal)) => self.handle_overlay_signal(signal),
+            Event::UserEvent(UserEvent::Annotation(result)) => {
+                self.handle_annotation_result(result)
+            }
             Event::LoopDestroyed => self.state = AppState::Exiting,
             _ => {}
         }
@@ -272,20 +277,100 @@ impl App {
                     return;
                 };
 
-                match capture::capture_region(&target, rect)
-                    .and_then(|image| output::process_capture(image, &self.config))
-                {
-                    Ok(result) => {
-                        info!(path = ?result.saved_path, image_width = result.image.width(), image_height = result.image.height(), "capture completed");
+                match capture::capture_region(&target, rect) {
+                    Ok(image) => {
+                        let placement = annotate::EditorPlacement {
+                            screen_x: target.origin_x + rect.x,
+                            screen_y: target.origin_y + rect.y,
+                            monitor_x: target.origin_x,
+                            monitor_y: target.origin_y,
+                            monitor_width: target.width,
+                            monitor_height: target.height,
+                            scale_milli: (target.scale_factor * 1000.0).round() as u32,
+                        };
+                        if let Err(error) = self.launch_annotation(image.clone(), placement) {
+                            error!(
+                                ?error,
+                                "failed to launch annotation editor; falling back to direct output"
+                            );
+                            self.finish_capture(image);
+                        }
                     }
                     Err(error) => {
                         error!(?error, "failed to capture selected region");
+                        self.state = AppState::Idle;
                     }
                 }
+            }
+        }
+    }
 
+    fn launch_annotation(
+        &mut self,
+        image: image::RgbaImage,
+        placement: annotate::EditorPlacement,
+    ) -> anyhow::Result<()> {
+        let launch = annotate::spawn_editor(&image, placement)?;
+        let proxy = self.event_proxy.clone();
+        thread::spawn(move || {
+            let result = annotate::wait_for_editor(launch);
+            let _ = proxy.send_event(UserEvent::Annotation(result));
+        });
+        self.state = AppState::Annotating;
+        info!("annotation editor launched");
+        Ok(())
+    }
+
+    fn handle_annotation_result(&mut self, result: annotate::EditorOutcome) {
+        match result {
+            annotate::EditorOutcome::Confirmed {
+                output_path,
+                temp_dir,
+            } => {
+                match annotate::load_output_image(&output_path) {
+                    Ok(image) => self.finish_capture(image),
+                    Err(error) => {
+                        error!(?error, output = ?output_path, "failed to load annotated output")
+                    }
+                }
+                annotate::cleanup_temp_dir(&temp_dir);
+                self.state = AppState::Idle;
+            }
+            annotate::EditorOutcome::Cancelled { temp_dir } => {
+                info!("annotation cancelled");
+                annotate::cleanup_temp_dir(&temp_dir);
+                self.state = AppState::Idle;
+            }
+            annotate::EditorOutcome::Failed { message, temp_dir } => {
+                error!(message = %message, "annotation editor failed");
+                if let Some(temp_dir) = temp_dir {
+                    let fallback_path = temp_dir.join("input.png");
+                    if fallback_path.exists() {
+                        match image::open(&fallback_path).map(|image| image.to_rgba8()) {
+                            Ok(image) => self.finish_capture(image),
+                            Err(error) => {
+                                error!(?error, fallback = ?fallback_path, "failed to recover original capture after annotation failure")
+                            }
+                        }
+                    }
+                    annotate::cleanup_temp_dir(&temp_dir);
+                }
                 self.state = AppState::Idle;
             }
         }
+    }
+
+    fn finish_capture(&mut self, image: image::RgbaImage) {
+        self.state = AppState::Capturing;
+        match output::process_capture(image, &self.config) {
+            Ok(result) => {
+                info!(path = ?result.saved_path, image_width = result.image.width(), image_height = result.image.height(), "capture completed");
+            }
+            Err(error) => {
+                error!(?error, "failed to process capture output");
+            }
+        }
+        self.state = AppState::Idle;
     }
 }
 
