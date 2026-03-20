@@ -7,7 +7,7 @@ use crate::{
     tray::{TrayAction, TrayHandles},
 };
 use global_hotkey::GlobalHotKeyEvent;
-use std::{process::Command, thread};
+use std::process::Command;
 use tao::{
     event::{Event, StartCause},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
@@ -67,8 +67,10 @@ struct App {
     tray: Option<TrayHandles>,
     hotkey: Option<RegisteredHotkey>,
     overlay: Option<OverlaySession>,
+    editor: Option<annotate::PersistentEditorClient>,
     pending_target: Option<capture::CaptureTarget>,
     pending_annotation_fallback: Option<image::RgbaImage>,
+    pending_annotation_temp_dir: Option<std::path::PathBuf>,
     overlay_requested_on_startup: bool,
 }
 
@@ -88,8 +90,10 @@ impl App {
             tray: None,
             hotkey: None,
             overlay: None,
+            editor: None,
             pending_target: None,
             pending_annotation_fallback: None,
+            pending_annotation_temp_dir: None,
             overlay_requested_on_startup: matches!(startup_mode, StartupMode::OverlayTest),
         }
     }
@@ -147,6 +151,27 @@ impl App {
         }
 
         self.prewarm_overlay();
+        self.prewarm_editor();
+    }
+
+    fn prewarm_editor(&mut self) {
+        if self.editor.is_some() {
+            return;
+        }
+
+        match annotate::spawn_persistent_editor() {
+            Ok((editor, outcome_rx)) => {
+                let proxy = self.event_proxy.clone();
+                std::thread::spawn(move || {
+                    while let Ok(outcome) = outcome_rx.recv() {
+                        let _ = proxy.send_event(UserEvent::Annotation(outcome));
+                    }
+                });
+                self.editor = Some(editor);
+                info!("persistent annotation editor prewarmed");
+            }
+            Err(error) => warn!(?error, "failed to prewarm persistent annotation editor"),
+        }
     }
 
     fn prewarm_overlay(&mut self) {
@@ -211,6 +236,7 @@ impl App {
                 }
             }
             TrayAction::Exit => {
+                self.shutdown_editor();
                 self.state = AppState::Exiting;
                 *control_flow = ControlFlow::Exit;
             }
@@ -319,15 +345,19 @@ impl App {
         placement: annotate::EditorPlacement,
         fallback_image: image::RgbaImage,
     ) -> anyhow::Result<()> {
-        let launch = annotate::spawn_editor(&monitor_image, placement)?;
+        if self.editor.is_none() {
+            self.prewarm_editor();
+        }
+
+        let editor = self
+            .editor
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("persistent annotation editor unavailable"))?;
+        let temp_dir = editor.request_edit(&monitor_image, placement)?;
         self.pending_annotation_fallback = Some(fallback_image);
-        let proxy = self.event_proxy.clone();
-        thread::spawn(move || {
-            let result = annotate::wait_for_editor(launch);
-            let _ = proxy.send_event(UserEvent::Annotation(result));
-        });
+        self.pending_annotation_temp_dir = Some(temp_dir);
         self.state = AppState::Annotating;
-        info!("annotation editor launched");
+        info!("annotation editor requested");
         Ok(())
     }
 
@@ -338,6 +368,7 @@ impl App {
                 temp_dir,
             } => {
                 self.pending_annotation_fallback = None;
+                self.pending_annotation_temp_dir = None;
                 match annotate::load_output_image(&output_path) {
                     Ok(image) => self.finish_capture(image),
                     Err(error) => {
@@ -349,6 +380,7 @@ impl App {
             }
             annotate::EditorOutcome::Cancelled { temp_dir } => {
                 self.pending_annotation_fallback = None;
+                self.pending_annotation_temp_dir = None;
                 info!("annotation cancelled");
                 annotate::cleanup_temp_dir(&temp_dir);
                 self.state = AppState::Idle;
@@ -358,12 +390,20 @@ impl App {
                 if let Some(image) = self.pending_annotation_fallback.take() {
                     self.finish_capture(image);
                 }
-                if let Some(temp_dir) = temp_dir {
+                let cleanup_dir = temp_dir.or_else(|| self.pending_annotation_temp_dir.take());
+                if let Some(temp_dir) = cleanup_dir {
                     annotate::cleanup_temp_dir(&temp_dir);
                 }
                 self.state = AppState::Idle;
             }
         }
+    }
+
+    fn shutdown_editor(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.shutdown();
+        }
+        self.editor = None;
     }
 
     fn finish_capture(&mut self, image: image::RgbaImage) {
@@ -386,4 +426,10 @@ fn open_directory(path: &std::path::Path) -> anyhow::Result<()> {
         .spawn()
         .map(|_| ())
         .map_err(Into::into)
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.shutdown_editor();
+    }
 }

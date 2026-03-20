@@ -18,6 +18,7 @@ pub enum StartupMode {
     CaptureTest,
     OverlayTest,
     Annotate(annotate::AnnotateCli),
+    AnnotateServer,
 }
 
 fn main() -> Result<()> {
@@ -35,6 +36,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         StartupMode::Annotate(cli) => annotate::run(cli),
+        StartupMode::AnnotateServer => annotate::run_server(),
         StartupMode::Run | StartupMode::OverlayTest => {
             app::run(config, paths, startup_mode);
         }
@@ -47,6 +49,7 @@ fn parse_startup_mode(mut args: impl Iterator<Item = String>) -> Result<StartupM
         Some("capture-test") => StartupMode::CaptureTest,
         Some("overlay-test") => StartupMode::OverlayTest,
         Some("annotate") => StartupMode::Annotate(annotate::AnnotateCli::parse(args)?),
+        Some("annotate-server") => StartupMode::AnnotateServer,
         _ => StartupMode::Run,
     })
 }

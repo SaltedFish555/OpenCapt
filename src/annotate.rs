@@ -2,13 +2,16 @@ use anyhow::{Context, Result, anyhow};
 use eframe::egui::{
     self, Align, Align2, CentralPanel, Color32, ColorImage, Context as EguiContext, CursorIcon,
     Frame, Id, Key, Layout, Margin, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportCommand,
+    StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportCommand, ViewportId,
 };
 use image::{RgbaImage, imageops};
 use std::{
     env, fs,
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -39,6 +42,9 @@ const TOOL_CANCEL: Color32 = Color32::from_rgb(182, 35, 36);
 const TEXT_BRIGHT: Color32 = Color32::from_rgb(244, 247, 250);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const WINDOW_PADDING: f32 = 28.0;
+const HIDDEN_HOST_POSITION: Pos2 = Pos2::new(-10000.0, -10000.0);
+const HIDDEN_HOST_SIZE: Vec2 = Vec2::new(1.0, 1.0);
+const PERSISTENT_EDITOR_VIEWPORT: &str = "persistent-editor";
 const TOOLBAR_MIN_WIDTH: f32 = 344.0;
 const TOOLBAR_IDEAL_WIDTH: f32 = 360.0;
 const TOOLBAR_HEIGHT: f32 = 44.0;
@@ -52,6 +58,8 @@ const MIN_RESIZE_SIDE: i32 = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnotateCli {
     pub input: PathBuf,
+    pub input_width: Option<u32>,
+    pub input_height: Option<u32>,
     pub output: PathBuf,
     pub placement: Option<EditorPlacement>,
 }
@@ -69,11 +77,9 @@ pub struct EditorPlacement {
     pub scale_milli: u32,
 }
 
-#[derive(Debug)]
-pub struct EditorLaunch {
+pub struct PersistentEditorClient {
     child: Child,
-    temp_dir: PathBuf,
-    output_path: PathBuf,
+    stdin: BufWriter<ChildStdin>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +95,26 @@ pub enum EditorOutcome {
         message: String,
         temp_dir: Option<PathBuf>,
     },
+}
+
+#[derive(Debug)]
+enum ServerCommand {
+    Open(EditorRequest),
+    Shutdown,
+}
+
+#[derive(Debug, Clone)]
+struct EditorRequest {
+    image: RgbaImage,
+    placement: EditorPlacement,
+    temp_dir: PathBuf,
+    output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    Confirm,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,11 +251,22 @@ struct AnnotationEditorApp {
     image_rect: Option<Rect>,
     inline_layout: Option<InlineLayout>,
     error_message: Option<String>,
+    pending_action: Option<PendingAction>,
+}
+
+struct PersistentEditorApp {
+    command_rx: mpsc::Receiver<ServerCommand>,
+    result_tx: mpsc::Sender<EditorOutcome>,
+    editor: Option<AnnotationEditorApp>,
+    current_temp_dir: Option<PathBuf>,
+    should_close: bool,
 }
 impl AnnotateCli {
     pub fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
         let mut input = None;
         let mut output = None;
+        let mut input_width = None;
+        let mut input_height = None;
         let mut screen_x = None;
         let mut screen_y = None;
         let mut monitor_x = None;
@@ -244,6 +281,10 @@ impl AnnotateCli {
             match arg.as_str() {
                 "--input" => input = args.next().map(PathBuf::from),
                 "--output" => output = args.next().map(PathBuf::from),
+                "--input-width" => input_width = Some(parse_u32_arg("--input-width", args.next())?),
+                "--input-height" => {
+                    input_height = Some(parse_u32_arg("--input-height", args.next())?)
+                }
                 "--screen-x" => screen_x = Some(parse_i32_arg("--screen-x", args.next())?),
                 "--screen-y" => screen_y = Some(parse_i32_arg("--screen-y", args.next())?),
                 "--monitor-x" => monitor_x = Some(parse_i32_arg("--monitor-x", args.next())?),
@@ -311,6 +352,8 @@ impl AnnotateCli {
 
         Ok(Self {
             input: input.ok_or_else(|| anyhow!("missing --input for annotate mode"))?,
+            input_width,
+            input_height,
             output: output.ok_or_else(|| anyhow!("missing --output for annotate mode"))?,
             placement,
         })
@@ -336,7 +379,8 @@ fn parse_u32_arg(flag: &str, value: Option<String>) -> Result<u32> {
         .parse::<u32>()
         .with_context(|| format!("failed to parse {flag} value: {value}"))
 }
-pub fn spawn_editor(image: &RgbaImage, placement: EditorPlacement) -> Result<EditorLaunch> {
+
+fn build_editor_request(image: &RgbaImage, placement: EditorPlacement) -> Result<EditorRequest> {
     let temp_dir = build_temp_dir();
     fs::create_dir_all(&temp_dir).with_context(|| {
         format!(
@@ -345,68 +389,231 @@ pub fn spawn_editor(image: &RgbaImage, placement: EditorPlacement) -> Result<Edi
         )
     })?;
 
-    let input_path = temp_dir.join("input.png");
-    let output_path = temp_dir.join("output.png");
-    image.save(&input_path).with_context(|| {
-        format!(
-            "failed to save annotation input at {}",
-            input_path.display()
-        )
-    })?;
+    Ok(EditorRequest {
+        image: image.clone(),
+        placement,
+        output_path: temp_dir.join("output.png"),
+        temp_dir,
+    })
+}
 
+impl PersistentEditorClient {
+    pub fn request_edit(&mut self, image: &RgbaImage, placement: EditorPlacement) -> Result<PathBuf> {
+        let request = build_editor_request(image, placement)?;
+        let temp_dir = request.temp_dir.clone();
+        if let Err(error) = write_server_command(&mut self.stdin, &ServerCommand::Open(request))
+            .and_then(|()| self.stdin.flush().context("failed to flush annotation server input"))
+        {
+            cleanup_temp_dir(&temp_dir);
+            return Err(error);
+        }
+        Ok(temp_dir)
+    }
+
+    pub fn shutdown(&mut self) {
+        let _ = write_server_command(&mut self.stdin, &ServerCommand::Shutdown);
+        let _ = self.stdin.flush();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for PersistentEditorClient {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = write_server_command(&mut self.stdin, &ServerCommand::Shutdown);
+            let _ = self.stdin.flush();
+            let _ = self.child.kill();
+        }
+    }
+}
+
+pub fn spawn_persistent_editor() -> Result<(PersistentEditorClient, mpsc::Receiver<EditorOutcome>)> {
     let mut command =
         Command::new(env::current_exe().context("failed to locate current executable")?);
     command
-        .arg("annotate")
-        .arg("--input")
-        .arg(&input_path)
-        .arg("--output")
-        .arg(&output_path)
-        .arg("--screen-x")
-        .arg(placement.screen_x.to_string())
-        .arg("--screen-y")
-        .arg(placement.screen_y.to_string())
-        .arg("--monitor-x")
-        .arg(placement.monitor_x.to_string())
-        .arg("--monitor-y")
-        .arg(placement.monitor_y.to_string())
-        .arg("--monitor-width")
-        .arg(placement.monitor_width.to_string())
-        .arg("--monitor-height")
-        .arg(placement.monitor_height.to_string())
-        .arg("--selection-width")
-        .arg(placement.selection_width.to_string())
-        .arg("--selection-height")
-        .arg(placement.selection_height.to_string())
-        .arg("--scale-milli")
-        .arg(placement.scale_milli.to_string());
+        .arg("annotate-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
     #[cfg(windows)]
     {
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = command.spawn().with_context(|| {
-        format!(
-            "failed to launch annotation editor for {}",
-            input_path.display()
-        )
-    })?;
+    let mut child = command
+        .spawn()
+        .context("failed to launch persistent annotation editor")?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("persistent annotation editor stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("persistent annotation editor stdout unavailable"))?;
 
-    Ok(EditorLaunch {
-        child,
-        temp_dir,
-        output_path,
-    })
-}
-pub fn wait_for_editor(mut launch: EditorLaunch) -> EditorOutcome {
-    match launch.child.wait() {
-        Ok(status) => complete_editor_wait(status, launch.temp_dir, launch.output_path),
-        Err(error) => EditorOutcome::Failed {
-            message: format!("failed to wait for annotation editor: {error}"),
-            temp_dir: Some(launch.temp_dir),
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (outcome_tx, outcome_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        match read_server_signal(&mut reader) {
+            Ok(Some(ServerSignal::Ready)) => {
+                let _ = ready_tx.send(Ok(()));
+            }
+            Ok(Some(ServerSignal::Outcome(outcome))) => {
+                let _ = ready_tx.send(Err(anyhow!(
+                    "persistent annotation editor responded before ready"
+                )));
+                let _ = outcome_tx.send(outcome);
+            }
+            Ok(None) => {
+                let _ = ready_tx.send(Err(anyhow!(
+                    "persistent annotation editor exited before ready"
+                )));
+                return;
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        }
+
+        loop {
+            match read_server_signal(&mut reader) {
+                Ok(Some(ServerSignal::Ready)) => {}
+                Ok(Some(ServerSignal::Outcome(outcome))) => {
+                    if outcome_tx.send(outcome).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = outcome_tx.send(EditorOutcome::Failed {
+                        message: "persistent annotation editor exited unexpectedly".to_string(),
+                        temp_dir: None,
+                    });
+                    break;
+                }
+                Err(error) => {
+                    let _ = outcome_tx.send(EditorOutcome::Failed {
+                        message: format!("failed to read annotation editor response: {error}"),
+                        temp_dir: None,
+                    });
+                    break;
+                }
+            }
+        }
+    });
+
+    ready_rx
+        .recv()
+        .map_err(|_| anyhow!("failed to receive persistent annotation editor readiness"))??;
+
+    Ok((
+        PersistentEditorClient {
+            child,
+            stdin: BufWriter::new(stdin),
         },
-    }
+        outcome_rx,
+    ))
 }
+
+pub fn run_server() -> Result<()> {
+    let (command_tx, command_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let repaint_ctx: Arc<Mutex<Option<EguiContext>>> = Arc::new(Mutex::new(None));
+
+    {
+        let repaint_ctx = Arc::clone(&repaint_ctx);
+        thread::spawn(move || {
+            let mut reader = BufReader::new(std::io::stdin());
+            loop {
+                match read_server_command(&mut reader) {
+                    Ok(Some(command)) => {
+                        let should_shutdown = matches!(command, ServerCommand::Shutdown);
+                        if command_tx.send(command).is_err() {
+                            break;
+                        }
+                        if let Ok(guard) = repaint_ctx.lock() {
+                            if let Some(ctx) = guard.as_ref() {
+                                ctx.request_repaint();
+                            }
+                        }
+                        if should_shutdown {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = command_tx.send(ServerCommand::Shutdown);
+                        if let Ok(guard) = repaint_ctx.lock() {
+                            if let Some(ctx) = guard.as_ref() {
+                                ctx.request_repaint();
+                            }
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = command_tx.send(ServerCommand::Shutdown);
+                        if let Ok(guard) = repaint_ctx.lock() {
+                            if let Some(ctx) = guard.as_ref() {
+                                ctx.request_repaint();
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    thread::spawn(move || {
+        let mut writer = BufWriter::new(std::io::stdout());
+        let _ = write_server_ready(&mut writer).and_then(|()| writer.flush().map_err(Into::into));
+        while let Ok(outcome) = result_rx.recv() {
+            if write_server_outcome(&mut writer, &outcome)
+                .and_then(|()| writer.flush().map_err(Into::into))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let native_options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+        viewport: ViewportBuilder::default()
+            .with_title("OpenCapt Annotate")
+            .with_inner_size(HIDDEN_HOST_SIZE)
+            .with_min_inner_size(HIDDEN_HOST_SIZE)
+            .with_position(HIDDEN_HOST_POSITION)
+            .with_max_inner_size([8192.0, 8192.0])
+            .with_visible(true)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_taskbar(false)
+            .with_close_button(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false)
+            .with_always_on_top(),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "OpenCapt Annotate",
+        native_options,
+        Box::new(move |cc| {
+            if let Ok(mut guard) = repaint_ctx.lock() {
+                *guard = Some(cc.egui_ctx.clone());
+            }
+            Ok(Box::new(PersistentEditorApp::new(
+                cc.egui_ctx.clone(),
+                command_rx,
+                result_tx,
+            )))
+        }),
+    )
+    .map_err(|error| anyhow!(error.to_string()))
+}
+
 
 pub fn cleanup_temp_dir(path: &Path) {
     if let Err(error) = fs::remove_dir_all(path) {
@@ -420,10 +627,32 @@ pub fn load_output_image(path: &Path) -> Result<RgbaImage> {
         .map(|image| image.to_rgba8())
 }
 
+fn load_source_image(cli: &AnnotateCli) -> Result<RgbaImage> {
+    match (cli.input_width, cli.input_height) {
+        (Some(width), Some(height)) => {
+            let bytes = fs::read(&cli.input).with_context(|| {
+                format!(
+                    "failed to read raw annotation source {}",
+                    cli.input.display()
+                )
+            })?;
+            RgbaImage::from_raw(width, height, bytes).ok_or_else(|| {
+                anyhow!(
+                    "raw annotation source size does not match {}x{} at {}",
+                    width,
+                    height,
+                    cli.input.display()
+                )
+            })
+        }
+        _ => image::open(&cli.input)
+            .with_context(|| format!("failed to open annotation source {}", cli.input.display()))
+            .map(|image| image.to_rgba8()),
+    }
+}
+
 pub fn run(cli: AnnotateCli) -> Result<()> {
-    let image = image::open(&cli.input)
-        .with_context(|| format!("failed to open annotation source {}", cli.input.display()))?
-        .to_rgba8();
+    let image = load_source_image(&cli)?;
     let inline_layout = cli
         .placement
         .map(|placement| build_inline_layout(&image, placement));
@@ -477,27 +706,6 @@ pub fn run(cli: AnnotateCli) -> Result<()> {
     .map_err(|error| anyhow!(error.to_string()))
 }
 
-fn complete_editor_wait(
-    status: ExitStatus,
-    temp_dir: PathBuf,
-    output_path: PathBuf,
-) -> EditorOutcome {
-    if status.success() {
-        if output_path.exists() {
-            EditorOutcome::Confirmed {
-                output_path,
-                temp_dir,
-            }
-        } else {
-            EditorOutcome::Cancelled { temp_dir }
-        }
-    } else {
-        EditorOutcome::Failed {
-            message: format!("annotation editor exited with status {status}"),
-            temp_dir: Some(temp_dir),
-        }
-    }
-}
 
 fn build_temp_dir() -> PathBuf {
     let stamp = SystemTime::now()
@@ -507,6 +715,225 @@ fn build_temp_dir() -> PathBuf {
     env::temp_dir()
         .join("OpenCapt")
         .join(format!("annotate-{}-{}", std::process::id(), stamp))
+}
+
+
+#[derive(Debug)]
+enum ServerSignal {
+    Ready,
+    Outcome(EditorOutcome),
+}
+
+const SERVER_COMMAND_OPEN: u8 = 1;
+const SERVER_COMMAND_SHUTDOWN: u8 = 2;
+const SERVER_SIGNAL_READY: u8 = 11;
+const SERVER_SIGNAL_CONFIRMED: u8 = 12;
+const SERVER_SIGNAL_CANCELLED: u8 = 13;
+const SERVER_SIGNAL_FAILED: u8 = 14;
+
+fn write_server_command(writer: &mut impl Write, command: &ServerCommand) -> Result<()> {
+    match command {
+        ServerCommand::Open(request) => {
+            write_u8(writer, SERVER_COMMAND_OPEN)?;
+            write_i32(writer, request.placement.screen_x)?;
+            write_i32(writer, request.placement.screen_y)?;
+            write_i32(writer, request.placement.monitor_x)?;
+            write_i32(writer, request.placement.monitor_y)?;
+            write_u32(writer, request.placement.monitor_width)?;
+            write_u32(writer, request.placement.monitor_height)?;
+            write_u32(writer, request.placement.selection_width)?;
+            write_u32(writer, request.placement.selection_height)?;
+            write_u32(writer, request.placement.scale_milli)?;
+            write_string(writer, &request.temp_dir.to_string_lossy())?;
+            write_string(writer, &request.output_path.to_string_lossy())?;
+            write_u32(writer, request.image.width())?;
+            write_u32(writer, request.image.height())?;
+            write_bytes(writer, request.image.as_raw())?;
+        }
+        ServerCommand::Shutdown => {
+            write_u8(writer, SERVER_COMMAND_SHUTDOWN)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_server_command(reader: &mut impl Read) -> Result<Option<ServerCommand>> {
+    let Some(tag) = read_u8_opt(reader)? else {
+        return Ok(None);
+    };
+    match tag {
+        SERVER_COMMAND_OPEN => {
+            let placement = EditorPlacement {
+                screen_x: read_i32(reader)?,
+                screen_y: read_i32(reader)?,
+                monitor_x: read_i32(reader)?,
+                monitor_y: read_i32(reader)?,
+                monitor_width: read_u32(reader)?,
+                monitor_height: read_u32(reader)?,
+                selection_width: read_u32(reader)?,
+                selection_height: read_u32(reader)?,
+                scale_milli: read_u32(reader)?,
+            };
+            let temp_dir = PathBuf::from(read_string(reader)?);
+            let output_path = PathBuf::from(read_string(reader)?);
+            let width = read_u32(reader)?;
+            let height = read_u32(reader)?;
+            let bytes = read_bytes(reader)?;
+            let image = RgbaImage::from_raw(width, height, bytes).ok_or_else(|| {
+                anyhow!(
+                    "annotation server received invalid image payload for {}x{}",
+                    width,
+                    height
+                )
+            })?;
+            Ok(Some(ServerCommand::Open(EditorRequest {
+                image,
+                placement,
+                temp_dir,
+                output_path,
+            })))
+        }
+        SERVER_COMMAND_SHUTDOWN => Ok(Some(ServerCommand::Shutdown)),
+        other => Err(anyhow!("unknown annotation server command: {other}")),
+    }
+}
+
+fn write_server_ready(writer: &mut impl Write) -> Result<()> {
+    write_u8(writer, SERVER_SIGNAL_READY)
+}
+
+fn write_server_outcome(writer: &mut impl Write, outcome: &EditorOutcome) -> Result<()> {
+    match outcome {
+        EditorOutcome::Confirmed {
+            output_path,
+            temp_dir,
+        } => {
+            write_u8(writer, SERVER_SIGNAL_CONFIRMED)?;
+            write_string(writer, &output_path.to_string_lossy())?;
+            write_string(writer, &temp_dir.to_string_lossy())?;
+        }
+        EditorOutcome::Cancelled { temp_dir } => {
+            write_u8(writer, SERVER_SIGNAL_CANCELLED)?;
+            write_string(writer, &temp_dir.to_string_lossy())?;
+        }
+        EditorOutcome::Failed { message, temp_dir } => {
+            write_u8(writer, SERVER_SIGNAL_FAILED)?;
+            write_string(writer, message)?;
+            write_bool(writer, temp_dir.is_some())?;
+            if let Some(path) = temp_dir {
+                write_string(writer, &path.to_string_lossy())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_server_signal(reader: &mut impl Read) -> Result<Option<ServerSignal>> {
+    let Some(tag) = read_u8_opt(reader)? else {
+        return Ok(None);
+    };
+    match tag {
+        SERVER_SIGNAL_READY => Ok(Some(ServerSignal::Ready)),
+        SERVER_SIGNAL_CONFIRMED => Ok(Some(ServerSignal::Outcome(EditorOutcome::Confirmed {
+            output_path: PathBuf::from(read_string(reader)?),
+            temp_dir: PathBuf::from(read_string(reader)?),
+        }))),
+        SERVER_SIGNAL_CANCELLED => Ok(Some(ServerSignal::Outcome(EditorOutcome::Cancelled {
+            temp_dir: PathBuf::from(read_string(reader)?),
+        }))),
+        SERVER_SIGNAL_FAILED => {
+            let message = read_string(reader)?;
+            let has_temp_dir = read_bool(reader)?;
+            let temp_dir = if has_temp_dir {
+                Some(PathBuf::from(read_string(reader)?))
+            } else {
+                None
+            };
+            Ok(Some(ServerSignal::Outcome(EditorOutcome::Failed {
+                message,
+                temp_dir,
+            })))
+        }
+        other => Err(anyhow!("unknown annotation server signal: {other}")),
+    }
+}
+
+fn write_u8(writer: &mut impl Write, value: u8) -> Result<()> {
+    writer.write_all(&[value]).map_err(Into::into)
+}
+
+fn read_u8_opt(reader: &mut impl Read) -> Result<Option<u8>> {
+    let mut buffer = [0u8; 1];
+    let read = reader.read(&mut buffer)?;
+    if read == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(buffer[0]))
+    }
+}
+
+fn write_bool(writer: &mut impl Write, value: bool) -> Result<()> {
+    write_u8(writer, if value { 1 } else { 0 })
+}
+
+fn read_bool(reader: &mut impl Read) -> Result<bool> {
+    Ok(read_u8(reader)? != 0)
+}
+
+fn read_u8(reader: &mut impl Read) -> Result<u8> {
+    let mut buffer = [0u8; 1];
+    reader.read_exact(&mut buffer)?;
+    Ok(buffer[0])
+}
+
+fn write_u32(writer: &mut impl Write, value: u32) -> Result<()> {
+    writer.write_all(&value.to_le_bytes()).map_err(Into::into)
+}
+
+fn read_u32(reader: &mut impl Read) -> Result<u32> {
+    let mut buffer = [0u8; 4];
+    reader.read_exact(&mut buffer)?;
+    Ok(u32::from_le_bytes(buffer))
+}
+
+fn write_i32(writer: &mut impl Write, value: i32) -> Result<()> {
+    writer.write_all(&value.to_le_bytes()).map_err(Into::into)
+}
+
+fn read_i32(reader: &mut impl Read) -> Result<i32> {
+    let mut buffer = [0u8; 4];
+    reader.read_exact(&mut buffer)?;
+    Ok(i32::from_le_bytes(buffer))
+}
+
+fn write_u64(writer: &mut impl Write, value: u64) -> Result<()> {
+    writer.write_all(&value.to_le_bytes()).map_err(Into::into)
+}
+
+fn read_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut buffer = [0u8; 8];
+    reader.read_exact(&mut buffer)?;
+    Ok(u64::from_le_bytes(buffer))
+}
+
+fn write_string(writer: &mut impl Write, value: &str) -> Result<()> {
+    write_bytes(writer, value.as_bytes())
+}
+
+fn read_string(reader: &mut impl Read) -> Result<String> {
+    String::from_utf8(read_bytes(reader)?).context("annotation server received invalid UTF-8")
+}
+
+fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    write_u64(writer, bytes.len() as u64)?;
+    writer.write_all(bytes).map_err(Into::into)
+}
+
+fn read_bytes(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let length = read_u64(reader)?;
+    let mut bytes = vec![0; length as usize];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn initial_window_size(image: &RgbaImage) -> [f32; 2] {
@@ -565,6 +992,31 @@ fn full_image_selection(image: &RgbaImage) -> NormalizedRect {
     }
 }
 
+fn persistent_editor_viewport_id() -> ViewportId {
+    ViewportId::from_hash_of(PERSISTENT_EDITOR_VIEWPORT)
+}
+
+fn build_editor_viewport(editor: &AnnotationEditorApp) -> ViewportBuilder {
+    let layout = editor
+        .inline_layout
+        .expect("persistent editor must always use inline layout");
+    ViewportBuilder::default()
+        .with_title("OpenCapt Annotate")
+        .with_inner_size(layout.window_size)
+        .with_min_inner_size(layout.window_size)
+        .with_max_inner_size(layout.window_size)
+        .with_position(layout.window_pos)
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_taskbar(false)
+        .with_close_button(false)
+        .with_minimize_button(false)
+        .with_maximize_button(false)
+        .with_active(true)
+        .with_always_on_top()
+}
+
 fn build_inline_layout(image: &RgbaImage, placement: EditorPlacement) -> InlineLayout {
     let pixels_per_point = placement.scale_factor();
     let scale = pixels_per_point;
@@ -580,6 +1032,133 @@ fn build_inline_layout(image: &RgbaImage, placement: EditorPlacement) -> InlineL
         window_size: snap_vec(window_size, pixels_per_point),
         image_rect: snap_rect(image_rect, pixels_per_point),
         pixels_per_point,
+    }
+}
+
+
+impl PersistentEditorApp {
+    fn new(
+        ctx: EguiContext,
+        command_rx: mpsc::Receiver<ServerCommand>,
+        result_tx: mpsc::Sender<EditorOutcome>,
+    ) -> Self {
+        configure_theme(&ctx, true);
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(HIDDEN_HOST_POSITION));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(HIDDEN_HOST_SIZE));
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(HIDDEN_HOST_SIZE));
+        Self {
+            command_rx,
+            result_tx,
+            editor: None,
+            current_temp_dir: None,
+            should_close: false,
+        }
+    }
+
+    fn handle_commands(&mut self, ctx: &EguiContext) {
+        while let Ok(command) = self.command_rx.try_recv() {
+            match command {
+                ServerCommand::Open(request) => {
+                    tracing::info!(width = request.image.width(), height = request.image.height(), "persistent annotation server received open request");
+                    self.open_request(ctx, request)
+                }
+                ServerCommand::Shutdown => {
+                    self.should_close = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn open_request(&mut self, ctx: &EguiContext, request: EditorRequest) {
+        let layout = build_inline_layout(&request.image, request.placement);
+        let selection = selection_rect_from_placement(&request.image, request.placement);
+        let mut editor = AnnotationEditorApp::new(
+            ctx.clone(),
+            request.image,
+            request.output_path,
+            Some(layout),
+            selection,
+        );
+        let _ = editor.texture(ctx);
+        self.current_temp_dir = Some(request.temp_dir);
+        self.editor = Some(editor);
+        ctx.request_repaint();
+    }
+
+    fn hide_editor(&mut self, ctx: &EguiContext) {
+        self.editor = None;
+        self.current_temp_dir = None;
+        ctx.send_viewport_cmd_to(
+            persistent_editor_viewport_id(),
+            ViewportCommand::Close,
+        );
+        ctx.request_repaint();
+    }
+}
+
+impl eframe::App for PersistentEditorApp {
+    fn update(&mut self, ctx: &EguiContext, _frame: &mut eframe::Frame) {
+        self.handle_commands(ctx);
+        if self.should_close {
+            return;
+        }
+
+        CentralPanel::default()
+            .frame(Frame::new().fill(Color32::TRANSPARENT))
+            .show(ctx, |_ui| {});
+
+        let mut pending_outcome = None;
+        let mut should_hide = false;
+        if let Some(editor) = self.editor.as_mut() {
+            let viewport_id = persistent_editor_viewport_id();
+            let builder = build_editor_viewport(editor);
+            tracing::info!("persistent annotation child viewport active");
+            ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                    editor.request_cancel();
+                }
+                editor.draw(ctx);
+            });
+            match editor.take_pending_action() {
+                Some(PendingAction::Confirm) => {
+                    if let Some(temp_dir) = self.current_temp_dir.clone() {
+                        match editor.save_output() {
+                            Ok(()) => {
+                                pending_outcome = Some(EditorOutcome::Confirmed {
+                                    output_path: editor.output_path.clone(),
+                                    temp_dir,
+                                });
+                                should_hide = true;
+                            }
+                            Err(error) => editor.error_message = Some(error.to_string()),
+                        }
+                    } else {
+                        editor.error_message = Some("missing annotation temp directory".to_string());
+                    }
+                }
+                Some(PendingAction::Cancel) => {
+                    editor.discard_output();
+                    if let Some(temp_dir) = self.current_temp_dir.clone() {
+                        pending_outcome = Some(EditorOutcome::Cancelled { temp_dir });
+                    }
+                    should_hide = true;
+                }
+                None => {}
+            }
+        }
+
+        if let Some(outcome) = pending_outcome {
+            let _ = self.result_tx.send(outcome);
+        }
+        if should_hide {
+            self.hide_editor(ctx);
+        }
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
 }
 
@@ -614,6 +1193,7 @@ impl AnnotationEditorApp {
             image_rect: inline_layout.map(|layout| layout.image_rect),
             inline_layout,
             error_message: None,
+            pending_action: None,
         }
     }
     fn texture<'a>(&'a mut self, ctx: &EguiContext) -> &'a TextureHandle {
@@ -650,10 +1230,10 @@ impl AnnotationEditorApp {
             self.delete_selected();
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter)) {
-            self.confirm_and_close(ctx);
+            self.request_confirm();
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-            self.cancel_and_close(ctx);
+            self.request_cancel();
         }
     }
 
@@ -678,18 +1258,26 @@ impl AnnotationEditorApp {
         }
     }
 
-    fn confirm_and_close(&mut self, ctx: &EguiContext) {
-        match self.render_annotated_image().save(&self.output_path) {
-            Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
-            Err(error) => {
-                self.error_message = Some(format!("failed to save annotation result: {error}"));
-            }
-        }
+    fn request_confirm(&mut self) {
+        self.pending_action = Some(PendingAction::Confirm);
     }
 
-    fn cancel_and_close(&mut self, ctx: &EguiContext) {
+    fn request_cancel(&mut self) {
+        self.pending_action = Some(PendingAction::Cancel);
+    }
+
+    fn take_pending_action(&mut self) -> Option<PendingAction> {
+        self.pending_action.take()
+    }
+
+    fn save_output(&mut self) -> Result<()> {
+        self.render_annotated_image()
+            .save(&self.output_path)
+            .with_context(|| format!("failed to save annotation result at {}", self.output_path.display()))
+    }
+
+    fn discard_output(&mut self) {
         let _ = fs::remove_file(&self.output_path);
-        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
     fn toolbar_anchor_rect(&self) -> Option<Rect> {
@@ -810,7 +1398,7 @@ impl AnnotationEditorApp {
                                     false,
                                     Some(TOOL_CONFIRM),
                                     false,
-                                    || self.confirm_and_close(ctx),
+                                    || self.request_confirm(),
                                 );
                                 glyph_button(
                                     ui,
@@ -818,7 +1406,7 @@ impl AnnotationEditorApp {
                                     false,
                                     Some(TOOL_CANCEL),
                                     false,
-                                    || self.cancel_and_close(ctx),
+                                    || self.request_cancel(),
                                 );
                             });
                         });
@@ -1366,8 +1954,8 @@ impl AnnotationEditorApp {
     }
 }
 
-impl eframe::App for AnnotationEditorApp {
-    fn update(&mut self, ctx: &EguiContext, _frame: &mut eframe::Frame) {
+impl AnnotationEditorApp {
+    fn draw(&mut self, ctx: &EguiContext) {
         if let Some(layout) = self.inline_layout {
             if (ctx.pixels_per_point() - layout.pixels_per_point).abs() > 0.01 {
                 ctx.set_pixels_per_point(layout.pixels_per_point);
@@ -1402,6 +1990,23 @@ impl eframe::App for AnnotationEditorApp {
                             ui.label(RichText::new(message).color(TEXT_BRIGHT));
                         });
                 });
+        }
+    }
+}
+
+impl eframe::App for AnnotationEditorApp {
+    fn update(&mut self, ctx: &EguiContext, _frame: &mut eframe::Frame) {
+        self.draw(ctx);
+        match self.take_pending_action() {
+            Some(PendingAction::Confirm) => match self.save_output() {
+                Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                Err(error) => self.error_message = Some(error.to_string()),
+            },
+            Some(PendingAction::Cancel) => {
+                self.discard_output();
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            None => {}
         }
     }
 
