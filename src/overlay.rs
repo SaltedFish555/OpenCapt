@@ -99,6 +99,8 @@ enum AnnotationTool {
     Mouse,
     Select,
     Rectangle,
+    Ellipse,
+    Line,
     Arrow,
     Text,
 }
@@ -128,6 +130,16 @@ struct TextDraft {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AnnotationShape {
     Rectangle {
+        start: CursorPoint,
+        end: CursorPoint,
+        style: ShapeStyle,
+    },
+    Ellipse {
+        start: CursorPoint,
+        end: CursorPoint,
+        style: ShapeStyle,
+    },
+    Line {
         start: CursorPoint,
         end: CursorPoint,
         style: ShapeStyle,
@@ -205,6 +217,8 @@ enum ToolbarAction {
     MouseTool,
     SelectTool,
     RectangleTool,
+    EllipseTool,
+    LineTool,
     ArrowTool,
     TextTool,
     Color(usize),
@@ -239,6 +253,12 @@ struct IntRect {
 struct ToolbarItem {
     rect: IntRect,
     action: ToolbarAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizableShapeKind {
+    Rectangle,
+    Ellipse,
 }
 
 #[derive(Debug, Clone)]
@@ -470,6 +490,8 @@ impl OverlayState {
             AnnotationTool::Mouse => false,
             AnnotationTool::Select => true,
             AnnotationTool::Rectangle => matches!(shape, AnnotationShape::Rectangle { .. }),
+            AnnotationTool::Ellipse => matches!(shape, AnnotationShape::Ellipse { .. }),
+            AnnotationTool::Line => matches!(shape, AnnotationShape::Line { .. }),
             AnnotationTool::Arrow => matches!(shape, AnnotationShape::Arrow { .. }),
             AnnotationTool::Text => matches!(shape, AnnotationShape::Text { .. }),
         }
@@ -527,17 +549,30 @@ impl OverlayState {
         }
     }
 
-    fn selected_rectangle_for_editing(&self) -> Option<(usize, NormalizedRect, ShapeStyle)> {
+    fn selected_resizable_shape_for_editing(
+        &self,
+    ) -> Option<(usize, NormalizedRect, ShapeStyle, ResizableShapeKind)> {
         let index = self.selected_shape?;
         let shape = self.shapes.get(index)?;
         if !self.tool_can_interact_with_shape(shape) {
             return None;
         }
         match shape {
-            AnnotationShape::Rectangle { start, end, style } => {
-                Some((index, NormalizedRect::from_points(*start, *end)?, *style))
-            }
-            AnnotationShape::Arrow { .. } | AnnotationShape::Text { .. } => None,
+            AnnotationShape::Rectangle { start, end, style } => Some((
+                index,
+                NormalizedRect::from_points(*start, *end)?,
+                *style,
+                ResizableShapeKind::Rectangle,
+            )),
+            AnnotationShape::Ellipse { start, end, style } => Some((
+                index,
+                NormalizedRect::from_points(*start, *end)?,
+                *style,
+                ResizableShapeKind::Ellipse,
+            )),
+            AnnotationShape::Line { .. }
+            | AnnotationShape::Arrow { .. }
+            | AnnotationShape::Text { .. } => None,
         }
     }
 
@@ -546,7 +581,7 @@ impl OverlayState {
     }
 
     fn shape_resize_handle_at(&self, point: CursorPoint) -> Option<ResizeHandle> {
-        let (_, rect, _) = self.selected_rectangle_for_editing()?;
+        let (_, rect, _, _) = self.selected_resizable_shape_for_editing()?;
         ResizeHandle::hit_at(rect, point)
     }
 
@@ -596,6 +631,8 @@ impl OverlayState {
             (ToolbarAction::MouseTool, TOOLBAR_BUTTON),
             (ToolbarAction::SelectTool, TOOLBAR_BUTTON),
             (ToolbarAction::RectangleTool, TOOLBAR_BUTTON),
+            (ToolbarAction::EllipseTool, TOOLBAR_BUTTON),
+            (ToolbarAction::LineTool, TOOLBAR_BUTTON),
             (ToolbarAction::ArrowTool, TOOLBAR_BUTTON),
             (ToolbarAction::TextTool, TOOLBAR_BUTTON),
             (ToolbarAction::Color(0), TOOLBAR_COLOR),
@@ -615,7 +652,7 @@ impl OverlayState {
             total_width += *width;
             if index + 1 != item_defs.len() {
                 total_width += match index {
-                    4 | 9 | 12 | 13 => TOOLBAR_GROUP_GAP,
+                    6 | 11 | 14 | 15 => TOOLBAR_GROUP_GAP,
                     _ => TOOLBAR_ITEM_GAP,
                 };
             }
@@ -654,7 +691,7 @@ impl OverlayState {
             cursor_x += width;
             if index + 1 != item_defs.len() {
                 cursor_x += match index {
-                    4 | 9 | 12 | 13 => TOOLBAR_GROUP_GAP,
+                    6 | 11 | 14 | 15 => TOOLBAR_GROUP_GAP,
                     _ => TOOLBAR_ITEM_GAP,
                 };
             }
@@ -842,6 +879,31 @@ impl DraftShape {
                     })
                 }
             }
+            AnnotationTool::Ellipse => {
+                let rect = NormalizedRect::from_points(self.start, self.current)?;
+                if rect.width() < MIN_SELECTION_SPAN || rect.height() < MIN_SELECTION_SPAN {
+                    None
+                } else {
+                    Some(AnnotationShape::Ellipse {
+                        start: self.start,
+                        end: self.current,
+                        style: self.style,
+                    })
+                }
+            }
+            AnnotationTool::Line => {
+                let dx = self.current.x - self.start.x;
+                let dy = self.current.y - self.start.y;
+                if dx * dx + dy * dy < 16 {
+                    None
+                } else {
+                    Some(AnnotationShape::Line {
+                        start: self.start,
+                        end: self.current,
+                        style: self.style,
+                    })
+                }
+            }
             AnnotationTool::Arrow => {
                 let dx = self.current.x - self.start.x;
                 let dy = self.current.y - self.start.y;
@@ -863,6 +925,8 @@ impl AnnotationShape {
     fn bounds(&self) -> NormalizedRect {
         match self {
             AnnotationShape::Rectangle { start, end, .. }
+            | AnnotationShape::Ellipse { start, end, .. }
+            | AnnotationShape::Line { start, end, .. }
             | AnnotationShape::Arrow { start, end, .. } => {
                 let left = start.x.min(end.x);
                 let top = start.y.min(end.y);
@@ -886,6 +950,28 @@ impl AnnotationShape {
     fn translated(&self, dx: i32, dy: i32) -> Self {
         match self {
             AnnotationShape::Rectangle { start, end, style } => AnnotationShape::Rectangle {
+                start: CursorPoint {
+                    x: start.x + dx,
+                    y: start.y + dy,
+                },
+                end: CursorPoint {
+                    x: end.x + dx,
+                    y: end.y + dy,
+                },
+                style: *style,
+            },
+            AnnotationShape::Ellipse { start, end, style } => AnnotationShape::Ellipse {
+                start: CursorPoint {
+                    x: start.x + dx,
+                    y: start.y + dy,
+                },
+                end: CursorPoint {
+                    x: end.x + dx,
+                    y: end.y + dy,
+                },
+                style: *style,
+            },
+            AnnotationShape::Line { start, end, style } => AnnotationShape::Line {
                 start: CursorPoint {
                     x: start.x + dx,
                     y: start.y + dy,
@@ -961,7 +1047,15 @@ impl AnnotationShape {
                     !inner.contains(point)
                 }
             }
-            AnnotationShape::Arrow { start, end, style } => {
+            AnnotationShape::Ellipse { start, end, style } => {
+                let Some(rect) = NormalizedRect::from_points(*start, *end) else {
+                    return false;
+                };
+                let padding = style.stroke.max(2) as f32 + 4.0;
+                ellipse_hit_test(point, rect, padding, selected)
+            }
+            AnnotationShape::Line { start, end, style }
+            | AnnotationShape::Arrow { start, end, style } => {
                 distance_to_segment(point, *start, *end)
                     <= (style.stroke.max(2) as f32 + if selected { 7.0 } else { 5.0 })
             }
@@ -1409,16 +1503,33 @@ fn handle_mouse_move(state: &mut OverlayState, point: CursorPoint) {
             if let Some(shape) = state.shapes.get_mut(*shape_index) {
                 let rect =
                     handle.resized_rect_with_bounds(*original_rect, clamped, selection_bounds);
-                *shape = AnnotationShape::Rectangle {
-                    start: CursorPoint {
-                        x: rect.left,
-                        y: rect.top,
+                let kind = match shape {
+                    AnnotationShape::Ellipse { .. } => ResizableShapeKind::Ellipse,
+                    _ => ResizableShapeKind::Rectangle,
+                };
+                *shape = match kind {
+                    ResizableShapeKind::Rectangle => AnnotationShape::Rectangle {
+                        start: CursorPoint {
+                            x: rect.left,
+                            y: rect.top,
+                        },
+                        end: CursorPoint {
+                            x: rect.right,
+                            y: rect.bottom,
+                        },
+                        style: *style,
                     },
-                    end: CursorPoint {
-                        x: rect.right,
-                        y: rect.bottom,
+                    ResizableShapeKind::Ellipse => AnnotationShape::Ellipse {
+                        start: CursorPoint {
+                            x: rect.left,
+                            y: rect.top,
+                        },
+                        end: CursorPoint {
+                            x: rect.right,
+                            y: rect.bottom,
+                        },
+                        style: *style,
                     },
-                    style: *style,
                 };
                 state.composed_dirty = true;
             }
@@ -1463,7 +1574,9 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
                 return false;
             }
             if let Some(handle) = state.shape_resize_handle_at(point) {
-                if let Some((shape_index, rect, style)) = state.selected_rectangle_for_editing() {
+                if let Some((shape_index, rect, style, _)) =
+                    state.selected_resizable_shape_for_editing()
+                {
                     state.active_drag = Some(ActiveDrag::ResizeShape {
                         shape_index,
                         handle,
@@ -1514,7 +1627,10 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
             }
             if matches!(
                 state.tool,
-                AnnotationTool::Rectangle | AnnotationTool::Arrow
+                AnnotationTool::Rectangle
+                    | AnnotationTool::Ellipse
+                    | AnnotationTool::Line
+                    | AnnotationTool::Arrow
             ) && state.point_in_selection(point)
             {
                 let point = state.clamp_point_to_selection(point);
@@ -1752,6 +1868,22 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
             }
             false
         }
+        0x4F => {
+            if state.mode == OverlayMode::Annotating {
+                commit_text_input(state);
+                state.tool = AnnotationTool::Ellipse;
+                state.sync_selected_shape_with_tool();
+            }
+            false
+        }
+        0x4C => {
+            if state.mode == OverlayMode::Annotating {
+                commit_text_input(state);
+                state.tool = AnnotationTool::Line;
+                state.sync_selected_shape_with_tool();
+            }
+            false
+        }
         0x41 => {
             if state.mode == OverlayMode::Annotating {
                 commit_text_input(state);
@@ -1810,6 +1942,14 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
         ToolbarAction::RectangleTool => {
             commit_text_input(state);
             state.tool = AnnotationTool::Rectangle;
+        }
+        ToolbarAction::EllipseTool => {
+            commit_text_input(state);
+            state.tool = AnnotationTool::Ellipse;
+        }
+        ToolbarAction::LineTool => {
+            commit_text_input(state);
+            state.tool = AnnotationTool::Line;
         }
         ToolbarAction::ArrowTool => {
             commit_text_input(state);
@@ -2072,6 +2212,8 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::MouseTool => state.tool == AnnotationTool::Mouse,
         ToolbarAction::SelectTool => state.tool == AnnotationTool::Select,
         ToolbarAction::RectangleTool => state.tool == AnnotationTool::Rectangle,
+        ToolbarAction::EllipseTool => state.tool == AnnotationTool::Ellipse,
+        ToolbarAction::LineTool => state.tool == AnnotationTool::Line,
         ToolbarAction::ArrowTool => state.tool == AnnotationTool::Arrow,
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
         ToolbarAction::Color(index) => state.color_index == index,
@@ -2122,6 +2264,20 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             TOOLBAR_TEXT,
         ),
         ToolbarAction::RectangleTool => draw_rectangle_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::EllipseTool => draw_ellipse_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::LineTool => draw_line_glyph(
             &mut state.frame,
             state.target.width,
             state.target.height,
@@ -2449,6 +2605,36 @@ fn draw_rectangle_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRec
     let radius = ((icon_scale(icon) * 2.0).round() as i32).max(1);
     stroke_rounded_rect(frame, width, height, glyph, radius, color);
 }
+fn draw_ellipse_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let start = map_icon_point(icon, 3.0, 4.0);
+    let end = map_icon_point(icon, 21.0, 20.0);
+    draw_ellipse_outline(
+        frame,
+        NormalizedRect {
+            left: start.x,
+            top: start.y,
+            right: end.x + 1,
+            bottom: end.y + 1,
+        },
+        width,
+        height,
+        1,
+        color,
+    );
+}
+fn draw_line_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    draw_line(
+        frame,
+        width,
+        height,
+        map_icon_point(icon, 4.0, 18.0),
+        map_icon_point(icon, 20.0, 6.0),
+        color,
+        2,
+    );
+}
 fn draw_arrow_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
     let p1 = map_icon_point(icon, 5.0, 19.0);
@@ -2567,6 +2753,20 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
                 draw_rect_outline(frame, rect.expanded(2), width, height, 1, SELECTION_ACCENT);
             }
         }
+        AnnotationShape::Ellipse { start, end, .. } => {
+            if let Some(rect) = NormalizedRect::from_points(*start, *end) {
+                draw_ellipse_outline(frame, rect.expanded(2), width, height, 1, SELECTION_ACCENT);
+            }
+        }
+        AnnotationShape::Line { start, end, style } => draw_line(
+            frame,
+            width,
+            height,
+            *start,
+            *end,
+            SELECTION_ACCENT,
+            style.stroke as i32 + 2,
+        ),
         AnnotationShape::Arrow { start, end, style } => draw_arrow(
             frame,
             width,
@@ -2594,7 +2794,9 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
 }
 
 fn paint_shape_handles(frame: &mut [u32], width: u32, height: u32, shape: &AnnotationShape) {
-    if let AnnotationShape::Rectangle { start, end, .. } = shape {
+    if let AnnotationShape::Rectangle { start, end, .. }
+    | AnnotationShape::Ellipse { start, end, .. } = shape
+    {
         if let Some(rect) = NormalizedRect::from_points(*start, *end) {
             for (_, center) in ResizeHandle::positions(rect) {
                 draw_handle_square(
@@ -2618,6 +2820,20 @@ fn draw_shape_image(frame: &mut [u32], width: u32, height: u32, shape: &Annotati
                 draw_rect_outline(frame, rect, width, height, style.stroke as i32, style.color);
             }
         }
+        AnnotationShape::Ellipse { start, end, style } => {
+            if let Some(rect) = NormalizedRect::from_points(*start, *end) {
+                draw_ellipse_outline(frame, rect, width, height, style.stroke as i32, style.color);
+            }
+        }
+        AnnotationShape::Line { start, end, style } => draw_line(
+            frame,
+            width,
+            height,
+            *start,
+            *end,
+            style.color,
+            style.stroke as i32,
+        ),
         AnnotationShape::Arrow { start, end, style } => draw_arrow(
             frame,
             width,
@@ -2877,6 +3093,72 @@ fn draw_rect_outline(
         }
     }
 }
+fn ellipse_hit_test(
+    point: CursorPoint,
+    rect: NormalizedRect,
+    padding: f32,
+    selected: bool,
+) -> bool {
+    let outer = ellipse_equation_value(point, rect.expanded(padding.ceil() as i32));
+    if outer > 1.0 {
+        return false;
+    }
+    if selected {
+        return true;
+    }
+    let inset = padding.ceil() as i32;
+    let inner = NormalizedRect {
+        left: rect.left + inset,
+        top: rect.top + inset,
+        right: rect.right - inset,
+        bottom: rect.bottom - inset,
+    };
+    if inner.width() <= 2 || inner.height() <= 2 {
+        return true;
+    }
+    ellipse_equation_value(point, inner) >= 1.0
+}
+
+fn ellipse_equation_value(point: CursorPoint, rect: NormalizedRect) -> f32 {
+    let rx = rect.width().max(1) as f32 / 2.0;
+    let ry = rect.height().max(1) as f32 / 2.0;
+    let cx = rect.left as f32 + rx;
+    let cy = rect.top as f32 + ry;
+    let dx = (point.x as f32 - cx) / rx;
+    let dy = (point.y as f32 - cy) / ry;
+    dx * dx + dy * dy
+}
+
+fn draw_ellipse_outline(
+    frame: &mut [u32],
+    rect: NormalizedRect,
+    width: u32,
+    height: u32,
+    thickness: i32,
+    color: u32,
+) {
+    let rx = rect.width().max(1) as f32 / 2.0;
+    let ry = rect.height().max(1) as f32 / 2.0;
+    let cx = rect.left as f32 + rx;
+    let cy = rect.top as f32 + ry;
+    let steps = ((rx.max(ry) * 6.0).round() as i32).clamp(48, 256);
+    let radius = (thickness.max(1) + 1) / 2;
+    for step in 0..=steps {
+        let theta = (step as f32 / steps as f32) * std::f32::consts::TAU;
+        let x = cx + rx * theta.cos();
+        let y = cy + ry * theta.sin();
+        draw_disc(
+            frame,
+            width,
+            height,
+            x.round() as i32,
+            y.round() as i32,
+            radius,
+            color,
+        );
+    }
+}
+
 fn draw_arrow(
     frame: &mut [u32],
     width: u32,
