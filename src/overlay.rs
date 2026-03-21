@@ -43,17 +43,17 @@ const PREVIEW_BRIGHTNESS_PERCENT: u32 = 60;
 const CLASS_NAME: windows::core::PCWSTR = w!("OpenCaptOverlayWindow");
 const COLOR_PRESETS: [u32; 5] = [0xF14C4C, 0xFF8C00, 0xF2C94C, 0x2ECC71, 0x4F8CFF];
 const STROKE_PRESETS: [u32; 3] = [2, 4, 6];
-const TOOLBAR_PADDING: i32 = 6;
-const TOOLBAR_GROUP_GAP: i32 = 6;
-const TOOLBAR_ITEM_GAP: i32 = 4;
-const TOOLBAR_BUTTON: i32 = 24;
-const TOOLBAR_COLOR: i32 = 18;
-const TOOLBAR_STROKE_WIDTH: i32 = 24;
-const TOOLBAR_HEIGHT: i32 = 36;
-const TOOLBAR_PANEL_RADIUS: i32 = 10;
-const TOOLBAR_BUTTON_RADIUS: i32 = 8;
-const TOOLBAR_ICON_MARGIN: i32 = 4;
-const TOOLBAR_MARGIN: i32 = 14;
+const TOOLBAR_PADDING: i32 = 8;
+const TOOLBAR_GROUP_GAP: i32 = 8;
+const TOOLBAR_ITEM_GAP: i32 = 6;
+const TOOLBAR_BUTTON: i32 = 30;
+const TOOLBAR_COLOR: i32 = 22;
+const TOOLBAR_STROKE_WIDTH: i32 = 30;
+const TOOLBAR_HEIGHT: i32 = 44;
+const TOOLBAR_PANEL_RADIUS: i32 = 12;
+const TOOLBAR_BUTTON_RADIUS: i32 = 10;
+const TOOLBAR_ICON_MARGIN: i32 = 5;
+const TOOLBAR_MARGIN: i32 = 18;
 const WINDOW_MARGIN: i32 = 10;
 const HANDLE_SIZE: i32 = 7;
 const HANDLE_HIT_RADIUS: i32 = 11;
@@ -94,6 +94,7 @@ struct ShapeStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnotationTool {
+    Mouse,
     Select,
     Rectangle,
     Arrow,
@@ -159,6 +160,7 @@ enum ActiveDrag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolbarAction {
+    MouseTool,
     SelectTool,
     RectangleTool,
     ArrowTool,
@@ -262,7 +264,7 @@ impl OverlaySession {
             surface,
             mode: OverlayMode::Selecting,
             selection: None,
-            tool: AnnotationTool::Select,
+            tool: AnnotationTool::Mouse,
             color_index: 4,
             stroke_index: 0,
             shapes: Vec::new(),
@@ -352,7 +354,7 @@ impl OverlayState {
     fn reset_for_show(&mut self, cursor_x: i32, cursor_y: i32) {
         self.mode = OverlayMode::Selecting;
         self.selection = None;
-        self.tool = AnnotationTool::Select;
+        self.tool = AnnotationTool::Mouse;
         self.color_index = 4;
         self.stroke_index = 0;
         self.shapes.clear();
@@ -465,6 +467,9 @@ impl OverlayState {
         if self.mode != OverlayMode::Annotating {
             return None;
         }
+        if self.tool == AnnotationTool::Mouse {
+            return None;
+        }
         if let Some(handle) = self.selection_resize_handle_at(point) {
             return Some(CanvasHoverAction::ResizeSelection(handle));
         }
@@ -486,6 +491,7 @@ impl OverlayState {
         }
         let selection = self.selection?;
         let item_defs = [
+            (ToolbarAction::MouseTool, TOOLBAR_BUTTON),
             (ToolbarAction::SelectTool, TOOLBAR_BUTTON),
             (ToolbarAction::RectangleTool, TOOLBAR_BUTTON),
             (ToolbarAction::ArrowTool, TOOLBAR_BUTTON),
@@ -506,7 +512,7 @@ impl OverlayState {
             total_width += *width;
             if index + 1 != item_defs.len() {
                 total_width += match index {
-                    2 | 7 | 10 | 11 => TOOLBAR_GROUP_GAP,
+                    3 | 8 | 11 | 12 => TOOLBAR_GROUP_GAP,
                     _ => TOOLBAR_ITEM_GAP,
                 };
             }
@@ -535,7 +541,7 @@ impl OverlayState {
             cursor_x += width;
             if index + 1 != item_defs.len() {
                 cursor_x += match index {
-                    2 | 7 | 10 | 11 => TOOLBAR_GROUP_GAP,
+                    3 | 8 | 11 | 12 => TOOLBAR_GROUP_GAP,
                     _ => TOOLBAR_ITEM_GAP,
                 };
             }
@@ -569,7 +575,7 @@ impl OverlayState {
                 CanvasHoverAction::MoveSelection | CanvasHoverAction::MoveShape(_) => CursorKind::Move,
             };
         }
-        if self.tool != AnnotationTool::Select && self.point_in_selection(self.last_cursor) {
+        if !matches!(self.tool, AnnotationTool::Mouse | AnnotationTool::Select) && self.point_in_selection(self.last_cursor) {
             CursorKind::Crosshair
         } else {
             CursorKind::Arrow
@@ -655,7 +661,7 @@ impl NormalizedRect {
 impl DraftShape {
     fn to_shape(self) -> Option<AnnotationShape> {
         match self.tool {
-            AnnotationTool::Select => None,
+            AnnotationTool::Mouse | AnnotationTool::Select => None,
             AnnotationTool::Rectangle => {
                 let rect = NormalizedRect::from_points(self.start, self.current)?;
                 if rect.width() < MIN_SELECTION_SPAN || rect.height() < MIN_SELECTION_SPAN {
@@ -1005,6 +1011,10 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
             if let Some(action) = state.toolbar_action_at(point) {
                 return handle_toolbar_action(hwnd, state, action);
             }
+            if state.tool == AnnotationTool::Mouse {
+                state.selected_shape = None;
+                return false;
+            }
             if let Some(handle) = state.selection_resize_handle_at(point) {
                 if let Some(selection) = state.selection {
                     state.active_drag = Some(ActiveDrag::ResizeSelection { handle, original_rect: selection });
@@ -1035,7 +1045,7 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
                 }
                 return false;
             }
-            if state.tool != AnnotationTool::Select && state.point_in_selection(point) {
+            if !matches!(state.tool, AnnotationTool::Mouse | AnnotationTool::Select) && state.point_in_selection(point) {
                 let point = state.clamp_point_to_selection(point);
                 state.draft = Some(DraftShape { tool: state.tool, start: point, current: point, style: state.current_style() });
                 state.active_drag = Some(ActiveDrag::Drafting);
@@ -1056,7 +1066,7 @@ fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> 
             if let Some(rect) = SelectionRect::from_points(start, point) {
                 state.mode = OverlayMode::Annotating;
                 state.selection = Some(NormalizedRect::from_selection_rect(rect));
-                state.tool = AnnotationTool::Select;
+                state.tool = AnnotationTool::Mouse;
                 state.draft = None;
                 state.selected_shape = None;
                 return false;
@@ -1070,7 +1080,6 @@ fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> 
                     let new_index = state.shapes.len();
                     state.shapes.push(shape);
                     state.selected_shape = Some(new_index);
-                    state.tool = AnnotationTool::Select;
                     state.composed_dirty = true;
                 }
             }
@@ -1137,6 +1146,7 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
 
 fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAction) -> bool {
     match action {
+        ToolbarAction::MouseTool => state.tool = AnnotationTool::Mouse,
         ToolbarAction::SelectTool => state.tool = AnnotationTool::Select,
         ToolbarAction::RectangleTool => state.tool = AnnotationTool::Rectangle,
         ToolbarAction::ArrowTool => state.tool = AnnotationTool::Arrow,
@@ -1260,6 +1270,7 @@ fn paint_toolbar(state: &mut OverlayState) {
 fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
     let hovered = item.rect.contains(state.last_cursor);
     let selected = match item.action {
+        ToolbarAction::MouseTool => state.tool == AnnotationTool::Mouse,
         ToolbarAction::SelectTool => state.tool == AnnotationTool::Select,
         ToolbarAction::RectangleTool => state.tool == AnnotationTool::Rectangle,
         ToolbarAction::ArrowTool => state.tool == AnnotationTool::Arrow,
@@ -1272,6 +1283,7 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
     fill_rounded_rect(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_BUTTON_RADIUS, fill);
     stroke_rounded_rect(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_BUTTON_RADIUS, border);
     match item.action {
+        ToolbarAction::MouseTool => draw_mouse_glyph(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_TEXT),
         ToolbarAction::SelectTool => draw_select_glyph(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_TEXT),
         ToolbarAction::RectangleTool => draw_rectangle_glyph(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_TEXT),
         ToolbarAction::ArrowTool => draw_arrow_glyph(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_TEXT),
@@ -1395,6 +1407,20 @@ fn map_icon_point(rect: IntRect, x: f32, y: f32) -> CursorPoint {
 }
 
 fn draw_handle_square(frame: &mut [u32], width: u32, height: u32, center: CursorPoint, size: i32, fill: u32, border: u32) { let half = size / 2; let rect = IntRect { left: center.x - half, top: center.y - half, right: center.x + half + 1, bottom: center.y + half + 1 }; fill_rect(frame, width, height, rect, fill); stroke_rect(frame, width, height, rect, border); }
+fn draw_mouse_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let points = [
+        map_icon_point(icon, 4.0, 4.0),
+        map_icon_point(icon, 11.0, 19.0),
+        map_icon_point(icon, 14.0, 14.0),
+        map_icon_point(icon, 19.0, 11.0),
+        map_icon_point(icon, 4.0, 4.0),
+    ];
+    for segment in points.windows(2) {
+        draw_line(frame, width, height, segment[0], segment[1], color, 1);
+    }
+}
+
 fn draw_select_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
     let segments = [
@@ -1465,7 +1491,7 @@ fn pack_rgb(red: u8, green: u8, blue: u8) -> u32 { ((red as u32) << 16) | ((gree
 fn put_pixel(frame: &mut [u32], width: u32, height: u32, x: i32, y: i32, color: u32) { if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 { return; } frame[y as usize * width as usize + x as usize] = opaque(color); }
 fn point_from_lparam(lparam: LPARAM) -> CursorPoint { let value = lparam.0 as i32; CursorPoint { x: (value & 0xffff) as i16 as i32, y: ((value >> 16) & 0xffff) as i16 as i32 } }
 fn overlay_state(hwnd: HWND) -> Option<&'static mut OverlayState> { let state_ptr = unsafe { GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0)) } as *mut OverlayState; unsafe { state_ptr.as_mut() } }
-fn button_height(action: ToolbarAction) -> i32 { match action { ToolbarAction::Color(_) | ToolbarAction::Stroke(_) => 18, _ => TOOLBAR_BUTTON } }
+fn button_height(action: ToolbarAction) -> i32 { match action { ToolbarAction::Color(_) | ToolbarAction::Stroke(_) => TOOLBAR_COLOR, _ => TOOLBAR_BUTTON } }
 fn update_overlay_cursor(state: &OverlayState) { let cursor_id = match state.current_cursor() { CursorKind::Arrow => IDC_ARROW, CursorKind::Crosshair => IDC_CROSS, CursorKind::Hand => IDC_HAND, CursorKind::Move => IDC_SIZEALL, CursorKind::ResizeNwSe => IDC_SIZENWSE, CursorKind::ResizeNeSw => IDC_SIZENESW, CursorKind::ResizeHorizontal => IDC_SIZEWE, CursorKind::ResizeVertical => IDC_SIZENS, }; if let Ok(cursor) = unsafe { LoadCursorW(None, cursor_id) } { unsafe { let _ = SetCursor(Some(cursor)); } } }
 fn is_control_pressed() -> bool { unsafe { GetKeyState(VK_CONTROL.0.into()) < 0 } }
 fn apply_capture_exclusion(hwnd: HWND) { if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } { warn!(?error, "failed to exclude overlay window from capture"); } }
@@ -1504,6 +1530,9 @@ mod tests {
         assert_eq!(destination[3], opaque(source[3]));
     }
 }
+
+
+
 
 
 
