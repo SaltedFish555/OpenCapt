@@ -102,6 +102,7 @@ enum AnnotationTool {
     Ellipse,
     Line,
     Arrow,
+    Mosaic,
     Text,
 }
 
@@ -145,6 +146,11 @@ enum AnnotationShape {
         style: ShapeStyle,
     },
     Arrow {
+        start: CursorPoint,
+        end: CursorPoint,
+        style: ShapeStyle,
+    },
+    Mosaic {
         start: CursorPoint,
         end: CursorPoint,
         style: ShapeStyle,
@@ -220,6 +226,7 @@ enum ToolbarAction {
     EllipseTool,
     LineTool,
     ArrowTool,
+    MosaicTool,
     TextTool,
     Color(usize),
     Stroke(usize),
@@ -259,6 +266,7 @@ struct ToolbarItem {
 enum ResizableShapeKind {
     Rectangle,
     Ellipse,
+    Mosaic,
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +501,7 @@ impl OverlayState {
             AnnotationTool::Ellipse => matches!(shape, AnnotationShape::Ellipse { .. }),
             AnnotationTool::Line => matches!(shape, AnnotationShape::Line { .. }),
             AnnotationTool::Arrow => matches!(shape, AnnotationShape::Arrow { .. }),
+            AnnotationTool::Mosaic => matches!(shape, AnnotationShape::Mosaic { .. }),
             AnnotationTool::Text => matches!(shape, AnnotationShape::Text { .. }),
         }
     }
@@ -570,6 +579,12 @@ impl OverlayState {
                 *style,
                 ResizableShapeKind::Ellipse,
             )),
+            AnnotationShape::Mosaic { start, end, style } => Some((
+                index,
+                NormalizedRect::from_points(*start, *end)?,
+                *style,
+                ResizableShapeKind::Mosaic,
+            )),
             AnnotationShape::Line { .. }
             | AnnotationShape::Arrow { .. }
             | AnnotationShape::Text { .. } => None,
@@ -634,6 +649,7 @@ impl OverlayState {
             (ToolbarAction::EllipseTool, TOOLBAR_BUTTON),
             (ToolbarAction::LineTool, TOOLBAR_BUTTON),
             (ToolbarAction::ArrowTool, TOOLBAR_BUTTON),
+            (ToolbarAction::MosaicTool, TOOLBAR_BUTTON),
             (ToolbarAction::TextTool, TOOLBAR_BUTTON),
             (ToolbarAction::Color(0), TOOLBAR_COLOR),
             (ToolbarAction::Color(1), TOOLBAR_COLOR),
@@ -652,7 +668,7 @@ impl OverlayState {
             total_width += *width;
             if index + 1 != item_defs.len() {
                 total_width += match index {
-                    6 | 11 | 14 | 15 => TOOLBAR_GROUP_GAP,
+                    7 | 12 | 15 | 16 => TOOLBAR_GROUP_GAP,
                     _ => TOOLBAR_ITEM_GAP,
                 };
             }
@@ -917,6 +933,18 @@ impl DraftShape {
                     })
                 }
             }
+            AnnotationTool::Mosaic => {
+                let rect = NormalizedRect::from_points(self.start, self.current)?;
+                if rect.width() < MIN_SELECTION_SPAN || rect.height() < MIN_SELECTION_SPAN {
+                    None
+                } else {
+                    Some(AnnotationShape::Mosaic {
+                        start: self.start,
+                        end: self.current,
+                        style: self.style,
+                    })
+                }
+            }
         }
     }
 }
@@ -927,7 +955,8 @@ impl AnnotationShape {
             AnnotationShape::Rectangle { start, end, .. }
             | AnnotationShape::Ellipse { start, end, .. }
             | AnnotationShape::Line { start, end, .. }
-            | AnnotationShape::Arrow { start, end, .. } => {
+            | AnnotationShape::Arrow { start, end, .. }
+            | AnnotationShape::Mosaic { start, end, .. } => {
                 let left = start.x.min(end.x);
                 let top = start.y.min(end.y);
                 let right = start.x.max(end.x).max(left + 1);
@@ -983,6 +1012,17 @@ impl AnnotationShape {
                 style: *style,
             },
             AnnotationShape::Arrow { start, end, style } => AnnotationShape::Arrow {
+                start: CursorPoint {
+                    x: start.x + dx,
+                    y: start.y + dy,
+                },
+                end: CursorPoint {
+                    x: end.x + dx,
+                    y: end.y + dy,
+                },
+                style: *style,
+            },
+            AnnotationShape::Mosaic { start, end, style } => AnnotationShape::Mosaic {
                 start: CursorPoint {
                     x: start.x + dx,
                     y: start.y + dy,
@@ -1058,6 +1098,12 @@ impl AnnotationShape {
             | AnnotationShape::Arrow { start, end, style } => {
                 distance_to_segment(point, *start, *end)
                     <= (style.stroke.max(2) as f32 + if selected { 7.0 } else { 5.0 })
+            }
+            AnnotationShape::Mosaic { start, end, .. } => {
+                let Some(rect) = NormalizedRect::from_points(*start, *end) else {
+                    return false;
+                };
+                rect.expanded(if selected { 6 } else { 3 }).contains(point)
             }
             AnnotationShape::Text {
                 anchor,
@@ -1505,6 +1551,7 @@ fn handle_mouse_move(state: &mut OverlayState, point: CursorPoint) {
                     handle.resized_rect_with_bounds(*original_rect, clamped, selection_bounds);
                 let kind = match shape {
                     AnnotationShape::Ellipse { .. } => ResizableShapeKind::Ellipse,
+                    AnnotationShape::Mosaic { .. } => ResizableShapeKind::Mosaic,
                     _ => ResizableShapeKind::Rectangle,
                 };
                 *shape = match kind {
@@ -1520,6 +1567,17 @@ fn handle_mouse_move(state: &mut OverlayState, point: CursorPoint) {
                         style: *style,
                     },
                     ResizableShapeKind::Ellipse => AnnotationShape::Ellipse {
+                        start: CursorPoint {
+                            x: rect.left,
+                            y: rect.top,
+                        },
+                        end: CursorPoint {
+                            x: rect.right,
+                            y: rect.bottom,
+                        },
+                        style: *style,
+                    },
+                    ResizableShapeKind::Mosaic => AnnotationShape::Mosaic {
                         start: CursorPoint {
                             x: rect.left,
                             y: rect.top,
@@ -1631,6 +1689,7 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
                     | AnnotationTool::Ellipse
                     | AnnotationTool::Line
                     | AnnotationTool::Arrow
+                    | AnnotationTool::Mosaic
             ) && state.point_in_selection(point)
             {
                 let point = state.clamp_point_to_selection(point);
@@ -1892,6 +1951,14 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
             }
             false
         }
+        0x4D => {
+            if state.mode == OverlayMode::Annotating {
+                commit_text_input(state);
+                state.tool = AnnotationTool::Mosaic;
+                state.sync_selected_shape_with_tool();
+            }
+            false
+        }
         0x54 => {
             if state.mode == OverlayMode::Annotating {
                 commit_text_input(state);
@@ -1954,6 +2021,10 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
         ToolbarAction::ArrowTool => {
             commit_text_input(state);
             state.tool = AnnotationTool::Arrow;
+        }
+        ToolbarAction::MosaicTool => {
+            commit_text_input(state);
+            state.tool = AnnotationTool::Mosaic;
         }
         ToolbarAction::TextTool => {
             commit_text_input(state);
@@ -2215,6 +2286,7 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::EllipseTool => state.tool == AnnotationTool::Ellipse,
         ToolbarAction::LineTool => state.tool == AnnotationTool::Line,
         ToolbarAction::ArrowTool => state.tool == AnnotationTool::Arrow,
+        ToolbarAction::MosaicTool => state.tool == AnnotationTool::Mosaic,
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
         ToolbarAction::Color(index) => state.color_index == index,
         ToolbarAction::Stroke(index) => state.stroke_index == index,
@@ -2285,6 +2357,13 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             TOOLBAR_TEXT,
         ),
         ToolbarAction::ArrowTool => draw_arrow_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::MosaicTool => draw_mosaic_glyph(
             &mut state.frame,
             state.target.width,
             state.target.height,
@@ -2635,6 +2714,37 @@ fn draw_line_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, co
         2,
     );
 }
+fn draw_mosaic_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let left = map_icon_point(icon, 4.0, 4.0).x;
+    let top = map_icon_point(icon, 4.0, 4.0).y;
+    let right = map_icon_point(icon, 20.0, 20.0).x + 1;
+    let bottom = map_icon_point(icon, 20.0, 20.0).y + 1;
+    let cell_w = ((right - left) / 3).max(1);
+    let cell_h = ((bottom - top) / 3).max(1);
+    for row in 0..3 {
+        for col in 0..3 {
+            let cell = IntRect {
+                left: left + col * cell_w,
+                top: top + row * cell_h,
+                right: if col == 2 {
+                    right
+                } else {
+                    left + (col + 1) * cell_w
+                },
+                bottom: if row == 2 {
+                    bottom
+                } else {
+                    top + (row + 1) * cell_h
+                },
+            };
+            if (row + col) % 2 == 0 {
+                fill_rect(frame, width, height, cell, color);
+            }
+            stroke_rect(frame, width, height, cell, color);
+        }
+    }
+}
 fn draw_arrow_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
     let p1 = map_icon_point(icon, 5.0, 19.0);
@@ -2776,6 +2886,11 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
             style.stroke as i32 + 2,
             SELECTION_ACCENT,
         ),
+        AnnotationShape::Mosaic { start, end, .. } => {
+            if let Some(rect) = NormalizedRect::from_points(*start, *end) {
+                draw_rect_outline(frame, rect.expanded(2), width, height, 1, SELECTION_ACCENT);
+            }
+        }
         AnnotationShape::Text {
             anchor,
             text,
@@ -2795,7 +2910,8 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
 
 fn paint_shape_handles(frame: &mut [u32], width: u32, height: u32, shape: &AnnotationShape) {
     if let AnnotationShape::Rectangle { start, end, .. }
-    | AnnotationShape::Ellipse { start, end, .. } = shape
+    | AnnotationShape::Ellipse { start, end, .. }
+    | AnnotationShape::Mosaic { start, end, .. } = shape
     {
         if let Some(rect) = NormalizedRect::from_points(*start, *end) {
             for (_, center) in ResizeHandle::positions(rect) {
@@ -2843,6 +2959,11 @@ fn draw_shape_image(frame: &mut [u32], width: u32, height: u32, shape: &Annotati
             style.stroke as i32,
             style.color,
         ),
+        AnnotationShape::Mosaic { start, end, style } => {
+            if let Some(rect) = NormalizedRect::from_points(*start, *end) {
+                draw_mosaic_rect(frame, width, height, rect, mosaic_block_size(*style));
+            }
+        }
         AnnotationShape::Text {
             anchor,
             text,
@@ -3093,6 +3214,67 @@ fn draw_rect_outline(
         }
     }
 }
+fn mosaic_block_size(style: ShapeStyle) -> i32 {
+    match style.stroke {
+        0..=2 => 10,
+        3..=4 => 16,
+        _ => 24,
+    }
+}
+
+fn draw_mosaic_rect(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: NormalizedRect,
+    block_size: i32,
+) {
+    let bounds = NormalizedRect {
+        left: rect.left.max(0),
+        top: rect.top.max(0),
+        right: rect.right.min(width as i32),
+        bottom: rect.bottom.min(height as i32),
+    };
+    let block_size = block_size.max(2);
+    let mut y = bounds.top;
+    while y < bounds.bottom {
+        let mut x = bounds.left;
+        while x < bounds.right {
+            let block_right = (x + block_size).min(bounds.right);
+            let block_bottom = (y + block_size).min(bounds.bottom);
+            let mut sum_r = 0u32;
+            let mut sum_g = 0u32;
+            let mut sum_b = 0u32;
+            let mut count = 0u32;
+            for py in y..block_bottom {
+                let row = py as usize * width as usize;
+                for px in x..block_right {
+                    let pixel = frame[row + px as usize];
+                    sum_r += (pixel >> 16) & 0xff;
+                    sum_g += (pixel >> 8) & 0xff;
+                    sum_b += pixel & 0xff;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let color = pack_rgb(
+                    (sum_r / count) as u8,
+                    (sum_g / count) as u8,
+                    (sum_b / count) as u8,
+                );
+                for py in y..block_bottom {
+                    let row = py as usize * width as usize;
+                    for px in x..block_right {
+                        frame[row + px as usize] = opaque(color);
+                    }
+                }
+            }
+            x += block_size;
+        }
+        y += block_size;
+    }
+}
+
 fn ellipse_hit_test(
     point: CursorPoint,
     rect: NormalizedRect,
