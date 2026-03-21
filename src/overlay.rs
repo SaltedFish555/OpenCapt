@@ -79,6 +79,7 @@ pub struct SelectionRect {
 #[derive(Debug, Clone)]
 pub enum OverlaySignal {
     Completed(RgbaImage),
+    Pinned(RgbaImage),
     Cancelled,
 }
 
@@ -231,6 +232,7 @@ enum ToolbarAction {
     Color(usize),
     Stroke(usize),
     Undo,
+    Pin,
     Confirm,
     Cancel,
 }
@@ -660,6 +662,7 @@ impl OverlayState {
             (ToolbarAction::Stroke(1), TOOLBAR_STROKE_WIDTH),
             (ToolbarAction::Stroke(2), TOOLBAR_STROKE_WIDTH),
             (ToolbarAction::Undo, TOOLBAR_BUTTON),
+            (ToolbarAction::Pin, TOOLBAR_BUTTON),
             (ToolbarAction::Confirm, TOOLBAR_BUTTON),
             (ToolbarAction::Cancel, TOOLBAR_BUTTON),
         ];
@@ -707,7 +710,7 @@ impl OverlayState {
             cursor_x += width;
             if index + 1 != item_defs.len() {
                 cursor_x += match index {
-                    6 | 11 | 14 | 15 => TOOLBAR_GROUP_GAP,
+                    7 | 12 | 15 | 16 => TOOLBAR_GROUP_GAP,
                     _ => TOOLBAR_ITEM_GAP,
                 };
             }
@@ -1967,6 +1970,16 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
             }
             false
         }
+        0x50 => {
+            if state.mode == OverlayMode::Annotating {
+                commit_text_input(state);
+                if let Some(image) = render_annotated_image(state) {
+                    finish_with_signal(hwnd, state, OverlaySignal::Pinned(image));
+                    return true;
+                }
+            }
+            false
+        }
         value if value == u32::from(VK_BACK.0) || value == u32::from(VK_DELETE.0) => {
             if let Some(index) = state.selected_shape.take() {
                 if index < state.shapes.len() {
@@ -2053,6 +2066,13 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
                     state.composed_dirty = true;
                 }
                 state.selected_shape = None;
+            }
+        }
+        ToolbarAction::Pin => {
+            commit_text_input(state);
+            if let Some(image) = render_annotated_image(state) {
+                finish_with_signal(hwnd, state, OverlaySignal::Pinned(image));
+                return true;
             }
         }
         ToolbarAction::Confirm => {
@@ -2290,6 +2310,7 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
         ToolbarAction::Color(index) => state.color_index == index,
         ToolbarAction::Stroke(index) => state.stroke_index == index,
+        ToolbarAction::Pin => false,
         _ => false,
     };
     let fill = if selected {
@@ -2378,6 +2399,13 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             TOOLBAR_TEXT,
         ),
         ToolbarAction::Undo => draw_undo_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::Pin => draw_pin_glyph(
             &mut state.frame,
             state.target.width,
             state.target.height,
@@ -2798,6 +2826,54 @@ fn draw_undo_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, co
     for segment in path.windows(2) {
         draw_line(frame, width, height, segment[0], segment[1], color, 1);
     }
+}
+fn draw_pin_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    draw_line(
+        frame,
+        width,
+        height,
+        map_icon_point(icon, 7.0, 6.0),
+        map_icon_point(icon, 17.0, 6.0),
+        color,
+        1,
+    );
+    draw_line(
+        frame,
+        width,
+        height,
+        map_icon_point(icon, 7.0, 6.0),
+        map_icon_point(icon, 12.0, 11.0),
+        color,
+        1,
+    );
+    draw_line(
+        frame,
+        width,
+        height,
+        map_icon_point(icon, 17.0, 6.0),
+        map_icon_point(icon, 12.0, 11.0),
+        color,
+        1,
+    );
+    draw_line(
+        frame,
+        width,
+        height,
+        map_icon_point(icon, 12.0, 11.0),
+        map_icon_point(icon, 12.0, 19.0),
+        color,
+        1,
+    );
+    draw_line(
+        frame,
+        width,
+        height,
+        map_icon_point(icon, 12.0, 19.0),
+        map_icon_point(icon, 9.5, 22.0),
+        color,
+        1,
+    );
 }
 fn draw_confirm_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);

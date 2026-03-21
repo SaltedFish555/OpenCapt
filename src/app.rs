@@ -4,6 +4,7 @@ use crate::{
     hotkey::RegisteredHotkey,
     output,
     overlay::{OverlaySession, OverlaySignal},
+    pin::PinWindow,
     tray::{TrayAction, TrayHandles},
 };
 use global_hotkey::GlobalHotKeyEvent;
@@ -65,6 +66,7 @@ struct App {
     tray: Option<TrayHandles>,
     hotkey: Option<RegisteredHotkey>,
     overlay: Option<OverlaySession>,
+    pin_windows: Vec<PinWindow>,
     overlay_requested_on_startup: bool,
 }
 
@@ -84,6 +86,7 @@ impl App {
             tray: None,
             hotkey: None,
             overlay: None,
+            pin_windows: Vec::new(),
             overlay_requested_on_startup: matches!(startup_mode, StartupMode::OverlayTest),
         }
     }
@@ -130,7 +133,11 @@ impl App {
                 info!(hotkey = ?hotkey.hotkey(), "registered global hotkey");
                 self.hotkey = Some(hotkey);
             }
-            Err(error) => error!(?error, hotkey = self.config.hotkey, "failed to register hotkey"),
+            Err(error) => error!(
+                ?error,
+                hotkey = self.config.hotkey,
+                "failed to register hotkey"
+            ),
         }
 
         self.prewarm_overlay();
@@ -166,13 +173,20 @@ impl App {
             return;
         }
 
-        if self.hotkey.as_ref().is_some_and(|hotkey| hotkey.matches_event(&event)) {
+        if self
+            .hotkey
+            .as_ref()
+            .is_some_and(|hotkey| hotkey.matches_event(&event))
+        {
             self.start_selection();
         }
     }
 
     fn handle_tray_menu_event(&mut self, control_flow: &mut ControlFlow, event: MenuEvent) {
-        let action = self.tray.as_ref().and_then(|tray| tray.resolve_action(&event.id));
+        let action = self
+            .tray
+            .as_ref()
+            .and_then(|tray| tray.resolve_action(&event.id));
         let Some(action) = action else {
             return;
         };
@@ -191,6 +205,7 @@ impl App {
             }
             TrayAction::Exit => {
                 self.hide_overlay();
+                self.close_pin_windows();
                 self.state = AppState::Exiting;
                 *control_flow = ControlFlow::Exit;
             }
@@ -252,6 +267,10 @@ impl App {
                 self.finish_capture(image);
                 self.state = AppState::Idle;
             }
+            OverlaySignal::Pinned(image) => {
+                self.show_pin_window(image);
+                self.state = AppState::Idle;
+            }
         }
     }
 
@@ -259,6 +278,27 @@ impl App {
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.hide();
         }
+    }
+
+    fn show_pin_window(&mut self, image: image::RgbaImage) {
+        self.pin_windows.retain(|window| window.is_alive());
+        let (cursor_x, cursor_y) = capture::current_cursor_position().unwrap_or((120, 120));
+        match PinWindow::show(image, cursor_x + 16, cursor_y + 16) {
+            Ok(window) => {
+                self.pin_windows.push(window);
+                info!(count = self.pin_windows.len(), "pin window opened");
+            }
+            Err(error) => {
+                error!(?error, "failed to open pin window");
+            }
+        }
+    }
+
+    fn close_pin_windows(&mut self) {
+        for window in &self.pin_windows {
+            window.close();
+        }
+        self.pin_windows.clear();
     }
 
     fn finish_capture(&mut self, image: image::RgbaImage) {

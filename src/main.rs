@@ -5,6 +5,7 @@ mod hotkey;
 mod logging;
 mod output;
 mod overlay;
+mod pin;
 mod tray;
 
 use anyhow::Result;
