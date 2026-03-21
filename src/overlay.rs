@@ -50,6 +50,9 @@ const TOOLBAR_BUTTON: i32 = 24;
 const TOOLBAR_COLOR: i32 = 18;
 const TOOLBAR_STROKE_WIDTH: i32 = 24;
 const TOOLBAR_HEIGHT: i32 = 36;
+const TOOLBAR_PANEL_RADIUS: i32 = 10;
+const TOOLBAR_BUTTON_RADIUS: i32 = 8;
+const TOOLBAR_ICON_MARGIN: i32 = 4;
 const TOOLBAR_MARGIN: i32 = 14;
 const WINDOW_MARGIN: i32 = 10;
 const HANDLE_SIZE: i32 = 7;
@@ -1266,8 +1269,8 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
     };
     let fill = if selected { TOOLBAR_ACTIVE } else if hovered { 0x293244 } else { TOOLBAR_FILL };
     let border = if selected { TOOLBAR_TEXT } else { TOOLBAR_BORDER };
-    fill_rect(&mut state.frame, state.target.width, state.target.height, item.rect, fill);
-    stroke_rect(&mut state.frame, state.target.width, state.target.height, item.rect, border);
+    fill_rounded_rect(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_BUTTON_RADIUS, fill);
+    stroke_rounded_rect(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_BUTTON_RADIUS, border);
     match item.action {
         ToolbarAction::SelectTool => draw_select_glyph(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_TEXT),
         ToolbarAction::RectangleTool => draw_rectangle_glyph(&mut state.frame, state.target.width, state.target.height, item.rect, TOOLBAR_TEXT),
@@ -1311,16 +1314,139 @@ fn restore_selection_region(source: &[u32], destination: &mut [u32], width: u32,
         destination[start..end].copy_from_slice(&source[start..end]);
     }
 }
-fn draw_panel(frame: &mut [u32], width: u32, height: u32, rect: IntRect) { fill_rect(frame, width, height, rect, TOOLBAR_FILL); stroke_rect(frame, width, height, rect, TOOLBAR_BORDER); }
+fn draw_panel(frame: &mut [u32], width: u32, height: u32, rect: IntRect) { fill_rounded_rect(frame, width, height, rect, TOOLBAR_PANEL_RADIUS, TOOLBAR_FILL); stroke_rounded_rect(frame, width, height, rect, TOOLBAR_PANEL_RADIUS, TOOLBAR_BORDER); }
 fn fill_rect(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { let sx = rect.left.max(0) as u32; let sy = rect.top.max(0) as u32; let ex = rect.right.min(width as i32).max(0) as u32; let ey = rect.bottom.min(height as i32).max(0) as u32; for row in sy..ey { let off = row as usize * width as usize; for col in sx..ex { frame[off + col as usize] = opaque(color); } } }
 fn stroke_rect(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { if rect.right <= rect.left || rect.bottom <= rect.top { return; } for x in rect.left..rect.right { put_pixel(frame, width, height, x, rect.top, color); put_pixel(frame, width, height, x, rect.bottom - 1, color); } for y in rect.top..rect.bottom { put_pixel(frame, width, height, rect.left, y, color); put_pixel(frame, width, height, rect.right - 1, y, color); } }
+fn rounded_rect_radius(rect: IntRect, radius: i32) -> i32 {
+    let max_radius = ((rect.right - rect.left).min(rect.bottom - rect.top) / 2).max(0);
+    radius.max(0).min(max_radius)
+}
+
+fn rounded_rect_contains(rect: IntRect, radius: i32, x: i32, y: i32) -> bool {
+    if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom {
+        return false;
+    }
+    let radius = rounded_rect_radius(rect, radius);
+    if radius <= 0 {
+        return true;
+    }
+    let inner_left = rect.left + radius;
+    let inner_right = rect.right - radius - 1;
+    let inner_top = rect.top + radius;
+    let inner_bottom = rect.bottom - radius - 1;
+    if (x >= inner_left && x <= inner_right) || (y >= inner_top && y <= inner_bottom) {
+        return true;
+    }
+    let corner_x = if x < inner_left { inner_left } else { inner_right };
+    let corner_y = if y < inner_top { inner_top } else { inner_bottom };
+    let dx = x - corner_x;
+    let dy = y - corner_y;
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn fill_rounded_rect(frame: &mut [u32], width: u32, height: u32, rect: IntRect, radius: i32, color: u32) {
+    for y in rect.top..rect.bottom {
+        for x in rect.left..rect.right {
+            if rounded_rect_contains(rect, radius, x, y) {
+                put_pixel(frame, width, height, x, y, color);
+            }
+        }
+    }
+}
+
+fn stroke_rounded_rect(frame: &mut [u32], width: u32, height: u32, rect: IntRect, radius: i32, color: u32) {
+    if rounded_rect_radius(rect, radius) <= 0 {
+        stroke_rect(frame, width, height, rect, color);
+        return;
+    }
+    for y in rect.top..rect.bottom {
+        for x in rect.left..rect.right {
+            if !rounded_rect_contains(rect, radius, x, y) {
+                continue;
+            }
+            if !rounded_rect_contains(rect, radius, x - 1, y)
+                || !rounded_rect_contains(rect, radius, x + 1, y)
+                || !rounded_rect_contains(rect, radius, x, y - 1)
+                || !rounded_rect_contains(rect, radius, x, y + 1) {
+                put_pixel(frame, width, height, x, y, color);
+            }
+        }
+    }
+}
+
+fn inset_rect(rect: IntRect, inset: i32) -> IntRect {
+    let inset = inset.max(0);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    let max_inset = ((width.min(height) - 2) / 2).max(0);
+    let inset = inset.min(max_inset);
+    IntRect { left: rect.left + inset, top: rect.top + inset, right: rect.right - inset, bottom: rect.bottom - inset }
+}
+
+fn icon_scale(rect: IntRect) -> f32 { ((rect.right - rect.left).min(rect.bottom - rect.top).max(1) as f32) / 24.0 }
+
+fn map_icon_point(rect: IntRect, x: f32, y: f32) -> CursorPoint {
+    let width = (rect.right - rect.left).max(1) as f32;
+    let height = (rect.bottom - rect.top).max(1) as f32;
+    CursorPoint {
+        x: (rect.left as f32 + x / 24.0 * width).round() as i32,
+        y: (rect.top as f32 + y / 24.0 * height).round() as i32,
+    }
+}
+
 fn draw_handle_square(frame: &mut [u32], width: u32, height: u32, center: CursorPoint, size: i32, fill: u32, border: u32) { let half = size / 2; let rect = IntRect { left: center.x - half, top: center.y - half, right: center.x + half + 1, bottom: center.y + half + 1 }; fill_rect(frame, width, height, rect, fill); stroke_rect(frame, width, height, rect, border); }
-fn draw_select_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { let cx = (rect.left + rect.right) / 2; let cy = (rect.top + rect.bottom) / 2; draw_line(frame, width, height, CursorPoint { x: rect.left + 5, y: cy }, CursorPoint { x: rect.right - 6, y: cy }, color, 1); draw_line(frame, width, height, CursorPoint { x: cx, y: rect.top + 5 }, CursorPoint { x: cx, y: rect.bottom - 6 }, color, 1); draw_circle_outline(frame, width, height, cx, cy, 5, color); }
-fn draw_rectangle_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { draw_rect_outline(frame, NormalizedRect { left: rect.left + 6, top: rect.top + 6, right: rect.right - 6, bottom: rect.bottom - 6 }, width, height, 1, color); }
-fn draw_arrow_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { draw_arrow(frame, width, height, CursorPoint { x: rect.left + 5, y: rect.bottom - 7 }, CursorPoint { x: rect.right - 6, y: rect.top + 6 }, 1, color); }
-fn draw_undo_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { let my = (rect.top + rect.bottom) / 2; draw_line(frame, width, height, CursorPoint { x: rect.left + 6, y: my }, CursorPoint { x: rect.right - 7, y: my }, color, 1); draw_line(frame, width, height, CursorPoint { x: rect.left + 6, y: my }, CursorPoint { x: rect.left + 10, y: my - 4 }, color, 1); draw_line(frame, width, height, CursorPoint { x: rect.left + 6, y: my }, CursorPoint { x: rect.left + 10, y: my + 4 }, color, 1); }
-fn draw_confirm_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { draw_line(frame, width, height, CursorPoint { x: rect.left + 5, y: rect.top + 12 }, CursorPoint { x: rect.left + 10, y: rect.bottom - 6 }, color, 2); draw_line(frame, width, height, CursorPoint { x: rect.left + 10, y: rect.bottom - 6 }, CursorPoint { x: rect.right - 5, y: rect.top + 6 }, color, 2); }
-fn draw_cancel_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { draw_line(frame, width, height, CursorPoint { x: rect.left + 6, y: rect.top + 6 }, CursorPoint { x: rect.right - 6, y: rect.bottom - 6 }, color, 2); draw_line(frame, width, height, CursorPoint { x: rect.right - 6, y: rect.top + 6 }, CursorPoint { x: rect.left + 6, y: rect.bottom - 6 }, color, 2); }
+fn draw_select_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let segments = [
+        (9.0, 5.0, 12.0, 2.0),
+        (12.0, 2.0, 15.0, 5.0),
+        (9.0, 19.0, 12.0, 22.0),
+        (12.0, 22.0, 15.0, 19.0),
+        (5.0, 9.0, 2.0, 12.0),
+        (2.0, 12.0, 5.0, 15.0),
+        (19.0, 9.0, 22.0, 12.0),
+        (22.0, 12.0, 19.0, 15.0),
+        (12.0, 2.0, 12.0, 22.0),
+        (2.0, 12.0, 22.0, 12.0),
+    ];
+    for (x1, y1, x2, y2) in segments {
+        let start = map_icon_point(icon, x1, y1);
+        let end = map_icon_point(icon, x2, y2);
+        draw_line(frame, width, height, start, end, color, 1);
+    }
+}
+fn draw_rectangle_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN); let start = map_icon_point(icon, 3.0, 3.0); let end = map_icon_point(icon, 21.0, 21.0); let glyph = IntRect { left: start.x, top: start.y, right: end.x + 1, bottom: end.y + 1 }; let radius = ((icon_scale(icon) * 2.0).round() as i32).max(1); stroke_rounded_rect(frame, width, height, glyph, radius, color); }
+fn draw_arrow_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN); let p1 = map_icon_point(icon, 5.0, 19.0); let p2 = map_icon_point(icon, 19.0, 5.0); let p3 = map_icon_point(icon, 10.0, 5.0); let p4 = map_icon_point(icon, 19.0, 5.0); let p5 = map_icon_point(icon, 19.0, 14.0); draw_line(frame, width, height, p1, p2, color, 1); draw_line(frame, width, height, p3, p4, color, 1); draw_line(frame, width, height, p4, p5, color, 1); }
+fn draw_undo_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let arrow = [
+        map_icon_point(icon, 9.0, 14.0),
+        map_icon_point(icon, 4.0, 9.0),
+        map_icon_point(icon, 9.0, 4.0),
+    ];
+    for segment in arrow.windows(2) {
+        draw_line(frame, width, height, segment[0], segment[1], color, 1);
+    }
+    let path = [
+        map_icon_point(icon, 4.0, 9.0),
+        map_icon_point(icon, 10.5, 9.0),
+        map_icon_point(icon, 14.5, 9.0),
+        map_icon_point(icon, 16.7, 9.4),
+        map_icon_point(icon, 18.4, 10.6),
+        map_icon_point(icon, 19.5, 12.4),
+        map_icon_point(icon, 20.0, 14.5),
+        map_icon_point(icon, 19.5, 16.6),
+        map_icon_point(icon, 18.4, 18.4),
+        map_icon_point(icon, 16.7, 19.6),
+        map_icon_point(icon, 14.5, 20.0),
+        map_icon_point(icon, 11.0, 20.0),
+    ];
+    for segment in path.windows(2) {
+        draw_line(frame, width, height, segment[0], segment[1], color, 1);
+    }
+}
+fn draw_confirm_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN); let a = map_icon_point(icon, 4.0, 12.0); let b = map_icon_point(icon, 9.0, 17.0); let c = map_icon_point(icon, 20.0, 6.0); draw_line(frame, width, height, a, b, color, 1); draw_line(frame, width, height, b, c, color, 1); }
+fn draw_cancel_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) { let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN); let a = map_icon_point(icon, 6.0, 6.0); let b = map_icon_point(icon, 18.0, 18.0); let c = map_icon_point(icon, 18.0, 6.0); let d = map_icon_point(icon, 6.0, 18.0); draw_line(frame, width, height, a, b, color, 1); draw_line(frame, width, height, c, d, color, 1); }
 fn draw_color_swatch(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32, selected: bool) { let cx = (rect.left + rect.right) / 2; let cy = (rect.top + rect.bottom) / 2; if selected { draw_disc(frame, width, height, cx, cy, 7, TOOLBAR_TEXT); } draw_disc(frame, width, height, cx, cy, 5, color); }
 fn draw_stroke_swatch(frame: &mut [u32], width: u32, height: u32, rect: IntRect, stroke: u32, _selected: bool) { let my = (rect.top + rect.bottom) / 2; draw_line(frame, width, height, CursorPoint { x: rect.left + 6, y: my }, CursorPoint { x: rect.right - 6, y: my }, TOOLBAR_TEXT, stroke as i32); }
 fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: AnnotationShape) { match shape { AnnotationShape::Rectangle { start, end, .. } => { if let Some(rect) = NormalizedRect::from_points(start, end) { draw_rect_outline(frame, rect.expanded(2), width, height, 1, SELECTION_ACCENT); } } AnnotationShape::Arrow { start, end, style } => draw_arrow(frame, width, height, start, end, style.stroke as i32 + 2, SELECTION_ACCENT), } }
@@ -1378,6 +1504,8 @@ mod tests {
         assert_eq!(destination[3], opaque(source[3]));
     }
 }
+
+
 
 
 
