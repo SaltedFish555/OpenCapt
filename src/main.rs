@@ -10,6 +10,8 @@ mod tray;
 use anyhow::Result;
 use std::env;
 use tracing::info;
+#[cfg(windows)]
+use windows::Win32::System::Console::FreeConsole;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupMode {
@@ -24,6 +26,7 @@ fn main() -> Result<()> {
     let _logging_guard = logging::init(&paths.log_dir)?;
 
     info!(?startup_mode, "OpenCapt starting");
+    detach_console_for_gui_mode(&startup_mode);
 
     match startup_mode {
         StartupMode::CaptureTest => {
@@ -46,3 +49,19 @@ fn parse_startup_mode(mut args: impl Iterator<Item = String>) -> Result<StartupM
         _ => StartupMode::Run,
     })
 }
+
+#[cfg(windows)]
+fn detach_console_for_gui_mode(startup_mode: &StartupMode) {
+    if !matches!(startup_mode, StartupMode::Run | StartupMode::OverlayTest) {
+        return;
+    }
+    if env::var_os("OPENCAPT_KEEP_CONSOLE").is_some() {
+        return;
+    }
+    unsafe {
+        let _ = FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+fn detach_console_for_gui_mode(_startup_mode: &StartupMode) {}
