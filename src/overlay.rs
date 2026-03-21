@@ -394,6 +394,24 @@ impl OverlayState {
         }
     }
 
+    fn tool_can_interact_with_shape(&self, shape: AnnotationShape) -> bool {
+        match self.tool {
+            AnnotationTool::Mouse => false,
+            AnnotationTool::Select => true,
+            AnnotationTool::Rectangle => matches!(shape, AnnotationShape::Rectangle { .. }),
+            AnnotationTool::Arrow => matches!(shape, AnnotationShape::Arrow { .. }),
+        }
+    }
+
+    fn sync_selected_shape_with_tool(&mut self) {
+        if let Some(index) = self.selected_shape {
+            let keep = self.shapes.get(index).copied().is_some_and(|shape| self.tool_can_interact_with_shape(shape));
+            if !keep {
+                self.selected_shape = None;
+            }
+        }
+    }
+
     fn bounds(&self) -> NormalizedRect {
         NormalizedRect {
             left: 0,
@@ -434,6 +452,9 @@ impl OverlayState {
     fn selected_rectangle_for_editing(&self) -> Option<(usize, NormalizedRect, ShapeStyle)> {
         let index = self.selected_shape?;
         let shape = *self.shapes.get(index)?;
+        if !self.tool_can_interact_with_shape(shape) {
+            return None;
+        }
         match shape {
             AnnotationShape::Rectangle { start, end, style } => {
                 Some((index, NormalizedRect::from_points(start, end)?, style))
@@ -459,7 +480,7 @@ impl OverlayState {
             .iter()
             .enumerate()
             .rev()
-            .find(|(index, shape)| shape.hit_test(point, self.selected_shape == Some(*index)))
+            .find(|(index, shape)| self.tool_can_interact_with_shape(**shape) && shape.hit_test(point, self.selected_shape == Some(*index)))
             .map(|(index, _)| index)
     }
 
@@ -1107,18 +1128,21 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
         0x56 => {
             if state.mode == OverlayMode::Annotating {
                 state.tool = AnnotationTool::Select;
+                state.sync_selected_shape_with_tool();
             }
             false
         }
         0x52 => {
             if state.mode == OverlayMode::Annotating {
                 state.tool = AnnotationTool::Rectangle;
+                state.sync_selected_shape_with_tool();
             }
             false
         }
         0x41 => {
             if state.mode == OverlayMode::Annotating {
                 state.tool = AnnotationTool::Arrow;
+                state.sync_selected_shape_with_tool();
             }
             false
         }
@@ -1173,6 +1197,7 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
             return true;
         }
     }
+    state.sync_selected_shape_with_tool();
     false
 }
 
