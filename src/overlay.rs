@@ -1211,8 +1211,9 @@ fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
         paint_selection(state);
         paint_toolbar(state);
     } else {
-        compose_preview_frame(&state.target.base_frame, &mut state.frame, state.target.width, state.target.height, preview_selection);
+        state.frame.copy_from_slice(&state.dimmed_frame);
         if let Some(selection) = preview_selection {
+            restore_selection_region(&state.base_opaque_frame, &mut state.frame, state.target.width, selection);
             draw_rect_outline(&mut state.frame, NormalizedRect::from_selection_rect(selection), state.target.width, state.target.height, 2, SELECTION_ACCENT);
         }
     }
@@ -1377,6 +1378,7 @@ mod tests {
         assert_eq!(destination[3], opaque(source[3]));
     }
 }
+
 
 
 
