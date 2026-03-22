@@ -2265,7 +2265,11 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
                 draft.text.pop();
                 return false;
             }
-            _ => {}
+            _ => {
+                if !is_control_pressed() {
+                    return false;
+                }
+            }
         }
     }
 
