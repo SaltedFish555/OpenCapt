@@ -283,7 +283,7 @@ impl App {
     fn show_pin_window(&mut self, image: image::RgbaImage) {
         self.pin_windows.retain(|window| window.is_alive());
         let (cursor_x, cursor_y) = capture::current_cursor_position().unwrap_or((120, 120));
-        match PinWindow::show(image, cursor_x + 16, cursor_y + 16) {
+        match PinWindow::show(image, cursor_x + 16, cursor_y + 16, self.config.save_dir.clone()) {
             Ok(window) => {
                 self.pin_windows.push(window);
                 info!(count = self.pin_windows.len(), "pin window opened");

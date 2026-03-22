@@ -1,6 +1,13 @@
+use crate::output;
 use anyhow::{Result, anyhow};
 use image::{RgbaImage, imageops::FilterType};
-use std::{mem::size_of, ptr::null_mut, sync::OnceLock};
+use std::{
+    mem::size_of,
+    path::PathBuf,
+    ptr::null_mut,
+    sync::OnceLock,
+};
+use tracing::{info, warn};
 use windows::{
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
@@ -13,14 +20,15 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::{ReleaseCapture, SetCapture},
             WindowsAndMessaging::{
-                CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW,
-                HTCLIENT, IsWindow, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-                SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
-                ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WINDOW_LONG_PTR_INDEX, WM_ERASEBKGND,
-                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-                WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu,
+                CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GWLP_USERDATA,
+                GetCursorPos, GetWindowLongPtrW, HTCLIENT, IsWindow, MF_SEPARATOR, MF_STRING,
+                RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+                SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+                TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow,
+                WINDOW_LONG_PTR_INDEX, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+                WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW,
+                WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -31,6 +39,10 @@ const CLASS_NAME: windows::core::PCWSTR = w!("OpenCaptPinWindow");
 const MIN_SCALE: f32 = 0.2;
 const MAX_SCALE: f32 = 6.0;
 const WHEEL_STEP: f32 = 1.1;
+const CMD_COPY: u32 = 1001;
+const CMD_SAVE: u32 = 1002;
+const CMD_RESET_ZOOM: u32 = 1003;
+const CMD_CLOSE: u32 = 1004;
 
 pub struct PinWindow {
     hwnd: HWND,
@@ -45,6 +57,7 @@ struct DragState {
 
 struct PinState {
     original: RgbaImage,
+    save_dir: PathBuf,
     surface: LayeredSurface,
     scale: f32,
     window_x: i32,
@@ -62,12 +75,13 @@ struct LayeredSurface {
 }
 
 impl PinWindow {
-    pub fn show(image: RgbaImage, x: i32, y: i32) -> Result<Self> {
+    pub fn show(image: RgbaImage, x: i32, y: i32, save_dir: PathBuf) -> Result<Self> {
         register_pin_class()?;
         let width = image.width().max(1) as i32;
         let height = image.height().max(1) as i32;
         let state = Box::new(PinState {
             original: image,
+            save_dir,
             surface: LayeredSurface::new(width, height)?,
             scale: 1.0,
             window_x: x,
@@ -277,23 +291,18 @@ unsafe extern "system" fn pin_wndproc(
         WM_MOUSEWHEEL => {
             if let Some(state) = pin_state(hwnd) {
                 let delta = (((wparam.0 >> 16) & 0xFFFF) as i16 as i32) as f32;
-                let factor = if delta >= 0.0 {
-                    WHEEL_STEP
-                } else {
-                    1.0 / WHEEL_STEP
-                };
-                let old_size = scaled_size(state);
-                state.scale = (state.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
-                let new_size = scaled_size(state);
-                state.window_x -= (new_size.cx - old_size.cx) / 2;
-                state.window_y -= (new_size.cy - old_size.cy) / 2;
-                let _ = render_pin_window(hwnd, state);
+                let factor = if delta >= 0.0 { WHEEL_STEP } else { 1.0 / WHEEL_STEP };
+                apply_scale(hwnd, state, (state.scale * factor).clamp(MIN_SCALE, MAX_SCALE));
             }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
+            if let Some(state) = pin_state(hwnd) {
+                let mut cursor = POINT::default();
+                unsafe {
+                    let _ = GetCursorPos(&mut cursor);
+                }
+                show_context_menu(hwnd, state, cursor);
             }
             LRESULT(0)
         }
@@ -309,7 +318,71 @@ unsafe extern "system" fn pin_wndproc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        _ => unsafe { DefWindowProcW(hwnd, msg, WPARAM(0), lparam) },
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn show_context_menu(hwnd: HWND, state: &mut PinState, cursor: POINT) {
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+
+    unsafe {
+        let _ = AppendMenuW(menu, MF_STRING, CMD_COPY as usize, w!("复制到剪贴板"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_SAVE as usize, w!("保存到截图目录"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, CMD_RESET_ZOOM as usize, w!("重置缩放"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, CMD_CLOSE as usize, w!("关闭贴图"));
+        let _ = SetForegroundWindow(hwnd);
+    }
+
+    let command = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            Some(0),
+            hwnd,
+            None,
+        )
+    };
+
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+
+    match command.0 as u32 {
+        CMD_COPY => {
+            if let Err(error) = output::copy_to_clipboard(&state.original) {
+                warn!(?error, "failed to copy pin image to clipboard");
+            } else {
+                info!("pin image copied to clipboard");
+            }
+        }
+        CMD_SAVE => match output::save_png(&state.original, &state.save_dir) {
+            Ok(path) => info!(path = ?path, "pin image saved"),
+            Err(error) => warn!(?error, "failed to save pin image"),
+        },
+        CMD_RESET_ZOOM => {
+            apply_scale(hwnd, state, 1.0);
+        }
+        CMD_CLOSE => unsafe {
+            let _ = DestroyWindow(hwnd);
+        },
+        _ => {}
+    }
+}
+
+fn apply_scale(hwnd: HWND, state: &mut PinState, next_scale: f32) {
+    let old_size = scaled_size(state);
+    state.scale = next_scale.clamp(MIN_SCALE, MAX_SCALE);
+    let new_size = scaled_size(state);
+    state.window_x -= (new_size.cx - old_size.cx) / 2;
+    state.window_y -= (new_size.cy - old_size.cy) / 2;
+    if let Err(error) = render_pin_window(hwnd, state) {
+        warn!(?error, "failed to redraw pin window");
     }
 }
 
@@ -326,17 +399,18 @@ fn scaled_size(state: &PinState) -> SIZE {
 
 fn render_pin_window(hwnd: HWND, state: &mut PinState) -> Result<()> {
     let size = scaled_size(state);
-    let resized =
-        if size.cx == state.original.width() as i32 && size.cy == state.original.height() as i32 {
-            state.original.clone()
-        } else {
-            image::imageops::resize(
-                &state.original,
-                size.cx as u32,
-                size.cy as u32,
-                FilterType::Triangle,
-            )
-        };
+    let resized = if size.cx == state.original.width() as i32
+        && size.cy == state.original.height() as i32
+    {
+        state.original.clone()
+    } else {
+        image::imageops::resize(
+            &state.original,
+            size.cx as u32,
+            size.cy as u32,
+            FilterType::Triangle,
+        )
+    };
     let pixels = rgba_to_layered_pixels(&resized);
     state.surface.resize(size.cx, size.cy)?;
     state.surface.update_pixels(&pixels);
@@ -378,8 +452,8 @@ fn rgba_to_layered_pixels(image: &RgbaImage) -> Vec<u32> {
 }
 
 fn pin_state(hwnd: HWND) -> Option<&'static mut PinState> {
-    let state_ptr =
-        unsafe { GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0)) } as *mut PinState;
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0)) }
+        as *mut PinState;
     unsafe { state_ptr.as_mut() }
 }
 
