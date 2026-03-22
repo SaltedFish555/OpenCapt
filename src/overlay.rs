@@ -50,6 +50,7 @@ const DEFAULT_STROKE_WIDTH: u32 = 2;
 const MIN_TEXT_SIZE: u32 = 14;
 const MAX_TEXT_SIZE: u32 = 54;
 const DEFAULT_TEXT_SIZE: u32 = 24;
+const TEXT_SIZE_OPTIONS: [u32; 11] = [14, 16, 18, 20, 24, 28, 32, 36, 42, 48, 54];
 const MIN_NUMBER_SIZE: u32 = 18;
 const MAX_NUMBER_SIZE: u32 = 52;
 const DEFAULT_NUMBER_SIZE: u32 = 28;
@@ -174,7 +175,9 @@ struct TextDraft {
     text: String,
     style: ShapeStyle,
     bold: bool,
+    italic: bool,
     background: bool,
+    font_family: TextFontFamily,
     editing_shape: Option<(usize, AnnotationShape)>,
 }
 
@@ -210,7 +213,9 @@ enum AnnotationShape {
         text: String,
         style: ShapeStyle,
         bold: bool,
+        italic: bool,
         background: bool,
+        font_family: TextFontFamily,
     },
     Number {
         center: CursorPoint,
@@ -288,7 +293,11 @@ enum ToolbarAction {
     TextTool,
     NumberTool,
     TextBoldToggle,
-    TextBackgroundToggle,
+    TextItalicToggle,
+    TextFontDropdown,
+    TextSizeDropdown,
+    TextFontOption(TextFontFamily),
+    TextSizeOption(u32),
     Color(usize),
     StyleControl,
     Undo,
@@ -339,9 +348,22 @@ enum ResizableShapeKind {
     Mosaic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextFontFamily {
+    YaHei,
+    DengXian,
+    KaiTi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDropdownKind {
+    FontFamily,
+    FontSize,
+}
+
 #[derive(Debug, Clone)]
 struct ToolbarLayout {
-    panel: IntRect,
+    panels: Vec<IntRect>,
     items: Vec<ToolbarItem>,
 }
 
@@ -369,7 +391,10 @@ struct OverlayState {
     number_size: u32,
     mosaic_size: u32,
     text_bold: bool,
+    text_italic: bool,
     text_background: bool,
+    text_font_family: TextFontFamily,
+    open_text_dropdown: Option<TextDropdownKind>,
     shapes: Vec<AnnotationShape>,
     draft: Option<DraftShape>,
     text_input: Option<TextDraft>,
@@ -420,7 +445,10 @@ impl OverlaySession {
             number_size: DEFAULT_NUMBER_SIZE,
             mosaic_size: DEFAULT_MOSAIC_SIZE,
             text_bold: false,
+            text_italic: false,
             text_background: false,
+            text_font_family: TextFontFamily::YaHei,
+            open_text_dropdown: None,
             shapes: Vec::new(),
             draft: None,
             text_input: None,
@@ -526,7 +554,10 @@ impl OverlayState {
         self.number_size = DEFAULT_NUMBER_SIZE;
         self.mosaic_size = DEFAULT_MOSAIC_SIZE;
         self.text_bold = false;
+        self.text_italic = false;
         self.text_background = false;
+        self.text_font_family = TextFontFamily::YaHei;
+        self.open_text_dropdown = None;
         self.shapes.clear();
         self.draft = None;
         self.text_input = None;
@@ -606,16 +637,40 @@ impl OverlayState {
         self.text_bold
     }
 
-    fn current_text_background(&self) -> bool {
+    fn current_text_italic(&self) -> bool {
         if let Some(draft) = &self.text_input {
-            return draft.background;
+            return draft.italic;
         }
         if let Some(index) = self.selected_shape {
-            if let Some(AnnotationShape::Text { background, .. }) = self.shapes.get(index) {
-                return *background;
+            if let Some(AnnotationShape::Text { italic, .. }) = self.shapes.get(index) {
+                return *italic;
             }
         }
-        self.text_background
+        self.text_italic
+    }
+
+    fn current_text_font_family(&self) -> TextFontFamily {
+        if let Some(draft) = &self.text_input {
+            return draft.font_family;
+        }
+        if let Some(index) = self.selected_shape {
+            if let Some(AnnotationShape::Text { font_family, .. }) = self.shapes.get(index) {
+                return *font_family;
+            }
+        }
+        self.text_font_family
+    }
+
+    fn current_text_size(&self) -> u32 {
+        if let Some(draft) = &self.text_input {
+            return draft.style.stroke.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
+        }
+        if let Some(index) = self.selected_shape {
+            if let Some(AnnotationShape::Text { style, .. }) = self.shapes.get(index) {
+                return style.stroke.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
+            }
+        }
+        self.text_size.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE)
     }
 
     fn set_text_bold(&mut self, value: bool) {
@@ -631,17 +686,34 @@ impl OverlayState {
         }
     }
 
-    fn set_text_background(&mut self, value: bool) {
-        self.text_background = value;
+    fn set_text_italic(&mut self, value: bool) {
+        self.text_italic = value;
         if let Some(draft) = self.text_input.as_mut() {
-            draft.background = value;
+            draft.italic = value;
         }
         if let Some(index) = self.selected_shape {
-            if let Some(AnnotationShape::Text { background, .. }) = self.shapes.get_mut(index) {
-                *background = value;
+            if let Some(AnnotationShape::Text { italic, .. }) = self.shapes.get_mut(index) {
+                *italic = value;
                 self.composed_dirty = true;
             }
         }
+    }
+
+    fn set_text_font_family(&mut self, value: TextFontFamily) {
+        self.text_font_family = value;
+        if let Some(draft) = self.text_input.as_mut() {
+            draft.font_family = value;
+        }
+        if let Some(index) = self.selected_shape {
+            if let Some(AnnotationShape::Text { font_family, .. }) = self.shapes.get_mut(index) {
+                *font_family = value;
+                self.composed_dirty = true;
+            }
+        }
+    }
+
+    fn text_toolbar_visible(&self) -> bool {
+        self.tool == AnnotationTool::Text || self.text_input.is_some()
     }
 
     fn shape_style_target(shape: &AnnotationShape) -> StyleControlTarget {
@@ -706,11 +778,13 @@ impl OverlayState {
             if target == StyleControlTarget::Text {
                 draft.style.stroke = value;
                 if let Some(selection) = self.selection {
-                    draft.box_rect = clamp_text_box_to_bounds(
+                    draft.box_rect = clamp_text_box_to_bounds_styled(
                         draft.box_rect,
                         &draft.text,
                         draft.style,
                         draft.bold,
+                        draft.italic,
+                        draft.font_family,
                         selection,
                     );
                 }
@@ -734,15 +808,19 @@ impl OverlayState {
                             text,
                             style,
                             bold,
+                            italic,
+                            font_family,
                             ..
                         } => {
                             style.stroke = value;
                             if let Some(selection) = self.selection {
-                                *box_rect = clamp_text_box_to_bounds(
+                                *box_rect = clamp_text_box_to_bounds_styled(
                                     *box_rect,
                                     text,
                                     *style,
                                     *bold,
+                                    *italic,
+                                    *font_family,
                                     selection,
                                 );
                             }
@@ -946,7 +1024,8 @@ impl OverlayState {
             return None;
         }
         let selection = self.selection?;
-        let item_defs = [
+        let text_toolbar_visible = self.text_toolbar_visible();
+        let mut primary_defs = vec![
             (ToolbarAction::MouseTool, TOOLBAR_BUTTON),
             (ToolbarAction::SelectTool, TOOLBAR_BUTTON),
             (ToolbarAction::RectangleTool, TOOLBAR_BUTTON),
@@ -955,68 +1034,160 @@ impl OverlayState {
             (ToolbarAction::ArrowTool, TOOLBAR_BUTTON),
             (ToolbarAction::MosaicTool, TOOLBAR_BUTTON),
             (ToolbarAction::TextTool, TOOLBAR_BUTTON),
-            (ToolbarAction::TextBoldToggle, TOOLBAR_BUTTON),
-            (ToolbarAction::TextBackgroundToggle, TOOLBAR_BUTTON),
             (ToolbarAction::NumberTool, TOOLBAR_BUTTON),
             (ToolbarAction::Color(0), TOOLBAR_COLOR),
             (ToolbarAction::Color(1), TOOLBAR_COLOR),
             (ToolbarAction::Color(2), TOOLBAR_COLOR),
             (ToolbarAction::Color(3), TOOLBAR_COLOR),
             (ToolbarAction::Color(4), TOOLBAR_COLOR),
-            (ToolbarAction::StyleControl, TOOLBAR_STYLE_WIDTH),
+        ];
+        if !text_toolbar_visible {
+            primary_defs.push((ToolbarAction::StyleControl, TOOLBAR_STYLE_WIDTH));
+        }
+        primary_defs.extend([
             (ToolbarAction::Undo, TOOLBAR_BUTTON),
             (ToolbarAction::Pin, TOOLBAR_BUTTON),
             (ToolbarAction::Confirm, TOOLBAR_BUTTON),
             (ToolbarAction::Cancel, TOOLBAR_BUTTON),
-        ];
-        let mut total_width = TOOLBAR_PADDING * 2;
-        for (index, (_, width)) in item_defs.iter().enumerate() {
-            total_width += *width;
-            if index + 1 != item_defs.len() {
-                total_width += toolbar_gap_after(index);
-            }
-        }
+        ]);
+
+        let primary_width = toolbar_row_width(&primary_defs, false);
+        let secondary_defs = if text_toolbar_visible {
+            vec![
+                (ToolbarAction::TextBoldToggle, TOOLBAR_BUTTON),
+                (ToolbarAction::TextItalicToggle, TOOLBAR_BUTTON),
+                (ToolbarAction::TextFontDropdown, 118),
+                (ToolbarAction::TextSizeDropdown, 58),
+            ]
+        } else {
+            Vec::new()
+        };
+        let secondary_width = if secondary_defs.is_empty() {
+            0
+        } else {
+            toolbar_row_width(&secondary_defs, true)
+        };
+        let total_height = if secondary_defs.is_empty() {
+            TOOLBAR_HEIGHT
+        } else {
+            TOOLBAR_HEIGHT * 2 + TOOLBAR_ITEM_GAP
+        };
 
         let preferred_top = selection.bottom + TOOLBAR_MARGIN;
-        let y = if preferred_top + TOOLBAR_HEIGHT <= self.target.height as i32 - WINDOW_MARGIN {
+        let place_below = preferred_top + total_height <= self.target.height as i32 - WINDOW_MARGIN;
+        let base_y = if place_below {
             preferred_top
         } else {
-            (selection.top - TOOLBAR_MARGIN - TOOLBAR_HEIGHT).max(WINDOW_MARGIN)
+            (selection.top - TOOLBAR_MARGIN - total_height).max(WINDOW_MARGIN)
         };
         let selection_center = selection.left + selection.width() / 2;
-        let mut x = selection_center - total_width / 2;
-        let max_left = (self.target.width as i32 - total_width - WINDOW_MARGIN).max(WINDOW_MARGIN);
+        let overall_width = primary_width.max(secondary_width);
+        let mut x = selection_center - overall_width / 2;
+        let max_left = (self.target.width as i32 - overall_width - WINDOW_MARGIN).max(WINDOW_MARGIN);
         x = x.clamp(WINDOW_MARGIN, max_left);
 
-        let panel = IntRect {
-            left: x,
-            top: y,
-            right: x + total_width,
-            bottom: y + TOOLBAR_HEIGHT,
+        let primary_panel = IntRect {
+            left: x + (overall_width - primary_width) / 2,
+            top: base_y,
+            right: x + (overall_width - primary_width) / 2 + primary_width,
+            bottom: base_y + TOOLBAR_HEIGHT,
         };
-        let mut items = Vec::with_capacity(item_defs.len());
-        let mut cursor_x = x + TOOLBAR_PADDING;
-        for (index, (action, width)) in item_defs.into_iter().enumerate() {
-            let top = y + (TOOLBAR_HEIGHT - button_height(action)) / 2;
-            items.push(ToolbarItem {
-                rect: IntRect {
-                    left: cursor_x,
-                    top,
-                    right: cursor_x + width,
-                    bottom: top + button_height(action),
-                },
-                action,
-            });
-            cursor_x += width;
-            if index + 1 != item_defs.len() {
-                cursor_x += toolbar_gap_after(index);
-            }
+
+        let mut panels = vec![primary_panel];
+        let mut items = layout_toolbar_row(primary_panel, &primary_defs, false);
+
+        if !secondary_defs.is_empty() {
+            let secondary_top = primary_panel.bottom + TOOLBAR_ITEM_GAP;
+            let secondary_panel = IntRect {
+                left: x + (overall_width - secondary_width) / 2,
+                top: secondary_top,
+                right: x + (overall_width - secondary_width) / 2 + secondary_width,
+                bottom: secondary_top + TOOLBAR_HEIGHT,
+            };
+            panels.push(secondary_panel);
+            items.extend(layout_toolbar_row(secondary_panel, &secondary_defs, true));
         }
 
-        Some(ToolbarLayout { panel, items })
+        Some(ToolbarLayout { panels, items })
+    }
+
+    fn toolbar_item_rect(&self, action: ToolbarAction) -> Option<IntRect> {
+        let layout = self.toolbar_layout()?;
+        layout
+            .items
+            .into_iter()
+            .find(|item| item.action == action)
+            .map(|item| item.rect)
+    }
+
+    fn text_dropdown_layout(&self) -> Option<ToolbarLayout> {
+        let kind = self.open_text_dropdown?;
+        if !self.text_toolbar_visible() {
+            return None;
+        }
+        let anchor_action = match kind {
+            TextDropdownKind::FontFamily => ToolbarAction::TextFontDropdown,
+            TextDropdownKind::FontSize => ToolbarAction::TextSizeDropdown,
+        };
+        let anchor = self.toolbar_item_rect(anchor_action)?;
+        let items_defs: Vec<(ToolbarAction, i32)> = match kind {
+            TextDropdownKind::FontFamily => vec![
+                (ToolbarAction::TextFontOption(TextFontFamily::YaHei), 118),
+                (ToolbarAction::TextFontOption(TextFontFamily::DengXian), 118),
+                (ToolbarAction::TextFontOption(TextFontFamily::KaiTi), 118),
+            ],
+            TextDropdownKind::FontSize => TEXT_SIZE_OPTIONS
+                .into_iter()
+                .map(|size| (ToolbarAction::TextSizeOption(size), 58))
+                .collect(),
+        };
+        let panel_width = TOOLBAR_PADDING * 2
+            + items_defs
+                .iter()
+                .map(|(_, width)| *width)
+                .max()
+                .unwrap_or(0);
+        let panel_height = TOOLBAR_PADDING * 2
+            + items_defs.len() as i32 * TOOLBAR_BUTTON
+            + (items_defs.len().saturating_sub(1) as i32) * TOOLBAR_ITEM_GAP;
+        let max_left = (self.target.width as i32 - panel_width - WINDOW_MARGIN).max(WINDOW_MARGIN);
+        let left = anchor.left.clamp(WINDOW_MARGIN, max_left);
+        let below_top = anchor.bottom + 4;
+        let top = if below_top + panel_height <= self.target.height as i32 - WINDOW_MARGIN {
+            below_top
+        } else {
+            (anchor.top - panel_height - 4).max(WINDOW_MARGIN)
+        };
+        let panel = IntRect {
+            left,
+            top,
+            right: left + panel_width,
+            bottom: top + panel_height,
+        };
+        let mut items = Vec::with_capacity(items_defs.len());
+        let mut y = panel.top + TOOLBAR_PADDING;
+        for (action, item_width) in items_defs {
+            let rect = IntRect {
+                left: panel.left + TOOLBAR_PADDING,
+                top: y,
+                right: panel.left + TOOLBAR_PADDING + item_width,
+                bottom: y + TOOLBAR_BUTTON,
+            };
+            items.push(ToolbarItem { rect, action });
+            y += TOOLBAR_BUTTON + TOOLBAR_ITEM_GAP;
+        }
+        Some(ToolbarLayout {
+            panels: vec![panel],
+            items,
+        })
     }
 
     fn toolbar_action_at(&self, point: CursorPoint) -> Option<ToolbarAction> {
+        if let Some(layout) = self.text_dropdown_layout() {
+            if let Some(item) = layout.items.into_iter().find(|item| item.rect.contains(point)) {
+                return Some(item.action);
+            }
+        }
         let layout = self.toolbar_layout()?;
         layout
             .items
@@ -1026,6 +1197,7 @@ impl OverlayState {
     }
 
     fn current_cursor(&self) -> CursorKind {
+
         if self.mode == OverlayMode::Selecting {
             return CursorKind::Crosshair;
         }
@@ -1277,8 +1449,10 @@ impl AnnotationShape {
                 text,
                 style,
                 bold,
+                italic,
+                font_family,
                 ..
-            } => text_box_bounds(*box_rect, text, *style, *bold),
+            } => text_box_bounds_styled(*box_rect, text, *style, *bold, *italic, *font_family),
             AnnotationShape::Number { center, style, .. } => number_badge_bounds(*center, *style),
         }
     }
@@ -1345,7 +1519,9 @@ impl AnnotationShape {
                 text,
                 style,
                 bold,
+                italic,
                 background,
+                font_family,
             } => AnnotationShape::Text {
                 box_rect: NormalizedRect {
                     left: box_rect.left + dx,
@@ -1356,7 +1532,9 @@ impl AnnotationShape {
                 text: text.clone(),
                 style: *style,
                 bold: *bold,
+                italic: *italic,
                 background: *background,
+                font_family: *font_family,
             },
             AnnotationShape::Number {
                 center,
@@ -1435,8 +1613,10 @@ impl AnnotationShape {
                 text,
                 style,
                 bold,
+                italic,
+                font_family,
                 ..
-            } => text_box_bounds(*box_rect, text, *style, *bold)
+            } => text_box_bounds_styled(*box_rect, text, *style, *bold, *italic, *font_family)
                 .expanded(if selected { 6 } else { 4 })
                 .contains(point),
             AnnotationShape::Number { center, style, .. } => {
@@ -1627,6 +1807,10 @@ impl ResizeHandle {
 impl IntRect {
     fn contains(self, point: CursorPoint) -> bool {
         point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
+    }
+
+    fn width(self) -> i32 {
+        self.right - self.left
     }
 }
 
@@ -1963,6 +2147,9 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
             if let Some(action) = state.toolbar_action_at(point) {
                 return handle_toolbar_action(hwnd, state, action);
             }
+            if state.open_text_dropdown.is_some() {
+                state.open_text_dropdown = None;
+            }
             if state.text_input.is_some() {
                 commit_text_input(state);
             }
@@ -2117,7 +2304,9 @@ fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> 
                                 text: String::new(),
                                 style: state.current_style(),
                                 bold: state.text_bold,
+                                italic: state.text_italic,
                                 background: state.text_background,
+                                font_family: state.text_font_family,
                                 editing_shape: None,
                             });
                         }
@@ -2144,11 +2333,13 @@ fn commit_text_input(state: &mut OverlayState) -> bool {
         return false;
     };
     if let Some(selection) = state.selection {
-        draft.box_rect = clamp_text_box_to_bounds(
+        draft.box_rect = clamp_text_box_to_bounds_styled(
             draft.box_rect,
             &draft.text,
             draft.style,
             draft.bold,
+            draft.italic,
+            draft.font_family,
             selection,
         );
     }
@@ -2167,7 +2358,9 @@ fn commit_text_input(state: &mut OverlayState) -> bool {
         text: draft.text,
         style: draft.style,
         bold: draft.bold,
+        italic: draft.italic,
         background: draft.background,
+        font_family: draft.font_family,
     };
     let new_index = if let Some((index, _)) = draft.editing_shape {
         let insert_index = index.min(state.shapes.len());
@@ -2192,7 +2385,9 @@ fn begin_text_edit(state: &mut OverlayState, shape_index: usize) -> bool {
         text,
         style,
         bold,
+        italic,
         background,
+        font_family,
     } = &original
     else {
         return false;
@@ -2203,7 +2398,9 @@ fn begin_text_edit(state: &mut OverlayState, shape_index: usize) -> bool {
         text: text.clone(),
         style: *style,
         bold: *bold,
+        italic: *italic,
         background: *background,
+        font_family: *font_family,
         editing_shape: Some((shape_index, original)),
     });
     state.selected_shape = None;
@@ -2392,6 +2589,15 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
 }
 
 fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAction) -> bool {
+    if !matches!(
+        action,
+        ToolbarAction::TextFontDropdown
+            | ToolbarAction::TextSizeDropdown
+            | ToolbarAction::TextFontOption(_)
+            | ToolbarAction::TextSizeOption(_)
+    ) {
+        state.open_text_dropdown = None;
+    }
     match action {
         ToolbarAction::MouseTool => {
             commit_text_input(state);
@@ -2428,8 +2634,30 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
         ToolbarAction::TextBoldToggle => {
             state.set_text_bold(!state.current_text_bold());
         }
-        ToolbarAction::TextBackgroundToggle => {
-            state.set_text_background(!state.current_text_background());
+        ToolbarAction::TextItalicToggle => {
+            state.set_text_italic(!state.current_text_italic());
+        }
+        ToolbarAction::TextFontDropdown => {
+            state.open_text_dropdown = if state.open_text_dropdown == Some(TextDropdownKind::FontFamily) {
+                None
+            } else {
+                Some(TextDropdownKind::FontFamily)
+            };
+        }
+        ToolbarAction::TextSizeDropdown => {
+            state.open_text_dropdown = if state.open_text_dropdown == Some(TextDropdownKind::FontSize) {
+                None
+            } else {
+                Some(TextDropdownKind::FontSize)
+            };
+        }
+        ToolbarAction::TextFontOption(font_family) => {
+            state.set_text_font_family(font_family);
+            state.open_text_dropdown = None;
+        }
+        ToolbarAction::TextSizeOption(size) => {
+            state.set_current_style_value(size);
+            state.open_text_dropdown = None;
         }
         ToolbarAction::NumberTool => {
             commit_text_input(state);
@@ -2666,7 +2894,9 @@ fn paint_dynamic_shapes(state: &mut OverlayState) {
             &text_input.text,
             text_input.style,
             text_input.bold,
+            text_input.italic,
             text_input.background,
+            text_input.font_family,
             true,
         );
     }
@@ -2701,19 +2931,36 @@ fn paint_toolbar(state: &mut OverlayState) {
     let Some(layout) = state.toolbar_layout() else {
         return;
     };
-    draw_panel(
-        &mut state.frame,
-        state.target.width,
-        state.target.height,
-        layout.panel,
-    );
+    for panel in &layout.panels {
+        draw_panel(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            *panel,
+        );
+    }
     for item in layout.items {
         paint_toolbar_item(state, item);
+    }
+    if let Some(layout) = state.text_dropdown_layout() {
+        for panel in &layout.panels {
+            draw_panel(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                *panel,
+            );
+        }
+        for item in layout.items {
+            paint_toolbar_item(state, item);
+        }
     }
 }
 
 fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
     let hovered = item.rect.contains(state.last_cursor);
+    let current_text_font_family = state.current_text_font_family();
+    let current_text_size = state.current_text_size();
     let selected = match item.action {
         ToolbarAction::MouseTool => state.tool == AnnotationTool::Mouse,
         ToolbarAction::SelectTool => state.tool == AnnotationTool::Select,
@@ -2724,7 +2971,11 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::MosaicTool => state.tool == AnnotationTool::Mosaic,
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
         ToolbarAction::TextBoldToggle => state.current_text_bold(),
-        ToolbarAction::TextBackgroundToggle => state.current_text_background(),
+        ToolbarAction::TextItalicToggle => state.current_text_italic(),
+        ToolbarAction::TextFontDropdown => state.open_text_dropdown == Some(TextDropdownKind::FontFamily),
+        ToolbarAction::TextSizeDropdown => state.open_text_dropdown == Some(TextDropdownKind::FontSize),
+        ToolbarAction::TextFontOption(font_family) => state.current_text_font_family() == font_family,
+        ToolbarAction::TextSizeOption(size) => current_text_size == size,
         ToolbarAction::NumberTool => state.tool == AnnotationTool::Number,
         ToolbarAction::Color(index) => state.color_index == index,
         ToolbarAction::StyleControl => false,
@@ -2823,11 +3074,43 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             item.rect,
             TOOLBAR_TEXT,
         ),
-        ToolbarAction::TextBackgroundToggle => draw_text_background_glyph(
+        ToolbarAction::TextItalicToggle => draw_text_italic_glyph(
             &mut state.frame,
             state.target.width,
             state.target.height,
             item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::TextFontDropdown => draw_text_font_dropdown_button(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            current_text_font_family,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::TextSizeDropdown => draw_text_size_dropdown_button(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            current_text_size,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::TextFontOption(font_family) => draw_text_font_option_label(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            font_family,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::TextSizeOption(size) => draw_text_size_option_label(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            size,
             TOOLBAR_TEXT,
         ),
         ToolbarAction::NumberTool => draw_number_glyph(
@@ -3238,18 +3521,139 @@ fn draw_text_bold_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRec
     };
     draw_gdi_text_centered_weighted(frame, width, height, center, "B", 15, color, true);
 }
-fn draw_text_background_glyph(
+
+fn draw_text_italic_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let center = CursorPoint {
+        x: (rect.left + rect.right) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    draw_gdi_text_centered_styled(
+        frame,
+        width,
+        height,
+        center,
+        "I",
+        15,
+        color,
+        false,
+        true,
+        TextFontFamily::YaHei,
+    );
+}
+
+fn draw_dropdown_chevron(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let cx = rect.right - 10;
+    let cy = (rect.top + rect.bottom) / 2;
+    draw_line(
+        frame,
+        width,
+        height,
+        CursorPoint { x: cx - 4, y: cy - 2 },
+        CursorPoint { x: cx, y: cy + 2 },
+        color,
+        1,
+    );
+    draw_line(
+        frame,
+        width,
+        height,
+        CursorPoint { x: cx, y: cy + 2 },
+        CursorPoint { x: cx + 4, y: cy - 2 },
+        color,
+        1,
+    );
+}
+
+fn draw_text_font_dropdown_button(
     frame: &mut [u32],
     width: u32,
     height: u32,
     rect: IntRect,
+    font_family: TextFontFamily,
     color: u32,
 ) {
-    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN + 1);
-    fill_rounded_rect(frame, width, height, icon, 4, 0x31405A);
-    stroke_rounded_rect(frame, width, height, icon, 4, color);
-    draw_gdi_text_centered(frame, width, height, CursorPoint { x: (icon.left + icon.right) / 2, y: (icon.top + icon.bottom) / 2 }, "T", 12, color);
+    let text_center = CursorPoint {
+        x: rect.left + (rect.width() - 16) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    draw_gdi_text_centered_styled(
+        frame,
+        width,
+        height,
+        text_center,
+        font_face_label(font_family),
+        17,
+        color,
+        false,
+        false,
+        TextFontFamily::YaHei,
+    );
+    draw_dropdown_chevron(frame, width, height, rect, color);
 }
+
+fn draw_text_size_dropdown_button(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    size: u32,
+    color: u32,
+) {
+    let text_center = CursorPoint {
+        x: rect.left + (rect.width() - 14) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    draw_gdi_text_centered(frame, width, height, text_center, &size.to_string(), 13, color);
+    draw_dropdown_chevron(frame, width, height, rect, color);
+}
+
+fn draw_text_font_option_label(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    font_family: TextFontFamily,
+    color: u32,
+) {
+    draw_gdi_text_centered_styled(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        font_face_label(font_family),
+        17,
+        color,
+        false,
+        false,
+        TextFontFamily::YaHei,
+    );
+}
+
+fn draw_text_size_option_label(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    size: u32,
+    color: u32,
+) {
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        &size.to_string(),
+        13,
+        color,
+    );
+}
+
 fn draw_number_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
     let start = map_icon_point(icon, 4.0, 4.0);
@@ -3646,11 +4050,14 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
             text,
             style,
             bold,
+            italic,
+            font_family,
             ..
         } => {
             draw_rect_outline(
                 frame,
-                text_box_bounds(*box_rect, text, *style, *bold).expanded(2),
+                text_box_bounds_styled(*box_rect, text, *style, *bold, *italic, *font_family)
+                    .expanded(2),
                 width,
                 height,
                 1,
@@ -3724,7 +4131,9 @@ fn draw_shape_image(frame: &mut [u32], width: u32, height: u32, shape: &Annotati
             text,
             style,
             bold,
+            italic,
             background,
+            font_family,
         } => draw_text_box_shape(
             frame,
             width,
@@ -3733,7 +4142,9 @@ fn draw_shape_image(frame: &mut [u32], width: u32, height: u32, shape: &Annotati
             text,
             *style,
             *bold,
+            *italic,
             *background,
+            *font_family,
             false,
         ),
         AnnotationShape::Number {
@@ -3791,14 +4202,30 @@ fn text_content_rect(box_rect: NormalizedRect) -> NormalizedRect {
     }
 }
 
-fn measure_text_width(text: &str, style: ShapeStyle, bold: bool) -> i32 {
-    measure_text_layout(text, style, bold)
+
+fn measure_text_width_styled(
+    text: &str,
+    style: ShapeStyle,
+    bold: bool,
+    italic: bool,
+    font_family: TextFontFamily,
+) -> i32 {
+    measure_text_layout_styled(text, style, bold, italic, font_family)
         .map(|metrics| metrics.max_width)
-        .unwrap_or_else(|| fallback_text_metrics(text, style, bold).max_width)
+        .unwrap_or_else(|| fallback_text_metrics_styled(text, style, bold, italic, font_family).max_width)
         .max(1)
 }
 
-fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32, bold: bool) -> Vec<String> {
+
+
+fn measure_wrapped_text_styled(
+    text: &str,
+    style: ShapeStyle,
+    max_width: i32,
+    bold: bool,
+    italic: bool,
+    font_family: TextFontFamily,
+) -> WrappedTextLayout {
     let max_width = max_width.max(1);
     let mut wrapped = Vec::new();
     let paragraphs: Vec<&str> = if text.is_empty() {
@@ -3815,7 +4242,9 @@ fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32, bold: bool) ->
         for ch in paragraph.chars() {
             let mut candidate = current.clone();
             candidate.push(ch);
-            if !current.is_empty() && measure_text_width(&candidate, style, bold) > max_width {
+            if !current.is_empty()
+                && measure_text_width_styled(&candidate, style, bold, italic, font_family) > max_width
+            {
                 wrapped.push(current);
                 current = ch.to_string();
             } else {
@@ -3827,24 +4256,19 @@ fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32, bold: bool) ->
     if wrapped.is_empty() {
         wrapped.push(String::new());
     }
-    wrapped
-}
-
-fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32, bold: bool) -> WrappedTextLayout {
-    let lines = wrap_text_lines(text, style, max_width, bold);
     let line_height = text_font_height(style);
     let line_gap = text_line_gap(style);
-    let widths: Vec<i32> = lines
+    let widths: Vec<i32> = wrapped
         .iter()
         .map(|line| {
             if line.is_empty() {
                 0
             } else {
-                measure_text_width(line, style, bold)
+                measure_text_width_styled(line, style, bold, italic, font_family)
             }
         })
         .collect();
-    let line_count = lines.len() as i32;
+    let line_count = wrapped.len() as i32;
     let max_width = widths.iter().copied().max().unwrap_or(0).max(1);
     let total_height = (line_count * line_height
         + (line_count - 1).max(0) * line_gap
@@ -3852,7 +4276,7 @@ fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32, bold: boo
         .max(1);
     let last_line_width = widths.last().copied().unwrap_or(0);
     WrappedTextLayout {
-        lines,
+        lines: wrapped,
         metrics: TextMetrics {
             max_width,
             total_height,
@@ -3864,14 +4288,17 @@ fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32, bold: boo
     }
 }
 
-fn text_box_bounds(
+
+fn text_box_bounds_styled(
     box_rect: NormalizedRect,
     text: &str,
     style: ShapeStyle,
     bold: bool,
+    italic: bool,
+    font_family: TextFontFamily,
 ) -> NormalizedRect {
     let content = text_content_rect(box_rect);
-    let layout = measure_wrapped_text(text, style, content.width(), bold);
+    let layout = measure_wrapped_text_styled(text, style, content.width(), bold, italic, font_family);
     let content_height = layout.metrics.total_height.max(1);
     let target_height = (content_height + TEXT_BOX_PADDING_Y * 2).max(box_rect.height());
     NormalizedRect {
@@ -3882,14 +4309,17 @@ fn text_box_bounds(
     }
 }
 
-fn clamp_text_box_to_bounds(
+
+fn clamp_text_box_to_bounds_styled(
     box_rect: NormalizedRect,
     text: &str,
     style: ShapeStyle,
     bold: bool,
+    italic: bool,
+    font_family: TextFontFamily,
     bounds: NormalizedRect,
 ) -> NormalizedRect {
-    let actual = text_box_bounds(box_rect, text, style, bold);
+    let actual = text_box_bounds_styled(box_rect, text, style, bold, italic, font_family);
     let dx = if actual.left < bounds.left {
         bounds.left - actual.left
     } else if actual.right > bounds.right {
@@ -3921,6 +4351,16 @@ fn text_line_gap(style: ShapeStyle) -> i32 {
 }
 
 fn fallback_text_metrics(text: &str, style: ShapeStyle, bold: bool) -> TextMetrics {
+    fallback_text_metrics_styled(text, style, bold, false, TextFontFamily::YaHei)
+}
+
+fn fallback_text_metrics_styled(
+    text: &str,
+    style: ShapeStyle,
+    bold: bool,
+    italic: bool,
+    _font_family: TextFontFamily,
+) -> TextMetrics {
     let line_height = text_font_height(style);
     let line_gap = text_line_gap(style);
     let lines: Vec<&str> = if text.is_empty() {
@@ -3928,22 +4368,13 @@ fn fallback_text_metrics(text: &str, style: ShapeStyle, bold: bool) -> TextMetri
     } else {
         text.split('\n').collect()
     };
-    let last_line_width = lines
-        .last()
-        .map(|line| {
-            let width = (line.chars().count() as i32 * (line_height / 2).max(1)).max(0);
-            if bold { ((width as f32) * 1.08).round() as i32 } else { width }
-        })
-        .unwrap_or(0);
-    let max_width = lines
-        .iter()
-        .map(|line| {
-            let width = (line.chars().count() as i32 * (line_height / 2).max(1)).max(0);
-            if bold { ((width as f32) * 1.08).round() as i32 } else { width }
-        })
-        .max()
-        .unwrap_or(0)
-        .max(1);
+    let width_scale = if italic { 1.06 } else { 1.0 } * if bold { 1.08 } else { 1.0 };
+    let measure_line = |line: &&str| {
+        let width = (line.chars().count() as i32 * (line_height / 2).max(1)).max(0);
+        ((width as f32) * width_scale).round() as i32
+    };
+    let last_line_width = lines.last().map(measure_line).unwrap_or(0);
+    let max_width = lines.iter().map(measure_line).max().unwrap_or(0).max(1);
     let line_count = lines.len() as i32;
     let total_height = (line_count * line_height
         + (line_count - 1).max(0) * line_gap
@@ -3960,6 +4391,16 @@ fn fallback_text_metrics(text: &str, style: ShapeStyle, bold: bool) -> TextMetri
 }
 
 fn measure_text_layout(text: &str, style: ShapeStyle, bold: bool) -> Option<TextMetrics> {
+    measure_text_layout_styled(text, style, bold, false, TextFontFamily::YaHei)
+}
+
+fn measure_text_layout_styled(
+    text: &str,
+    style: ShapeStyle,
+    bold: bool,
+    italic: bool,
+    font_family: TextFontFamily,
+) -> Option<TextMetrics> {
     let line_height = text_font_height(style);
     let line_gap = text_line_gap(style);
     let lines: Vec<&str> = if text.is_empty() {
@@ -3978,7 +4419,7 @@ fn measure_text_layout(text: &str, style: ShapeStyle, bold: bool) -> Option<Text
             0,
             0,
             font_weight(bold),
-            0,
+            italic as u32,
             0,
             0,
             DEFAULT_CHARSET,
@@ -3986,7 +4427,7 @@ fn measure_text_layout(text: &str, style: ShapeStyle, bold: bool) -> Option<Text
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            w!("Microsoft YaHei UI"),
+            font_face_name(font_family),
         )
     };
     if font.0.is_null() {
@@ -4101,6 +4542,22 @@ fn text_background_border(color: u32) -> u32 {
     pack_rgb(mix(red) as u8, mix(green) as u8, mix(blue) as u8)
 }
 
+fn font_face_name(font_family: TextFontFamily) -> windows::core::PCWSTR {
+    match font_family {
+        TextFontFamily::YaHei => w!("Microsoft YaHei UI"),
+        TextFontFamily::DengXian => w!("DengXian"),
+        TextFontFamily::KaiTi => w!("KaiTi"),
+    }
+}
+
+fn font_face_label(font_family: TextFontFamily) -> &'static str {
+    match font_family {
+        TextFontFamily::YaHei => "雅黑",
+        TextFontFamily::DengXian => "等线",
+        TextFontFamily::KaiTi => "楷体",
+    }
+}
+
 fn font_weight(bold: bool) -> i32 {
     if bold { 700 } else { FW_NORMAL.0 as i32 }
 }
@@ -4114,6 +4571,32 @@ fn draw_gdi_text_centered_weighted(
     font_height: i32,
     color: u32,
     bold: bool,
+) {
+    draw_gdi_text_centered_styled(
+        frame,
+        width,
+        height,
+        center,
+        text,
+        font_height,
+        color,
+        bold,
+        false,
+        TextFontFamily::YaHei,
+    );
+}
+
+fn draw_gdi_text_centered_styled(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    center: CursorPoint,
+    text: &str,
+    font_height: i32,
+    color: u32,
+    bold: bool,
+    italic: bool,
+    font_family: TextFontFamily,
 ) {
     if text.is_empty() {
         return;
@@ -4129,7 +4612,7 @@ fn draw_gdi_text_centered_weighted(
             0,
             0,
             font_weight(bold),
-            0,
+            italic as u32,
             0,
             0,
             DEFAULT_CHARSET,
@@ -4137,7 +4620,7 @@ fn draw_gdi_text_centered_weighted(
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            w!("Microsoft YaHei UI"),
+            font_face_name(font_family),
         )
     };
     if font.0.is_null() {
@@ -4222,7 +4705,18 @@ fn draw_gdi_text_centered(
     font_height: i32,
     color: u32,
 ) {
-    draw_gdi_text_centered_weighted(frame, width, height, center, text, font_height, color, false);
+    draw_gdi_text_centered_styled(
+        frame,
+        width,
+        height,
+        center,
+        text,
+        font_height,
+        color,
+        false,
+        false,
+        TextFontFamily::YaHei,
+    );
 }
 
 fn draw_number_outline(
@@ -4307,12 +4801,39 @@ fn draw_text_box_shape(
     text: &str,
     style: ShapeStyle,
     bold: bool,
+    italic: bool,
     background: bool,
+    font_family: TextFontFamily,
     show_caret: bool,
 ) {
-    let bounds = text_box_bounds(box_rect, text, style, bold);
+    let bounds = text_box_bounds_styled(box_rect, text, style, bold, italic, font_family);
     let content = text_content_rect(bounds);
-    let layout = measure_wrapped_text(text, style, content.width(), bold);
+    let layout = measure_wrapped_text_styled(text, style, content.width(), bold, italic, font_family);
+
+    if show_caret {
+        let panel = IntRect {
+            left: bounds.left - TEXT_EDIT_PADDING_X,
+            top: bounds.top - TEXT_EDIT_PADDING_Y,
+            right: bounds.right + TEXT_EDIT_PADDING_X,
+            bottom: bounds.bottom + TEXT_EDIT_PADDING_Y,
+        };
+        fill_rounded_rect(
+            frame,
+            width,
+            height,
+            panel,
+            TEXT_EDIT_RADIUS,
+            TEXT_EDIT_FILL,
+        );
+        stroke_rounded_rect(
+            frame,
+            width,
+            height,
+            panel,
+            TEXT_EDIT_RADIUS,
+            TEXT_EDIT_BORDER,
+        );
+    }
 
     if background {
         fill_rounded_rect(
@@ -4344,29 +4865,18 @@ fn draw_text_box_shape(
     }
 
     if show_caret {
-        let panel = IntRect {
-            left: bounds.left - TEXT_EDIT_PADDING_X,
-            top: bounds.top - TEXT_EDIT_PADDING_Y,
-            right: bounds.right + TEXT_EDIT_PADDING_X,
-            bottom: bounds.bottom + TEXT_EDIT_PADDING_Y,
-        };
-        fill_rounded_rect(
+        draw_rect_outline(
             frame,
+            bounds,
             width,
             height,
-            panel,
-            TEXT_EDIT_RADIUS,
-            TEXT_EDIT_FILL,
+            1,
+            if background {
+                text_background_border(style.color)
+            } else {
+                TEXT_EDIT_BORDER
+            },
         );
-        stroke_rounded_rect(
-            frame,
-            width,
-            height,
-            panel,
-            TEXT_EDIT_RADIUS,
-            TEXT_EDIT_BORDER,
-        );
-        draw_rect_outline(frame, bounds, width, height, 1, TEXT_EDIT_BORDER);
     }
 
     let bitmap_width = content.width().max(1);
@@ -4413,7 +4923,7 @@ fn draw_text_box_shape(
             0,
             0,
             font_weight(bold),
-            0,
+            italic as u32,
             0,
             0,
             DEFAULT_CHARSET,
@@ -4421,7 +4931,7 @@ fn draw_text_box_shape(
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            w!("Microsoft YaHei UI"),
+            font_face_name(font_family),
         )
     };
     let old_font = if font.0.is_null() {
@@ -4959,11 +5469,62 @@ fn button_height(action: ToolbarAction) -> i32 {
     }
 }
 
-fn toolbar_gap_after(index: usize) -> i32 {
-    match index {
-        10 | 15 | 16 | 17 => TOOLBAR_GROUP_GAP,
-        _ => TOOLBAR_ITEM_GAP,
+fn toolbar_gap_after(action: ToolbarAction, text_row: bool) -> i32 {
+    if text_row {
+        match action {
+            ToolbarAction::TextItalicToggle | ToolbarAction::TextFontDropdown => TOOLBAR_GROUP_GAP,
+            _ => TOOLBAR_ITEM_GAP,
+        }
+    } else {
+        match action {
+            ToolbarAction::NumberTool
+            | ToolbarAction::Color(4)
+            | ToolbarAction::StyleControl
+            | ToolbarAction::Undo => TOOLBAR_GROUP_GAP,
+            _ => TOOLBAR_ITEM_GAP,
+        }
     }
+}
+
+fn toolbar_row_width(defs: &[(ToolbarAction, i32)], text_row: bool) -> i32 {
+    let items_width: i32 = defs.iter().map(|(_, item_width)| *item_width).sum();
+    let gaps: i32 = defs
+        .iter()
+        .enumerate()
+        .map(|(index, (action, _))| {
+            if index + 1 == defs.len() {
+                0
+            } else {
+                toolbar_gap_after(*action, text_row)
+            }
+        })
+        .sum();
+    TOOLBAR_PADDING * 2 + items_width + gaps
+}
+
+fn layout_toolbar_row(
+    panel: IntRect,
+    defs: &[(ToolbarAction, i32)],
+    text_row: bool,
+) -> Vec<ToolbarItem> {
+    let mut items = Vec::with_capacity(defs.len());
+    let mut x = panel.left + TOOLBAR_PADDING;
+    for (index, (action, item_width)) in defs.iter().copied().enumerate() {
+        let item_height = button_height(action);
+        let top = panel.top + (panel.bottom - panel.top - item_height) / 2;
+        let rect = IntRect {
+            left: x,
+            top,
+            right: x + item_width,
+            bottom: top + item_height,
+        };
+        items.push(ToolbarItem { rect, action });
+        x += item_width;
+        if index + 1 != defs.len() {
+            x += toolbar_gap_after(action, text_row);
+        }
+    }
+    items
 }
 fn update_overlay_cursor(state: &OverlayState) {
     let cursor_id = match state.current_cursor() {
