@@ -173,6 +173,8 @@ struct TextDraft {
     box_rect: NormalizedRect,
     text: String,
     style: ShapeStyle,
+    bold: bool,
+    background: bool,
     editing_shape: Option<(usize, AnnotationShape)>,
 }
 
@@ -207,6 +209,8 @@ enum AnnotationShape {
         box_rect: NormalizedRect,
         text: String,
         style: ShapeStyle,
+        bold: bool,
+        background: bool,
     },
     Number {
         center: CursorPoint,
@@ -283,6 +287,8 @@ enum ToolbarAction {
     MosaicTool,
     TextTool,
     NumberTool,
+    TextBoldToggle,
+    TextBackgroundToggle,
     Color(usize),
     StyleControl,
     Undo,
@@ -362,6 +368,8 @@ struct OverlayState {
     text_size: u32,
     number_size: u32,
     mosaic_size: u32,
+    text_bold: bool,
+    text_background: bool,
     shapes: Vec<AnnotationShape>,
     draft: Option<DraftShape>,
     text_input: Option<TextDraft>,
@@ -411,6 +419,8 @@ impl OverlaySession {
             text_size: DEFAULT_TEXT_SIZE,
             number_size: DEFAULT_NUMBER_SIZE,
             mosaic_size: DEFAULT_MOSAIC_SIZE,
+            text_bold: false,
+            text_background: false,
             shapes: Vec::new(),
             draft: None,
             text_input: None,
@@ -515,6 +525,8 @@ impl OverlayState {
         self.text_size = DEFAULT_TEXT_SIZE;
         self.number_size = DEFAULT_NUMBER_SIZE;
         self.mosaic_size = DEFAULT_MOSAIC_SIZE;
+        self.text_bold = false;
+        self.text_background = false;
         self.shapes.clear();
         self.draft = None;
         self.text_input = None;
@@ -579,6 +591,56 @@ impl OverlayState {
         ShapeStyle {
             color: COLOR_PRESETS[self.color_index],
             stroke: self.current_style_value(),
+        }
+    }
+
+    fn current_text_bold(&self) -> bool {
+        if let Some(draft) = &self.text_input {
+            return draft.bold;
+        }
+        if let Some(index) = self.selected_shape {
+            if let Some(AnnotationShape::Text { bold, .. }) = self.shapes.get(index) {
+                return *bold;
+            }
+        }
+        self.text_bold
+    }
+
+    fn current_text_background(&self) -> bool {
+        if let Some(draft) = &self.text_input {
+            return draft.background;
+        }
+        if let Some(index) = self.selected_shape {
+            if let Some(AnnotationShape::Text { background, .. }) = self.shapes.get(index) {
+                return *background;
+            }
+        }
+        self.text_background
+    }
+
+    fn set_text_bold(&mut self, value: bool) {
+        self.text_bold = value;
+        if let Some(draft) = self.text_input.as_mut() {
+            draft.bold = value;
+        }
+        if let Some(index) = self.selected_shape {
+            if let Some(AnnotationShape::Text { bold, .. }) = self.shapes.get_mut(index) {
+                *bold = value;
+                self.composed_dirty = true;
+            }
+        }
+    }
+
+    fn set_text_background(&mut self, value: bool) {
+        self.text_background = value;
+        if let Some(draft) = self.text_input.as_mut() {
+            draft.background = value;
+        }
+        if let Some(index) = self.selected_shape {
+            if let Some(AnnotationShape::Text { background, .. }) = self.shapes.get_mut(index) {
+                *background = value;
+                self.composed_dirty = true;
+            }
         }
     }
 
@@ -648,6 +710,7 @@ impl OverlayState {
                         draft.box_rect,
                         &draft.text,
                         draft.style,
+                        draft.bold,
                         selection,
                     );
                 }
@@ -670,11 +733,18 @@ impl OverlayState {
                             box_rect,
                             text,
                             style,
+                            bold,
+                            ..
                         } => {
                             style.stroke = value;
                             if let Some(selection) = self.selection {
-                                *box_rect =
-                                    clamp_text_box_to_bounds(*box_rect, text, *style, selection);
+                                *box_rect = clamp_text_box_to_bounds(
+                                    *box_rect,
+                                    text,
+                                    *style,
+                                    *bold,
+                                    selection,
+                                );
                             }
                         }
                         AnnotationShape::Number { style, .. } => {
@@ -885,6 +955,8 @@ impl OverlayState {
             (ToolbarAction::ArrowTool, TOOLBAR_BUTTON),
             (ToolbarAction::MosaicTool, TOOLBAR_BUTTON),
             (ToolbarAction::TextTool, TOOLBAR_BUTTON),
+            (ToolbarAction::TextBoldToggle, TOOLBAR_BUTTON),
+            (ToolbarAction::TextBackgroundToggle, TOOLBAR_BUTTON),
             (ToolbarAction::NumberTool, TOOLBAR_BUTTON),
             (ToolbarAction::Color(0), TOOLBAR_COLOR),
             (ToolbarAction::Color(1), TOOLBAR_COLOR),
@@ -1204,7 +1276,9 @@ impl AnnotationShape {
                 box_rect,
                 text,
                 style,
-            } => text_box_bounds(*box_rect, text, *style),
+                bold,
+                ..
+            } => text_box_bounds(*box_rect, text, *style, *bold),
             AnnotationShape::Number { center, style, .. } => number_badge_bounds(*center, *style),
         }
     }
@@ -1270,6 +1344,8 @@ impl AnnotationShape {
                 box_rect,
                 text,
                 style,
+                bold,
+                background,
             } => AnnotationShape::Text {
                 box_rect: NormalizedRect {
                     left: box_rect.left + dx,
@@ -1279,6 +1355,8 @@ impl AnnotationShape {
                 },
                 text: text.clone(),
                 style: *style,
+                bold: *bold,
+                background: *background,
             },
             AnnotationShape::Number {
                 center,
@@ -1356,7 +1434,9 @@ impl AnnotationShape {
                 box_rect,
                 text,
                 style,
-            } => text_box_bounds(*box_rect, text, *style)
+                bold,
+                ..
+            } => text_box_bounds(*box_rect, text, *style, *bold)
                 .expanded(if selected { 6 } else { 4 })
                 .contains(point),
             AnnotationShape::Number { center, style, .. } => {
@@ -2036,6 +2116,8 @@ fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> 
                                 box_rect,
                                 text: String::new(),
                                 style: state.current_style(),
+                                bold: state.text_bold,
+                                background: state.text_background,
                                 editing_shape: None,
                             });
                         }
@@ -2062,8 +2144,13 @@ fn commit_text_input(state: &mut OverlayState) -> bool {
         return false;
     };
     if let Some(selection) = state.selection {
-        draft.box_rect =
-            clamp_text_box_to_bounds(draft.box_rect, &draft.text, draft.style, selection);
+        draft.box_rect = clamp_text_box_to_bounds(
+            draft.box_rect,
+            &draft.text,
+            draft.style,
+            draft.bold,
+            selection,
+        );
     }
 
     if draft.text.trim().is_empty() {
@@ -2079,6 +2166,8 @@ fn commit_text_input(state: &mut OverlayState) -> bool {
         box_rect: draft.box_rect,
         text: draft.text,
         style: draft.style,
+        bold: draft.bold,
+        background: draft.background,
     };
     let new_index = if let Some((index, _)) = draft.editing_shape {
         let insert_index = index.min(state.shapes.len());
@@ -2102,6 +2191,8 @@ fn begin_text_edit(state: &mut OverlayState, shape_index: usize) -> bool {
         box_rect,
         text,
         style,
+        bold,
+        background,
     } = &original
     else {
         return false;
@@ -2111,6 +2202,8 @@ fn begin_text_edit(state: &mut OverlayState, shape_index: usize) -> bool {
         box_rect: *box_rect,
         text: text.clone(),
         style: *style,
+        bold: *bold,
+        background: *background,
         editing_shape: Some((shape_index, original)),
     });
     state.selected_shape = None;
@@ -2327,6 +2420,12 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
         ToolbarAction::TextTool => {
             commit_text_input(state);
             state.tool = AnnotationTool::Text;
+        }
+        ToolbarAction::TextBoldToggle => {
+            state.set_text_bold(!state.current_text_bold());
+        }
+        ToolbarAction::TextBackgroundToggle => {
+            state.set_text_background(!state.current_text_background());
         }
         ToolbarAction::NumberTool => {
             commit_text_input(state);
@@ -2562,6 +2661,8 @@ fn paint_dynamic_shapes(state: &mut OverlayState) {
             text_input.box_rect,
             &text_input.text,
             text_input.style,
+            text_input.bold,
+            text_input.background,
             true,
         );
     }
@@ -2618,6 +2719,8 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::ArrowTool => state.tool == AnnotationTool::Arrow,
         ToolbarAction::MosaicTool => state.tool == AnnotationTool::Mosaic,
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
+        ToolbarAction::TextBoldToggle => state.current_text_bold(),
+        ToolbarAction::TextBackgroundToggle => state.current_text_background(),
         ToolbarAction::NumberTool => state.tool == AnnotationTool::Number,
         ToolbarAction::Color(index) => state.color_index == index,
         ToolbarAction::StyleControl => false,
@@ -2703,6 +2806,20 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             TOOLBAR_TEXT,
         ),
         ToolbarAction::TextTool => draw_text_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::TextBoldToggle => draw_text_bold_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::TextBackgroundToggle => draw_text_background_glyph(
             &mut state.frame,
             state.target.width,
             state.target.height,
@@ -3110,6 +3227,25 @@ fn draw_text_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, co
         draw_line(frame, width, height, start, end, color, 1);
     }
 }
+fn draw_text_bold_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let center = CursorPoint {
+        x: (rect.left + rect.right) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    draw_gdi_text_centered_weighted(frame, width, height, center, "B", 15, color, true);
+}
+fn draw_text_background_glyph(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    color: u32,
+) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN + 1);
+    fill_rounded_rect(frame, width, height, icon, 4, 0x31405A);
+    stroke_rounded_rect(frame, width, height, icon, 4, color);
+    draw_gdi_text_centered(frame, width, height, CursorPoint { x: (icon.left + icon.right) / 2, y: (icon.top + icon.bottom) / 2 }, "T", 12, color);
+}
 fn draw_number_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
     let start = map_icon_point(icon, 4.0, 4.0);
@@ -3308,8 +3444,8 @@ fn draw_style_control(state: &mut OverlayState, rect: IntRect, hovered: bool) {
                 small,
                 false,
             );
-            let large_metrics = measure_text_layout("A", large)
-                .unwrap_or_else(|| fallback_text_metrics("A", large));
+            let large_metrics = measure_text_layout("A", large, false)
+                .unwrap_or_else(|| fallback_text_metrics("A", large, false));
             draw_text_shape(
                 &mut state.frame,
                 state.target.width,
@@ -3505,10 +3641,12 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
             box_rect,
             text,
             style,
+            bold,
+            ..
         } => {
             draw_rect_outline(
                 frame,
-                text_box_bounds(*box_rect, text, *style).expanded(2),
+                text_box_bounds(*box_rect, text, *style, *bold).expanded(2),
                 width,
                 height,
                 1,
@@ -3581,7 +3719,19 @@ fn draw_shape_image(frame: &mut [u32], width: u32, height: u32, shape: &Annotati
             box_rect,
             text,
             style,
-        } => draw_text_box_shape(frame, width, height, *box_rect, text, *style, false),
+            bold,
+            background,
+        } => draw_text_box_shape(
+            frame,
+            width,
+            height,
+            *box_rect,
+            text,
+            *style,
+            *bold,
+            *background,
+            false,
+        ),
         AnnotationShape::Number {
             center,
             value,
@@ -3637,14 +3787,14 @@ fn text_content_rect(box_rect: NormalizedRect) -> NormalizedRect {
     }
 }
 
-fn measure_text_width(text: &str, style: ShapeStyle) -> i32 {
-    measure_text_layout(text, style)
+fn measure_text_width(text: &str, style: ShapeStyle, bold: bool) -> i32 {
+    measure_text_layout(text, style, bold)
         .map(|metrics| metrics.max_width)
-        .unwrap_or_else(|| fallback_text_metrics(text, style).max_width)
+        .unwrap_or_else(|| fallback_text_metrics(text, style, bold).max_width)
         .max(1)
 }
 
-fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32) -> Vec<String> {
+fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32, bold: bool) -> Vec<String> {
     let max_width = max_width.max(1);
     let mut wrapped = Vec::new();
     let paragraphs: Vec<&str> = if text.is_empty() {
@@ -3661,7 +3811,7 @@ fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32) -> Vec<String>
         for ch in paragraph.chars() {
             let mut candidate = current.clone();
             candidate.push(ch);
-            if !current.is_empty() && measure_text_width(&candidate, style) > max_width {
+            if !current.is_empty() && measure_text_width(&candidate, style, bold) > max_width {
                 wrapped.push(current);
                 current = ch.to_string();
             } else {
@@ -3676,8 +3826,8 @@ fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32) -> Vec<String>
     wrapped
 }
 
-fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32) -> WrappedTextLayout {
-    let lines = wrap_text_lines(text, style, max_width);
+fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32, bold: bool) -> WrappedTextLayout {
+    let lines = wrap_text_lines(text, style, max_width, bold);
     let line_height = text_font_height(style);
     let line_gap = text_line_gap(style);
     let widths: Vec<i32> = lines
@@ -3686,7 +3836,7 @@ fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32) -> Wrappe
             if line.is_empty() {
                 0
             } else {
-                measure_text_width(line, style)
+                measure_text_width(line, style, bold)
             }
         })
         .collect();
@@ -3710,9 +3860,14 @@ fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32) -> Wrappe
     }
 }
 
-fn text_box_bounds(box_rect: NormalizedRect, text: &str, style: ShapeStyle) -> NormalizedRect {
+fn text_box_bounds(
+    box_rect: NormalizedRect,
+    text: &str,
+    style: ShapeStyle,
+    bold: bool,
+) -> NormalizedRect {
     let content = text_content_rect(box_rect);
-    let layout = measure_wrapped_text(text, style, content.width());
+    let layout = measure_wrapped_text(text, style, content.width(), bold);
     let content_height = layout.metrics.total_height.max(1);
     let target_height = (content_height + TEXT_BOX_PADDING_Y * 2).max(box_rect.height());
     NormalizedRect {
@@ -3727,9 +3882,10 @@ fn clamp_text_box_to_bounds(
     box_rect: NormalizedRect,
     text: &str,
     style: ShapeStyle,
+    bold: bool,
     bounds: NormalizedRect,
 ) -> NormalizedRect {
-    let actual = text_box_bounds(box_rect, text, style);
+    let actual = text_box_bounds(box_rect, text, style, bold);
     let dx = if actual.left < bounds.left {
         bounds.left - actual.left
     } else if actual.right > bounds.right {
@@ -3760,7 +3916,7 @@ fn text_line_gap(style: ShapeStyle) -> i32 {
     (text_font_height(style) / 5).max(4)
 }
 
-fn fallback_text_metrics(text: &str, style: ShapeStyle) -> TextMetrics {
+fn fallback_text_metrics(text: &str, style: ShapeStyle, bold: bool) -> TextMetrics {
     let line_height = text_font_height(style);
     let line_gap = text_line_gap(style);
     let lines: Vec<&str> = if text.is_empty() {
@@ -3770,11 +3926,17 @@ fn fallback_text_metrics(text: &str, style: ShapeStyle) -> TextMetrics {
     };
     let last_line_width = lines
         .last()
-        .map(|line| (line.chars().count() as i32 * (line_height / 2).max(1)).max(0))
+        .map(|line| {
+            let width = (line.chars().count() as i32 * (line_height / 2).max(1)).max(0);
+            if bold { ((width as f32) * 1.08).round() as i32 } else { width }
+        })
         .unwrap_or(0);
     let max_width = lines
         .iter()
-        .map(|line| (line.chars().count() as i32 * (line_height / 2).max(1)).max(0))
+        .map(|line| {
+            let width = (line.chars().count() as i32 * (line_height / 2).max(1)).max(0);
+            if bold { ((width as f32) * 1.08).round() as i32 } else { width }
+        })
         .max()
         .unwrap_or(0)
         .max(1);
@@ -3793,7 +3955,7 @@ fn fallback_text_metrics(text: &str, style: ShapeStyle) -> TextMetrics {
     }
 }
 
-fn measure_text_layout(text: &str, style: ShapeStyle) -> Option<TextMetrics> {
+fn measure_text_layout(text: &str, style: ShapeStyle, bold: bool) -> Option<TextMetrics> {
     let line_height = text_font_height(style);
     let line_gap = text_line_gap(style);
     let lines: Vec<&str> = if text.is_empty() {
@@ -3811,7 +3973,7 @@ fn measure_text_layout(text: &str, style: ShapeStyle) -> Option<TextMetrics> {
             0,
             0,
             0,
-            FW_NORMAL.0 as i32,
+            font_weight(bold),
             0,
             0,
             0,
@@ -3873,8 +4035,8 @@ fn measure_text_layout(text: &str, style: ShapeStyle) -> Option<TextMetrics> {
 
 #[cfg(test)]
 fn text_bounds(anchor: CursorPoint, text: &str, style: ShapeStyle) -> NormalizedRect {
-    let metrics =
-        measure_text_layout(text, style).unwrap_or_else(|| fallback_text_metrics(text, style));
+    let metrics = measure_text_layout(text, style, false)
+        .unwrap_or_else(|| fallback_text_metrics(text, style, false));
     NormalizedRect {
         left: anchor.x,
         top: anchor.y,
@@ -3919,7 +4081,27 @@ fn contrast_ink(color: u32) -> u32 {
     if luminance >= 150 { 0x1B2230 } else { 0xFFFFFF }
 }
 
-fn draw_gdi_text_centered(
+fn text_background_fill(color: u32) -> u32 {
+    let red = ((color >> 16) & 0xff) as u32;
+    let green = ((color >> 8) & 0xff) as u32;
+    let blue = (color & 0xff) as u32;
+    let mix = |channel: u32| ((channel * 25) + (255 * 75)) / 100;
+    pack_rgb(mix(red) as u8, mix(green) as u8, mix(blue) as u8)
+}
+
+fn text_background_border(color: u32) -> u32 {
+    let red = ((color >> 16) & 0xff) as u32;
+    let green = ((color >> 8) & 0xff) as u32;
+    let blue = (color & 0xff) as u32;
+    let mix = |channel: u32| ((channel * 55) + (255 * 45)) / 100;
+    pack_rgb(mix(red) as u8, mix(green) as u8, mix(blue) as u8)
+}
+
+fn font_weight(bold: bool) -> i32 {
+    if bold { 700 } else { FW_NORMAL.0 as i32 }
+}
+
+fn draw_gdi_text_centered_weighted(
     frame: &mut [u32],
     width: u32,
     height: u32,
@@ -3927,6 +4109,7 @@ fn draw_gdi_text_centered(
     text: &str,
     font_height: i32,
     color: u32,
+    bold: bool,
 ) {
     if text.is_empty() {
         return;
@@ -3941,7 +4124,7 @@ fn draw_gdi_text_centered(
             0,
             0,
             0,
-            FW_NORMAL.0 as i32,
+            font_weight(bold),
             0,
             0,
             0,
@@ -4026,6 +4209,18 @@ fn draw_gdi_text_centered(
     }
 }
 
+fn draw_gdi_text_centered(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    center: CursorPoint,
+    text: &str,
+    font_height: i32,
+    color: u32,
+) {
+    draw_gdi_text_centered_weighted(frame, width, height, center, text, font_height, color, false);
+}
+
 fn draw_number_outline(
     frame: &mut [u32],
     width: u32,
@@ -4107,11 +4302,42 @@ fn draw_text_box_shape(
     box_rect: NormalizedRect,
     text: &str,
     style: ShapeStyle,
+    bold: bool,
+    background: bool,
     show_caret: bool,
 ) {
-    let bounds = text_box_bounds(box_rect, text, style);
+    let bounds = text_box_bounds(box_rect, text, style, bold);
     let content = text_content_rect(bounds);
-    let layout = measure_wrapped_text(text, style, content.width());
+    let layout = measure_wrapped_text(text, style, content.width(), bold);
+
+    if background {
+        fill_rounded_rect(
+            frame,
+            width,
+            height,
+            IntRect {
+                left: bounds.left,
+                top: bounds.top,
+                right: bounds.right,
+                bottom: bounds.bottom,
+            },
+            6,
+            text_background_fill(style.color),
+        );
+        stroke_rounded_rect(
+            frame,
+            width,
+            height,
+            IntRect {
+                left: bounds.left,
+                top: bounds.top,
+                right: bounds.right,
+                bottom: bounds.bottom,
+            },
+            6,
+            text_background_border(style.color),
+        );
+    }
 
     if show_caret {
         let panel = IntRect {
@@ -4182,7 +4408,7 @@ fn draw_text_box_shape(
             0,
             0,
             0,
-            FW_NORMAL.0 as i32,
+            font_weight(bold),
             0,
             0,
             0,
@@ -4271,7 +4497,7 @@ fn draw_text_shape(
     show_caret: bool,
 ) {
     let metrics =
-        measure_text_layout(text, style).unwrap_or_else(|| fallback_text_metrics(text, style));
+        measure_text_layout(text, style, false).unwrap_or_else(|| fallback_text_metrics(text, style, false));
     let bounds = NormalizedRect {
         left: anchor.x,
         top: anchor.y,
@@ -4731,7 +4957,7 @@ fn button_height(action: ToolbarAction) -> i32 {
 
 fn toolbar_gap_after(index: usize) -> i32 {
     match index {
-        8 | 13 | 14 | 15 => TOOLBAR_GROUP_GAP,
+        10 | 15 | 16 | 17 => TOOLBAR_GROUP_GAP,
         _ => TOOLBAR_ITEM_GAP,
     }
 }
@@ -4804,7 +5030,7 @@ mod tests {
             color: 0xffffff,
             stroke: 4,
         };
-        let metrics = fallback_text_metrics("A\nBC", style);
+        let metrics = fallback_text_metrics("A\nBC", style, false);
         assert_eq!(metrics.line_count, 2);
         assert!(metrics.total_height > metrics.line_height);
         assert!(metrics.max_width >= metrics.last_line_width);
@@ -4848,3 +5074,4 @@ mod tests {
         assert_eq!(destination[3], opaque(source[3]));
     }
 }
+
