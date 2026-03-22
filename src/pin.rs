@@ -1,12 +1,7 @@
 use crate::output;
 use anyhow::{Result, anyhow};
 use image::{RgbaImage, imageops::FilterType};
-use std::{
-    mem::size_of,
-    path::PathBuf,
-    ptr::null_mut,
-    sync::OnceLock,
-};
+use std::{mem::size_of, path::PathBuf, ptr::null_mut, sync::OnceLock};
 use tracing::{info, warn};
 use windows::{
     Win32::{
@@ -44,8 +39,12 @@ const CMD_COPY: u32 = 1001;
 const CMD_SAVE: u32 = 1002;
 const CMD_TOPMOST: u32 = 1003;
 const CMD_DECORATION: u32 = 1004;
-const CMD_RESET_ZOOM: u32 = 1005;
-const CMD_CLOSE: u32 = 1006;
+const CMD_OPACITY_100: u32 = 1005;
+const CMD_OPACITY_80: u32 = 1006;
+const CMD_OPACITY_60: u32 = 1007;
+const CMD_OPACITY_40: u32 = 1008;
+const CMD_RESET_ZOOM: u32 = 1009;
+const CMD_CLOSE: u32 = 1010;
 const DECORATION_PADDING: i32 = 10;
 const FRAME_BORDER_THICKNESS: i32 = 1;
 const FRAME_COLOR: u32 = 0xFFE6EEF9;
@@ -71,6 +70,7 @@ struct PinState {
     image_y: i32,
     always_on_top: bool,
     show_decoration: bool,
+    opacity_percent: u8,
     dragging: Option<DragState>,
 }
 
@@ -107,6 +107,7 @@ impl PinWindow {
             image_y: y,
             always_on_top: true,
             show_decoration: true,
+            opacity_percent: 100,
             dragging: None,
         });
         let layout = layout_for_state(&state);
@@ -314,8 +315,16 @@ unsafe extern "system" fn pin_wndproc(
         WM_MOUSEWHEEL => {
             if let Some(state) = pin_state(hwnd) {
                 let delta = (((wparam.0 >> 16) & 0xFFFF) as i16 as i32) as f32;
-                let factor = if delta >= 0.0 { WHEEL_STEP } else { 1.0 / WHEEL_STEP };
-                apply_scale(hwnd, state, (state.scale * factor).clamp(MIN_SCALE, MAX_SCALE));
+                let factor = if delta >= 0.0 {
+                    WHEEL_STEP
+                } else {
+                    1.0 / WHEEL_STEP
+                };
+                apply_scale(
+                    hwnd,
+                    state,
+                    (state.scale * factor).clamp(MIN_SCALE, MAX_SCALE),
+                );
             }
             LRESULT(0)
         }
@@ -350,9 +359,42 @@ fn show_context_menu(hwnd: HWND, state: &mut PinState, cursor: POINT) {
         return;
     };
 
-    let topmost_flags = MF_STRING | if state.always_on_top { MF_CHECKED } else { MF_UNCHECKED };
-    let decoration_flags =
-        MF_STRING | if state.show_decoration { MF_CHECKED } else { MF_UNCHECKED };
+    let topmost_flags = MF_STRING
+        | if state.always_on_top {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    let decoration_flags = MF_STRING
+        | if state.show_decoration {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    let opacity_100_flags = MF_STRING
+        | if state.opacity_percent == 100 {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    let opacity_80_flags = MF_STRING
+        | if state.opacity_percent == 80 {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    let opacity_60_flags = MF_STRING
+        | if state.opacity_percent == 60 {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    let opacity_40_flags = MF_STRING
+        | if state.opacity_percent == 40 {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
 
     unsafe {
         let _ = AppendMenuW(menu, MF_STRING, CMD_COPY as usize, w!("复制到剪贴板"));
@@ -364,6 +406,31 @@ fn show_context_menu(hwnd: HWND, state: &mut PinState, cursor: POINT) {
             decoration_flags,
             CMD_DECORATION as usize,
             w!("显示边框和阴影"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(
+            menu,
+            opacity_100_flags,
+            CMD_OPACITY_100 as usize,
+            w!("透明度 100%"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            opacity_80_flags,
+            CMD_OPACITY_80 as usize,
+            w!("透明度 80%"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            opacity_60_flags,
+            CMD_OPACITY_60 as usize,
+            w!("透明度 60%"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            opacity_40_flags,
+            CMD_OPACITY_40 as usize,
+            w!("透明度 40%"),
         );
         let _ = AppendMenuW(menu, MF_STRING, CMD_RESET_ZOOM as usize, w!("重置缩放"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -407,6 +474,18 @@ fn show_context_menu(hwnd: HWND, state: &mut PinState, cursor: POINT) {
             state.show_decoration = !state.show_decoration;
             if let Err(error) = render_pin_window(hwnd, state) {
                 warn!(?error, "failed to toggle pin decoration");
+            }
+        }
+        CMD_OPACITY_100 | CMD_OPACITY_80 | CMD_OPACITY_60 | CMD_OPACITY_40 => {
+            state.opacity_percent = match command.0 as u32 {
+                CMD_OPACITY_100 => 100,
+                CMD_OPACITY_80 => 80,
+                CMD_OPACITY_60 => 60,
+                CMD_OPACITY_40 => 40,
+                _ => state.opacity_percent,
+            };
+            if let Err(error) = render_pin_window(hwnd, state) {
+                warn!(?error, "failed to update pin opacity");
             }
         }
         CMD_RESET_ZOOM => {
@@ -495,7 +574,9 @@ fn render_pin_window(hwnd: HWND, state: &mut PinState) -> Result<()> {
         )
     };
     let pixels = compose_window_pixels(state, &resized, layout);
-    state.surface.resize(layout.window_width, layout.window_height)?;
+    state
+        .surface
+        .resize(layout.window_width, layout.window_height)?;
     state.surface.update_pixels(&pixels);
     let dst = POINT {
         x: layout.window_x,
@@ -509,7 +590,7 @@ fn render_pin_window(hwnd: HWND, state: &mut PinState) -> Result<()> {
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         BlendFlags: 0,
-        SourceConstantAlpha: 255,
+        SourceConstantAlpha: opacity_to_alpha(state.opacity_percent),
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
     unsafe {
@@ -649,6 +730,10 @@ fn rgba_to_layered_pixels(image: &RgbaImage) -> Vec<u32> {
         .collect()
 }
 
+fn opacity_to_alpha(percent: u8) -> u8 {
+    (((percent.clamp(1, 100) as u16) * 255) / 100) as u8
+}
+
 fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
@@ -677,8 +762,8 @@ fn blend_argb(dst: u32, src: u32) -> u32 {
 }
 
 fn pin_state(hwnd: HWND) -> Option<&'static mut PinState> {
-    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0)) }
-        as *mut PinState;
+    let state_ptr =
+        unsafe { GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0)) } as *mut PinState;
     unsafe { state_ptr.as_mut() }
 }
 
