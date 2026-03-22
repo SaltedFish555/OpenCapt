@@ -1,9 +1,11 @@
 use crate::{
     config::{
-        ANNOTATION_COLOR_PRESETS, AppConfig, AppPaths, GeneralConfig, PIN_OPACITY_OPTIONS,
+        ANNOTATION_COLOR_PRESETS, AppConfig, AppPaths, GeneralConfig, OCR_TIMEOUT_MAX_MS,
+        OCR_TIMEOUT_MIN_MS, OcrBboxScaleMode, OcrProfile, OcrProviderKind, PIN_OPACITY_OPTIONS,
         TextFontFamily,
     },
     hotkey::RegisteredHotkey,
+    ocr,
 };
 use anyhow::{Context, Result, bail};
 use eframe::{App, CreationContext, NativeOptions, egui};
@@ -15,7 +17,7 @@ use windows::{
 
 const SETTINGS_TITLE: &str = "OpenCapt 设置";
 const SETTINGS_MIN_SIZE: [f32; 2] = [780.0, 560.0];
-const SETTINGS_SIZE: [f32; 2] = [860.0, 620.0];
+const SETTINGS_SIZE: [f32; 2] = [920.0, 660.0];
 
 pub fn open_or_focus() -> Result<()> {
     if focus_existing_settings_window() {
@@ -72,16 +74,18 @@ enum SettingsPage {
     General,
     Annotation,
     Pin,
+    Ocr,
 }
 
 impl SettingsPage {
-    const ALL: [Self; 3] = [Self::General, Self::Annotation, Self::Pin];
+    const ALL: [Self; 4] = [Self::General, Self::Annotation, Self::Pin, Self::Ocr];
 
     fn title(self) -> &'static str {
         match self {
             Self::General => "通用",
             Self::Annotation => "标注",
             Self::Pin => "贴图",
+            Self::Ocr => "OCR",
         }
     }
 
@@ -90,6 +94,7 @@ impl SettingsPage {
             Self::General => "热键、目录和基础行为",
             Self::Annotation => "新截图进入标注时的默认值",
             Self::Pin => "贴图窗口的默认行为",
+            Self::Ocr => "OCR 模型与接口配置",
         }
     }
 }
@@ -107,6 +112,7 @@ struct SettingsApp {
     current_page: SettingsPage,
     hotkey_input: String,
     save_dir_input: String,
+    selected_ocr_profile: Option<usize>,
     status: Option<UiStatus>,
 }
 
@@ -117,6 +123,11 @@ impl SettingsApp {
 
         let hotkey_input = config.general.hotkey.clone();
         let save_dir_input = config.general.save_dir.display().to_string();
+        let selected_ocr_profile = if config.ocr.profiles.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         Self {
             original: config.clone(),
             draft: config,
@@ -124,6 +135,7 @@ impl SettingsApp {
             current_page: SettingsPage::General,
             hotkey_input,
             save_dir_input,
+            selected_ocr_profile,
             status: None,
         }
     }
@@ -131,6 +143,33 @@ impl SettingsApp {
     fn sync_text_inputs_from_draft(&mut self) {
         self.hotkey_input = self.draft.general.hotkey.clone();
         self.save_dir_input = self.draft.general.save_dir.display().to_string();
+        self.fix_ocr_selection();
+    }
+
+    fn fix_ocr_selection(&mut self) {
+        self.selected_ocr_profile = match self.selected_ocr_profile {
+            Some(index) if index < self.draft.ocr.profiles.len() => Some(index),
+            _ if self.draft.ocr.profiles.is_empty() => None,
+            _ => Some(0),
+        };
+    }
+
+    fn next_ocr_profile_id(&self) -> String {
+        let used: std::collections::HashSet<&str> = self
+            .draft
+            .ocr
+            .profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect();
+        let mut index = 1usize;
+        loop {
+            let candidate = format!("profile_{}", index);
+            if !used.contains(candidate.as_str()) {
+                return candidate;
+            }
+            index += 1;
+        }
     }
 
     fn reset_current_page(&mut self) {
@@ -141,6 +180,7 @@ impl SettingsApp {
                 self.draft.annotation_defaults = defaults.annotation_defaults
             }
             SettingsPage::Pin => self.draft.pin_defaults = defaults.pin_defaults,
+            SettingsPage::Ocr => self.draft.ocr = defaults.ocr,
         }
         self.sync_text_inputs_from_draft();
         self.status = None;
@@ -215,7 +255,7 @@ impl SettingsApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("截图、标注与贴图的默认行为")
+                    egui::RichText::new("截图、标注、贴图与 OCR 默认行为")
                         .size(13.0)
                         .color(egui::Color32::from_rgb(106, 114, 128)),
                 );
@@ -330,6 +370,7 @@ impl SettingsApp {
                         SettingsPage::General => self.page_general(ui),
                         SettingsPage::Annotation => self.page_annotation(ui),
                         SettingsPage::Pin => self.page_pin(ui),
+                        SettingsPage::Ocr => self.page_ocr(ui),
                     }
                 });
         });
@@ -472,6 +513,176 @@ impl SettingsApp {
                         );
                     }
                 });
+        });
+    }
+
+    fn page_ocr(&mut self, ui: &mut egui::Ui) {
+        section_card(ui, "OCR 总开关与请求超时", |ui| {
+            ui.checkbox(&mut self.draft.ocr.enabled, "启用 OCR");
+            ui.add_sized(
+                [420.0, 0.0],
+                egui::Slider::new(
+                    &mut self.draft.ocr.request_timeout_ms,
+                    OCR_TIMEOUT_MIN_MS..=OCR_TIMEOUT_MAX_MS,
+                )
+                .text("请求超时(ms)"),
+            );
+
+            let selected = self
+                .draft
+                .ocr
+                .profiles
+                .iter()
+                .find(|profile| profile.id == self.draft.ocr.default_profile_id)
+                .map(|profile| profile.display_name.as_str())
+                .unwrap_or("未选择");
+
+            egui::ComboBox::from_label("默认模型")
+                .selected_text(selected)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for profile in &self.draft.ocr.profiles {
+                        ui.selectable_value(
+                            &mut self.draft.ocr.default_profile_id,
+                            profile.id.clone(),
+                            &profile.display_name,
+                        );
+                    }
+                });
+        });
+
+        section_card(ui, "模型配置", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("新增模型").clicked() {
+                    let index = self.draft.ocr.profiles.len() + 1;
+                    let id = self.next_ocr_profile_id();
+                    self.draft.ocr.profiles.push(OcrProfile {
+                        id: id.clone(),
+                        display_name: format!("模型{}", index),
+                        provider_kind: OcrProviderKind::OpenAiCompatible,
+                        base_url: "https://api.openai.com/v1".to_string(),
+                        api_key: String::new(),
+                        model: "gpt-4.1-mini".to_string(),
+                        bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
+                    });
+                    self.selected_ocr_profile = Some(self.draft.ocr.profiles.len() - 1);
+                    if self.draft.ocr.default_profile_id.is_empty() {
+                        self.draft.ocr.default_profile_id = id;
+                    }
+                }
+
+                if ui
+                    .add_enabled(
+                        self.selected_ocr_profile.is_some(),
+                        egui::Button::new("删除当前模型"),
+                    )
+                    .clicked()
+                {
+                    if let Some(index) = self.selected_ocr_profile {
+                        if index < self.draft.ocr.profiles.len() {
+                            let removed = self.draft.ocr.profiles.remove(index);
+                            if self.draft.ocr.default_profile_id == removed.id {
+                                self.draft.ocr.default_profile_id = self
+                                    .draft
+                                    .ocr
+                                    .profiles
+                                    .first()
+                                    .map(|profile| profile.id.clone())
+                                    .unwrap_or_default();
+                            }
+                            self.fix_ocr_selection();
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.columns(2, |columns| {
+                columns[0].set_min_width(240.0);
+                columns[0].vertical(|ui| {
+                    ui.label(egui::RichText::new("模型列表").strong());
+                    ui.add_space(6.0);
+                    for (index, profile) in self.draft.ocr.profiles.iter().enumerate() {
+                        let selected = self.selected_ocr_profile == Some(index);
+                        if ui
+                            .selectable_label(selected, profile.display_name.as_str())
+                            .clicked()
+                        {
+                            self.selected_ocr_profile = Some(index);
+                        }
+                    }
+                    if self.draft.ocr.profiles.is_empty() {
+                        ui.label(label_text("暂无模型，请先新增"));
+                    }
+                });
+
+                columns[1].vertical(|ui| {
+                    if let Some(index) = self.selected_ocr_profile {
+                        if let Some(profile) = self.draft.ocr.profiles.get_mut(index) {
+                            ui.label(egui::RichText::new("模型详情").strong());
+                            ui.add_space(8.0);
+
+                            ui.label(label_text("显示名称"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.display_name)
+                                    .desired_width(280.0),
+                            );
+
+                            ui.label(label_text("Base URL"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.base_url)
+                                    .desired_width(360.0),
+                            );
+
+                            ui.label(label_text("API Key"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.api_key)
+                                    .desired_width(360.0)
+                                    .password(true),
+                            );
+
+                            ui.label(label_text("模型名称"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.model).desired_width(280.0),
+                            );
+
+                            egui::ComboBox::from_label("坐标范围")
+                                .selected_text(profile.bbox_scale_mode.label())
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    for mode in OcrBboxScaleMode::ALL {
+                                        ui.selectable_value(
+                                            &mut profile.bbox_scale_mode,
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+                            if ui.button("连接测试").clicked() {
+                                match ocr::test_profile(profile, self.draft.ocr.request_timeout_ms)
+                                {
+                                    Ok(()) => {
+                                        self.status = Some(UiStatus {
+                                            is_error: false,
+                                            text: "OCR 模型连接成功".to_string(),
+                                        });
+                                    }
+                                    Err(error) => {
+                                        self.status = Some(UiStatus {
+                                            is_error: true,
+                                            text: format!("连接测试失败: {}", error),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ui.label(label_text("请先在左侧选择一个模型"));
+                    }
+                });
+            });
         });
     }
 }

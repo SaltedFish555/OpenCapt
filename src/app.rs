@@ -333,7 +333,13 @@ impl App {
             return;
         };
 
-        match overlay.show(target, cursor_x, cursor_y, &self.config.annotation_defaults) {
+        match overlay.show(
+            target,
+            cursor_x,
+            cursor_y,
+            &self.config.annotation_defaults,
+            &self.config.ocr,
+        ) {
             Ok(()) => {
                 self.state = AppState::Selecting;
                 info!(startup = ?self.startup_mode, "overlay opened");

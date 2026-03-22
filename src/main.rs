@@ -3,6 +3,7 @@ mod capture;
 mod config;
 mod hotkey;
 mod logging;
+mod ocr;
 mod output;
 mod overlay;
 mod pin;

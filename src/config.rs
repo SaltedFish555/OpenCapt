@@ -20,6 +20,9 @@ pub const MIN_MOSAIC_SIZE: u32 = 6;
 pub const MAX_MOSAIC_SIZE: u32 = 30;
 pub const DEFAULT_MOSAIC_SIZE: u32 = 12;
 pub const PIN_OPACITY_OPTIONS: [u8; 4] = [100, 80, 60, 40];
+pub const OCR_TIMEOUT_MIN_MS: u64 = 2_000;
+pub const OCR_TIMEOUT_MAX_MS: u64 = 120_000;
+pub const OCR_TIMEOUT_DEFAULT_MS: u64 = 20_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TextFontFamily {
@@ -40,6 +43,44 @@ impl TextFontFamily {
             Self::YaHei => "微软雅黑",
             Self::DengXian => "等线",
             Self::KaiTi => "楷体",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum OcrProviderKind {
+    #[default]
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum OcrBboxScaleMode {
+    #[default]
+    #[serde(rename = "0_1")]
+    ZeroToOne,
+    #[serde(rename = "0_999")]
+    ZeroTo999,
+    #[serde(rename = "0_1000")]
+    ZeroTo1000,
+    #[serde(rename = "pixel")]
+    PixelAbsolute,
+}
+
+impl OcrBboxScaleMode {
+    pub const ALL: [Self; 4] = [
+        Self::ZeroToOne,
+        Self::ZeroTo999,
+        Self::ZeroTo1000,
+        Self::PixelAbsolute,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ZeroToOne => "0~1",
+            Self::ZeroTo999 => "0~999",
+            Self::ZeroTo1000 => "0~1000",
+            Self::PixelAbsolute => "像素坐标",
         }
     }
 }
@@ -75,11 +116,32 @@ pub struct PinDefaults {
     pub opacity_percent: u8,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OcrProfile {
+    pub id: String,
+    pub display_name: String,
+    pub provider_kind: OcrProviderKind,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub bbox_scale_mode: OcrBboxScaleMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OcrConfig {
+    pub enabled: bool,
+    pub default_profile_id: String,
+    pub request_timeout_ms: u64,
+    pub profiles: Vec<OcrProfile>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub general: GeneralConfig,
     pub annotation_defaults: AnnotationDefaults,
     pub pin_defaults: PinDefaults,
+    pub ocr: OcrConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -127,12 +189,24 @@ impl Default for PinDefaults {
     }
 }
 
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_profile_id: String::new(),
+            request_timeout_ms: OCR_TIMEOUT_DEFAULT_MS,
+            profiles: Vec::new(),
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             general: GeneralConfig::default(),
             annotation_defaults: AnnotationDefaults::default(),
             pin_defaults: PinDefaults::default(),
+            ocr: OcrConfig::default(),
         }
     }
 }
@@ -150,6 +224,57 @@ impl AppConfig {
                 self.pin_defaults.opacity_percent
             );
         }
+        if !(OCR_TIMEOUT_MIN_MS..=OCR_TIMEOUT_MAX_MS).contains(&self.ocr.request_timeout_ms) {
+            bail!(
+                "ocr timeout must be between {} and {} ms",
+                OCR_TIMEOUT_MIN_MS,
+                OCR_TIMEOUT_MAX_MS
+            );
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for profile in &self.ocr.profiles {
+            if profile.id.trim().is_empty() {
+                bail!("ocr profile id may not be empty");
+            }
+            if !ids.insert(profile.id.trim().to_string()) {
+                bail!("duplicate ocr profile id: {}", profile.id);
+            }
+            if profile.display_name.trim().is_empty() {
+                bail!("ocr profile display_name may not be empty");
+            }
+            if profile.base_url.trim().is_empty() {
+                bail!("ocr profile base_url may not be empty");
+            }
+            if profile.api_key.trim().is_empty() {
+                bail!("ocr profile api_key may not be empty");
+            }
+            if profile.model.trim().is_empty() {
+                bail!("ocr profile model may not be empty");
+            }
+        }
+
+        if self.ocr.enabled && self.ocr.profiles.is_empty() {
+            bail!("ocr enabled but no profile configured");
+        }
+
+        if !self.ocr.profiles.is_empty() {
+            if self.ocr.default_profile_id.trim().is_empty() {
+                bail!("ocr default profile may not be empty when profiles are configured");
+            }
+            if !self
+                .ocr
+                .profiles
+                .iter()
+                .any(|profile| profile.id == self.ocr.default_profile_id)
+            {
+                bail!(
+                    "ocr default profile not found: {}",
+                    self.ocr.default_profile_id
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -177,7 +302,49 @@ impl AppConfig {
         if !PIN_OPACITY_OPTIONS.contains(&self.pin_defaults.opacity_percent) {
             self.pin_defaults.opacity_percent = PinDefaults::default().opacity_percent;
         }
+        self.ocr.request_timeout_ms = self
+            .ocr
+            .request_timeout_ms
+            .clamp(OCR_TIMEOUT_MIN_MS, OCR_TIMEOUT_MAX_MS);
+        normalize_ocr_profile_ids(&mut self.ocr.profiles);
+
+        if self.ocr.profiles.is_empty() {
+            self.ocr.enabled = false;
+            self.ocr.default_profile_id.clear();
+        } else if !self
+            .ocr
+            .profiles
+            .iter()
+            .any(|profile| profile.id == self.ocr.default_profile_id)
+        {
+            self.ocr.default_profile_id = self.ocr.profiles[0].id.clone();
+        }
+
         self
+    }
+}
+
+fn normalize_ocr_profile_ids(profiles: &mut [OcrProfile]) {
+    let mut used = std::collections::HashSet::new();
+    let mut next_index = 1usize;
+
+    for profile in profiles {
+        let trimmed = profile.id.trim();
+        if !trimmed.is_empty() && used.insert(trimmed.to_string()) {
+            if trimmed != profile.id {
+                profile.id = trimmed.to_string();
+            }
+            continue;
+        }
+
+        loop {
+            let candidate = format!("profile_{}", next_index);
+            next_index += 1;
+            if used.insert(candidate.clone()) {
+                profile.id = candidate;
+                break;
+            }
+        }
     }
 }
 
@@ -197,6 +364,7 @@ struct AppConfigCompat {
     general: Option<GeneralConfigCompat>,
     annotation_defaults: Option<AnnotationDefaultsCompat>,
     pin_defaults: Option<PinDefaultsCompat>,
+    ocr: Option<OcrConfigCompat>,
     hotkey: Option<String>,
     auto_copy: Option<bool>,
     auto_save: Option<bool>,
@@ -234,6 +402,15 @@ struct PinDefaultsCompat {
     opacity_percent: Option<u8>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OcrConfigCompat {
+    enabled: Option<bool>,
+    default_profile_id: Option<String>,
+    request_timeout_ms: Option<u64>,
+    profiles: Option<Vec<OcrProfile>>,
+}
+
 impl AppConfigCompat {
     fn into_config(self) -> AppConfig {
         let mut config = AppConfig::default();
@@ -246,6 +423,9 @@ impl AppConfigCompat {
         }
         if let Some(pin) = self.pin_defaults {
             apply_pin(&mut config.pin_defaults, pin);
+        }
+        if let Some(ocr) = self.ocr {
+            apply_ocr(&mut config.ocr, ocr);
         }
 
         if let Some(hotkey) = self.hotkey {
@@ -319,6 +499,21 @@ fn apply_pin(target: &mut PinDefaults, value: PinDefaultsCompat) {
     }
     if let Some(opacity_percent) = value.opacity_percent {
         target.opacity_percent = opacity_percent;
+    }
+}
+
+fn apply_ocr(target: &mut OcrConfig, value: OcrConfigCompat) {
+    if let Some(enabled) = value.enabled {
+        target.enabled = enabled;
+    }
+    if let Some(default_profile_id) = value.default_profile_id {
+        target.default_profile_id = default_profile_id;
+    }
+    if let Some(request_timeout_ms) = value.request_timeout_ms {
+        target.request_timeout_ms = request_timeout_ms;
+    }
+    if let Some(profiles) = value.profiles {
+        target.profiles = profiles;
     }
 }
 
@@ -411,11 +606,25 @@ mod tests {
         assert!(config.general.save_dir.ends_with("OpenCapt"));
         assert_eq!(config.annotation_defaults.default_color_index, 4);
         assert_eq!(config.pin_defaults.opacity_percent, 100);
+        assert!(!config.ocr.enabled);
+        assert_eq!(config.ocr.request_timeout_ms, OCR_TIMEOUT_DEFAULT_MS);
     }
 
     #[test]
     fn write_config_round_trips() {
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        config.ocr.profiles.push(OcrProfile {
+            id: "default".to_string(),
+            display_name: "默认模型".to_string(),
+            provider_kind: OcrProviderKind::OpenAiCompatible,
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            model: "gpt-4.1-mini".to_string(),
+            bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
+        });
+        config.ocr.enabled = true;
+        config.ocr.default_profile_id = "default".to_string();
+
         let serialized = toml::to_string_pretty(&config).expect("serialize config");
         let parsed: AppConfig = toml::from_str(&serialized).expect("parse config");
         assert_eq!(config, parsed);
@@ -466,6 +675,81 @@ hotkey = "Alt+Shift+S"
         let mut config = AppConfig::default();
         config.general.hotkey = "Ctrl+A+B".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn missing_bbox_scale_mode_is_rejected() {
+        let parsed = toml::from_str::<AppConfig>(
+            r#"
+[ocr]
+enabled = true
+default_profile_id = "demo"
+request_timeout_ms = 20000
+
+[[ocr.profiles]]
+id = "demo"
+display_name = "Demo"
+provider_kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "abc"
+model = "gpt-4.1-mini"
+"#,
+        );
+        assert!(parsed.is_err());
+    }
+    #[test]
+    fn sanitize_ocr_profile_ids_when_missing_or_duplicated() {
+        let mut config = AppConfig::default();
+        config.ocr.profiles = vec![
+            OcrProfile {
+                id: String::new(),
+                display_name: "A".to_string(),
+                provider_kind: OcrProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "a".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
+            },
+            OcrProfile {
+                id: "profile_1".to_string(),
+                display_name: "B".to_string(),
+                provider_kind: OcrProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "b".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
+            },
+            OcrProfile {
+                id: "profile_1".to_string(),
+                display_name: "C".to_string(),
+                provider_kind: OcrProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "c".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
+            },
+        ];
+        config.ocr.default_profile_id = "missing".to_string();
+
+        let sanitized = config.sanitize();
+        let ids: std::collections::HashSet<_> = sanitized
+            .ocr
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect();
+        assert_eq!(ids.len(), sanitized.ocr.profiles.len());
+        assert!(
+            sanitized
+                .ocr
+                .profiles
+                .iter()
+                .all(|profile| !profile.id.trim().is_empty())
+        );
+        assert_eq!(
+            sanitized.ocr.default_profile_id,
+            sanitized.ocr.profiles[0].id
+        );
     }
 
     #[test]

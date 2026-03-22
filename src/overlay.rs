@@ -1,14 +1,17 @@
 use crate::{
     capture::CaptureTarget,
-    config::{AnnotationDefaults, TextFontFamily},
+    config::{AnnotationDefaults, OcrConfig, OcrProfile, TextFontFamily},
+    ocr,
 };
 use anyhow::{Result, anyhow};
-use image::{RgbaImage, imageops};
+use arboard::Clipboard;
+use image::{DynamicImage, ImageFormat, RgbaImage, imageops};
 use std::{
     ffi::c_void,
+    io::Cursor,
     mem::size_of,
     ptr::null_mut,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tracing::{info, warn};
 use windows::{
@@ -32,12 +35,12 @@ use windows::{
                 CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
                 DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_CROSS,
                 IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
-                IDC_SIZEWE, LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW, SetCursor,
+                IDC_SIZEWE, LoadCursorW, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetCursor,
                 SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow,
                 ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_LONG_PTR_INDEX,
-                WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR, WNDCLASSW,
-                WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WM_APP, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR,
+                WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -92,6 +95,9 @@ const TEXT_BOX_PADDING_Y: i32 = 6;
 const TEXT_BOX_MIN_WIDTH: i32 = 96;
 const TEXT_BOX_MIN_HEIGHT: i32 = 40;
 const TEXT_LAYOUT_BOTTOM_PADDING: i32 = 4;
+const WM_APP_OCR_READY: u32 = WM_APP + 1;
+const OCR_BLOCK_BORDER: u32 = 0x36A3FF;
+const OCR_BLOCK_ACTIVE: u32 = 0xF6B10A;
 
 type OverlayEmitter = Arc<dyn Fn(OverlaySignal) + Send + Sync + 'static>;
 
@@ -295,6 +301,10 @@ enum ToolbarAction {
     MosaicTool,
     TextTool,
     NumberTool,
+    OcrRun,
+    OcrProfileDropdown,
+    OcrProfileOption(usize),
+    OcrCopyAll,
     TextBoldToggle,
     TextItalicToggle,
     TextFontDropdown,
@@ -391,6 +401,15 @@ struct OverlayState {
     text_background: bool,
     text_font_family: TextFontFamily,
     open_text_dropdown: Option<TextDropdownKind>,
+    open_ocr_profile_dropdown: bool,
+    ocr_config: OcrConfig,
+    ocr_profile_index: usize,
+    ocr_blocks: Vec<OcrOverlayBlock>,
+    ocr_full_text: String,
+    ocr_selected_block: Option<usize>,
+    ocr_running: bool,
+    ocr_status: Option<String>,
+    ocr_worker: Arc<Mutex<Option<OcrWorkerResult>>>,
     shapes: Vec<AnnotationShape>,
     draft: Option<DraftShape>,
     text_input: Option<TextDraft>,
@@ -398,6 +417,20 @@ struct OverlayState {
     active_drag: Option<ActiveDrag>,
     last_cursor: CursorPoint,
     next_number: u32,
+}
+
+#[derive(Debug, Clone)]
+struct OcrOverlayBlock {
+    text: String,
+    rect: NormalizedRect,
+}
+
+enum OcrWorkerResult {
+    Success {
+        output: ocr::OcrResult,
+        selection: NormalizedRect,
+    },
+    Failure(String),
 }
 
 struct LayeredSurface {
@@ -445,6 +478,15 @@ impl OverlaySession {
             text_background: false,
             text_font_family: TextFontFamily::YaHei,
             open_text_dropdown: None,
+            open_ocr_profile_dropdown: false,
+            ocr_config: OcrConfig::default(),
+            ocr_profile_index: 0,
+            ocr_blocks: Vec::new(),
+            ocr_full_text: String::new(),
+            ocr_selected_block: None,
+            ocr_running: false,
+            ocr_status: None,
+            ocr_worker: Arc::new(Mutex::new(None)),
             shapes: Vec::new(),
             draft: None,
             text_input: None,
@@ -484,6 +526,7 @@ impl OverlaySession {
         cursor_x: i32,
         cursor_y: i32,
         defaults: &AnnotationDefaults,
+        ocr_config: &OcrConfig,
     ) -> Result<()> {
         let hwnd = self.hwnd;
         let state = self.state_mut();
@@ -500,6 +543,7 @@ impl OverlaySession {
             cursor_x - state.target.origin_x,
             cursor_y - state.target.origin_y,
             defaults,
+            ocr_config,
         );
 
         info!(
@@ -547,7 +591,13 @@ impl Drop for OverlaySession {
 }
 
 impl OverlayState {
-    fn reset_for_show(&mut self, cursor_x: i32, cursor_y: i32, defaults: &AnnotationDefaults) {
+    fn reset_for_show(
+        &mut self,
+        cursor_x: i32,
+        cursor_y: i32,
+        defaults: &AnnotationDefaults,
+        ocr_config: &OcrConfig,
+    ) {
         self.mode = OverlayMode::Selecting;
         self.selection = None;
         self.tool = AnnotationTool::Mouse;
@@ -565,6 +615,17 @@ impl OverlayState {
         self.text_background = defaults.text_background;
         self.text_font_family = defaults.text_font_family;
         self.open_text_dropdown = None;
+        self.open_ocr_profile_dropdown = false;
+        self.ocr_config = ocr_config.clone();
+        self.ocr_profile_index = self.default_ocr_profile_index();
+        self.ocr_blocks.clear();
+        self.ocr_full_text.clear();
+        self.ocr_selected_block = None;
+        self.ocr_running = false;
+        self.ocr_status = None;
+        if let Ok(mut worker) = self.ocr_worker.lock() {
+            *worker = None;
+        }
         self.shapes.clear();
         self.draft = None;
         self.text_input = None;
@@ -906,6 +967,84 @@ impl OverlayState {
         }
     }
 
+    fn default_ocr_profile_index(&self) -> usize {
+        if self.ocr_config.profiles.is_empty() {
+            return 0;
+        }
+        self.ocr_config
+            .profiles
+            .iter()
+            .position(|profile| profile.id == self.ocr_config.default_profile_id)
+            .unwrap_or(0)
+    }
+
+    fn current_ocr_profile(&self) -> Option<&OcrProfile> {
+        self.ocr_config.profiles.get(self.ocr_profile_index)
+    }
+
+    fn ocr_profile_name(&self) -> String {
+        self.current_ocr_profile()
+            .map(|profile| profile.display_name.clone())
+            .unwrap_or_else(|| "未配置".to_string())
+    }
+
+    fn ocr_block_at(&self, point: CursorPoint) -> Option<usize> {
+        self.ocr_blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, block)| block.rect.contains(point))
+            .map(|(index, _)| index)
+    }
+
+    fn consume_ocr_worker_result(&mut self) {
+        let result = {
+            let Ok(mut worker) = self.ocr_worker.lock() else {
+                return;
+            };
+            worker.take()
+        };
+        let Some(result) = result else {
+            return;
+        };
+
+        self.ocr_running = false;
+        match result {
+            OcrWorkerResult::Success { output, selection } => {
+                self.ocr_full_text = output.full_text;
+                self.ocr_blocks.clear();
+                let width = selection.width().max(1) as f32;
+                let height = selection.height().max(1) as f32;
+                for block in output.blocks {
+                    let left = selection.left + (block.bbox_norm[0] * width).round() as i32;
+                    let top = selection.top + (block.bbox_norm[1] * height).round() as i32;
+                    let right = selection.left + (block.bbox_norm[2] * width).round() as i32;
+                    let bottom = selection.top + (block.bbox_norm[3] * height).round() as i32;
+                    if let Some(rect) = NormalizedRect::from_points(
+                        CursorPoint { x: left, y: top },
+                        CursorPoint {
+                            x: right,
+                            y: bottom,
+                        },
+                    ) {
+                        self.ocr_blocks.push(OcrOverlayBlock {
+                            text: block.text,
+                            rect,
+                        });
+                    }
+                }
+                self.ocr_selected_block = None;
+                self.ocr_status =
+                    Some(format!("OCR 完成：识别 {} 个文本块", self.ocr_blocks.len()));
+            }
+            OcrWorkerResult::Failure(error) => {
+                self.ocr_status = Some(format!("OCR 失败：{}", error));
+                self.ocr_blocks.clear();
+                self.ocr_selected_block = None;
+                self.ocr_full_text.clear();
+            }
+        }
+    }
     fn bounds(&self) -> NormalizedRect {
         NormalizedRect {
             left: 0,
@@ -1047,6 +1186,9 @@ impl OverlayState {
             (ToolbarAction::Color(2), TOOLBAR_COLOR),
             (ToolbarAction::Color(3), TOOLBAR_COLOR),
             (ToolbarAction::Color(4), TOOLBAR_COLOR),
+            (ToolbarAction::OcrRun, TOOLBAR_BUTTON),
+            (ToolbarAction::OcrProfileDropdown, 156),
+            (ToolbarAction::OcrCopyAll, 96),
         ];
         if !text_toolbar_visible {
             primary_defs.push((ToolbarAction::StyleControl, TOOLBAR_STYLE_WIDTH));
@@ -1190,8 +1332,63 @@ impl OverlayState {
         })
     }
 
+    fn ocr_profile_dropdown_layout(&self) -> Option<ToolbarLayout> {
+        if !self.open_ocr_profile_dropdown {
+            return None;
+        }
+        let anchor = self.toolbar_item_rect(ToolbarAction::OcrProfileDropdown)?;
+        if self.ocr_config.profiles.is_empty() {
+            return None;
+        }
+        let panel_width = 196;
+        let panel_height = TOOLBAR_PADDING * 2
+            + self.ocr_config.profiles.len() as i32 * TOOLBAR_BUTTON
+            + (self.ocr_config.profiles.len().saturating_sub(1) as i32) * TOOLBAR_ITEM_GAP;
+        let max_left = (self.target.width as i32 - panel_width - WINDOW_MARGIN).max(WINDOW_MARGIN);
+        let left = anchor.left.clamp(WINDOW_MARGIN, max_left);
+        let below_top = anchor.bottom + 4;
+        let top = if below_top + panel_height <= self.target.height as i32 - WINDOW_MARGIN {
+            below_top
+        } else {
+            (anchor.top - panel_height - 4).max(WINDOW_MARGIN)
+        };
+        let panel = IntRect {
+            left,
+            top,
+            right: left + panel_width,
+            bottom: top + panel_height,
+        };
+        let mut items = Vec::with_capacity(self.ocr_config.profiles.len());
+        let mut y = panel.top + TOOLBAR_PADDING;
+        for (index, _) in self.ocr_config.profiles.iter().enumerate() {
+            let rect = IntRect {
+                left: panel.left + TOOLBAR_PADDING,
+                top: y,
+                right: panel.right - TOOLBAR_PADDING,
+                bottom: y + TOOLBAR_BUTTON,
+            };
+            items.push(ToolbarItem {
+                rect,
+                action: ToolbarAction::OcrProfileOption(index),
+            });
+            y += TOOLBAR_BUTTON + TOOLBAR_ITEM_GAP;
+        }
+        Some(ToolbarLayout {
+            panels: vec![panel],
+            items,
+        })
+    }
     fn toolbar_action_at(&self, point: CursorPoint) -> Option<ToolbarAction> {
         if let Some(layout) = self.text_dropdown_layout() {
+            if let Some(item) = layout
+                .items
+                .into_iter()
+                .find(|item| item.rect.contains(point))
+            {
+                return Some(item.action);
+            }
+        }
+        if let Some(layout) = self.ocr_profile_dropdown_layout() {
             if let Some(item) = layout
                 .items
                 .into_iter()
@@ -1207,12 +1404,16 @@ impl OverlayState {
             .find(|item| item.rect.contains(point))
             .map(|item| item.action)
     }
-
     fn current_cursor(&self) -> CursorKind {
         if self.mode == OverlayMode::Selecting {
             return CursorKind::Crosshair;
         }
         if self.toolbar_action_at(self.last_cursor).is_some() {
+            return CursorKind::Hand;
+        }
+        if matches!(self.tool, AnnotationTool::Mouse | AnnotationTool::Select)
+            && self.ocr_block_at(self.last_cursor).is_some()
+        {
             return CursorKind::Hand;
         }
         if self.text_input.is_some() {
@@ -2016,6 +2217,14 @@ unsafe extern "system" fn overlay_wndproc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_APP_OCR_READY => {
+            if let Some(state) = overlay_state(hwnd) {
+                state.consume_ocr_worker_result();
+                let _ = render_overlay(hwnd, state);
+                update_overlay_cursor(state);
+            }
+            LRESULT(0)
+        }
         WM_NCDESTROY => {
             let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -2044,14 +2253,27 @@ fn handle_mouse_move(state: &mut OverlayState, point: CursorPoint) {
         }) => {
             let dx = point.x - anchor.x;
             let dy = point.y - anchor.y;
-            state.selection = Some(original_rect.translated_clamped(dx, dy, state.bounds()));
+            let next = original_rect.translated_clamped(dx, dy, state.bounds());
+            if state.selection != Some(next) {
+                state.ocr_blocks.clear();
+                state.ocr_selected_block = None;
+                state.ocr_full_text.clear();
+                state.ocr_status = Some("选区已调整，请重新执行 OCR".to_string());
+            }
+            state.selection = Some(next);
         }
         Some(ActiveDrag::ResizeSelection {
             handle,
             original_rect,
         }) => {
-            state.selection =
-                Some(handle.resized_rect_with_bounds(*original_rect, point, state.bounds()));
+            let next = handle.resized_rect_with_bounds(*original_rect, point, state.bounds());
+            if state.selection != Some(next) {
+                state.ocr_blocks.clear();
+                state.ocr_selected_block = None;
+                state.ocr_full_text.clear();
+                state.ocr_status = Some("选区已调整，请重新执行 OCR".to_string());
+            }
+            state.selection = Some(next);
         }
         Some(ActiveDrag::MoveShape {
             shape_index,
@@ -2161,8 +2383,27 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
             if state.open_text_dropdown.is_some() {
                 state.open_text_dropdown = None;
             }
+            if state.open_ocr_profile_dropdown {
+                state.open_ocr_profile_dropdown = false;
+            }
             if state.text_input.is_some() {
                 commit_text_input(state);
+            }
+            if matches!(state.tool, AnnotationTool::Mouse | AnnotationTool::Select) {
+                if let Some(index) = state.ocr_block_at(point) {
+                    state.ocr_selected_block = Some(index);
+                    if let Some(block) = state.ocr_blocks.get(index) {
+                        if let Err(error) = copy_text_to_clipboard(&block.text) {
+                            state.ocr_status = Some(format!("复制 OCR 文本失败: {}", error));
+                        } else {
+                            state.ocr_status = Some("已复制 OCR 文本块".to_string());
+                        }
+                    }
+                    return false;
+                }
+                if !state.ocr_blocks.is_empty() {
+                    state.ocr_selected_block = None;
+                }
             }
             if state.tool == AnnotationTool::Mouse {
                 state.selected_shape = None;
@@ -2609,6 +2850,12 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
     ) {
         state.open_text_dropdown = None;
     }
+    if !matches!(
+        action,
+        ToolbarAction::OcrProfileDropdown | ToolbarAction::OcrProfileOption(_)
+    ) {
+        state.open_ocr_profile_dropdown = false;
+    }
     match action {
         ToolbarAction::MouseTool => {
             commit_text_input(state);
@@ -2682,6 +2929,29 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
                 draft.style.color = COLOR_PRESETS[state.color_index];
             }
         }
+        ToolbarAction::OcrRun => {
+            start_ocr_request(hwnd, state);
+        }
+        ToolbarAction::OcrProfileDropdown => {
+            state.open_ocr_profile_dropdown = !state.open_ocr_profile_dropdown;
+        }
+        ToolbarAction::OcrProfileOption(index) => {
+            if index < state.ocr_config.profiles.len() {
+                state.ocr_profile_index = index;
+            }
+            state.open_ocr_profile_dropdown = false;
+        }
+        ToolbarAction::OcrCopyAll => {
+            if !state.ocr_full_text.trim().is_empty() {
+                if let Err(error) = copy_text_to_clipboard(&state.ocr_full_text) {
+                    state.ocr_status = Some(format!("复制 OCR 结果失败: {}", error));
+                } else {
+                    state.ocr_status = Some("已复制全部 OCR 文本".to_string());
+                }
+            } else {
+                state.ocr_status = Some("暂无 OCR 文本可复制".to_string());
+            }
+        }
         ToolbarAction::StyleControl => {}
         ToolbarAction::Undo => {
             let restored = if state.text_input.is_some() {
@@ -2720,6 +2990,92 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
     false
 }
 
+fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().map_err(|error| anyhow!(error.to_string()))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| anyhow!(error.to_string()))
+}
+
+fn start_ocr_request(hwnd: HWND, state: &mut OverlayState) {
+    if state.ocr_running {
+        return;
+    }
+    if !state.ocr_config.enabled {
+        state.ocr_status = Some("OCR 已关闭，请在设置中启用".to_string());
+        return;
+    }
+
+    let Some(selection) = state.selection else {
+        state.ocr_status = Some("当前没有可用选区".to_string());
+        return;
+    };
+    let Some(profile) = state.current_ocr_profile().cloned() else {
+        state.ocr_status = Some("未配置 OCR 模型".to_string());
+        return;
+    };
+
+    let selection_width = selection.width().max(1) as u32;
+    let selection_height = selection.height().max(1) as u32;
+    let source = framebuffer_to_image(
+        state.target.base_frame.clone(),
+        state.target.width,
+        state.target.height,
+    );
+    let crop = imageops::crop_imm(
+        &source,
+        selection.left.max(0) as u32,
+        selection.top.max(0) as u32,
+        selection_width,
+        selection_height,
+    )
+    .to_image();
+
+    let mut buffer = Cursor::new(Vec::<u8>::new());
+    if DynamicImage::ImageRgba8(crop)
+        .write_to(&mut buffer, ImageFormat::Png)
+        .is_err()
+    {
+        state.ocr_status = Some("OCR 输入图片编码失败".to_string());
+        return;
+    }
+
+    state.ocr_running = true;
+    state.ocr_status = Some("OCR 识别中...".to_string());
+    state.ocr_selected_block = None;
+    if let Ok(mut worker) = state.ocr_worker.lock() {
+        *worker = None;
+    }
+
+    let timeout_ms = state.ocr_config.request_timeout_ms;
+    let image_png = buffer.into_inner();
+    let image_width = selection_width;
+    let image_height = selection_height;
+    let worker_slot = Arc::clone(&state.ocr_worker);
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let request = ocr::OcrRecognizeRequest {
+            image_png,
+            timeout_ms,
+            language_hint: None,
+        };
+        let result = ocr::recognize_with_profile(&profile, &request, image_width, image_height)
+            .map(|output| OcrWorkerResult::Success { output, selection })
+            .unwrap_or_else(|error| OcrWorkerResult::Failure(error.to_string()));
+
+        if let Ok(mut slot) = worker_slot.lock() {
+            *slot = Some(result);
+        }
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd_raw as *mut c_void)),
+                WM_APP_OCR_READY,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    });
+}
 fn finish_with_signal(hwnd: HWND, state: &mut OverlayState, signal: OverlaySignal) {
     state.active_drag = None;
     state.draft = None;
@@ -2805,6 +3161,7 @@ fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
         }
         paint_dynamic_shapes(state);
         paint_selection(state);
+        paint_ocr_blocks(state);
         paint_toolbar(state);
     } else {
         state.frame.copy_from_slice(&state.dimmed_frame);
@@ -2940,6 +3297,78 @@ fn paint_selection(state: &mut OverlayState) {
     }
 }
 
+fn paint_ocr_blocks(state: &mut OverlayState) {
+    if state.ocr_blocks.is_empty() {
+        return;
+    }
+    let hovered_index = if matches!(state.tool, AnnotationTool::Mouse | AnnotationTool::Select)
+        && state.toolbar_action_at(state.last_cursor).is_none()
+    {
+        state.ocr_block_at(state.last_cursor)
+    } else {
+        None
+    };
+
+    for (index, block) in state.ocr_blocks.iter().enumerate() {
+        let active = state.ocr_selected_block == Some(index) || hovered_index == Some(index);
+        draw_rect_outline(
+            &mut state.frame,
+            block.rect,
+            state.target.width,
+            state.target.height,
+            if active { 2 } else { 1 },
+            if active {
+                OCR_BLOCK_ACTIVE
+            } else {
+                OCR_BLOCK_BORDER
+            },
+        );
+    }
+}
+
+fn paint_ocr_status(state: &mut OverlayState) {
+    let Some(status) = state.ocr_status.as_deref() else {
+        return;
+    };
+    if status.trim().is_empty() {
+        return;
+    }
+    let panel_width = (state.target.width as i32 - WINDOW_MARGIN * 2).clamp(160, 460);
+    let panel = IntRect {
+        left: WINDOW_MARGIN,
+        top: WINDOW_MARGIN,
+        right: WINDOW_MARGIN + panel_width,
+        bottom: WINDOW_MARGIN + 34,
+    };
+    fill_rounded_rect(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        panel,
+        8,
+        0x0F1725,
+    );
+    stroke_rounded_rect(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        panel,
+        8,
+        TOOLBAR_BORDER,
+    );
+    draw_gdi_text_centered(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        CursorPoint {
+            x: (panel.left + panel.right) / 2,
+            y: (panel.top + panel.bottom) / 2,
+        },
+        status,
+        15,
+        TOOLBAR_TEXT,
+    );
+}
 fn paint_toolbar(state: &mut OverlayState) {
     let Some(layout) = state.toolbar_layout() else {
         return;
@@ -2968,12 +3397,27 @@ fn paint_toolbar(state: &mut OverlayState) {
             paint_toolbar_item(state, item);
         }
     }
+    if let Some(layout) = state.ocr_profile_dropdown_layout() {
+        for panel in &layout.panels {
+            draw_panel(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                *panel,
+            );
+        }
+        for item in layout.items {
+            paint_toolbar_item(state, item);
+        }
+    }
+    paint_ocr_status(state);
 }
 
 fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
     let hovered = item.rect.contains(state.last_cursor);
     let current_text_font_family = state.current_text_font_family();
     let current_text_size = state.current_text_size();
+    let current_ocr_profile_name = state.ocr_profile_name();
     let selected = match item.action {
         ToolbarAction::MouseTool => state.tool == AnnotationTool::Mouse,
         ToolbarAction::SelectTool => state.tool == AnnotationTool::Select,
@@ -2997,6 +3441,10 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::TextSizeOption(size) => current_text_size == size,
         ToolbarAction::NumberTool => state.tool == AnnotationTool::Number,
         ToolbarAction::Color(index) => state.color_index == index,
+        ToolbarAction::OcrRun => state.ocr_running,
+        ToolbarAction::OcrProfileDropdown => state.open_ocr_profile_dropdown,
+        ToolbarAction::OcrProfileOption(index) => state.ocr_profile_index == index,
+        ToolbarAction::OcrCopyAll => false,
         ToolbarAction::StyleControl => false,
         ToolbarAction::Pin => false,
         _ => false,
@@ -3132,6 +3580,41 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             size,
             TOOLBAR_TEXT,
         ),
+        ToolbarAction::OcrRun => draw_ocr_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+            state.ocr_running,
+        ),
+        ToolbarAction::OcrProfileDropdown => draw_ocr_profile_dropdown_button(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            &current_ocr_profile_name,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::OcrProfileOption(index) => {
+            if let Some(profile) = state.ocr_config.profiles.get(index) {
+                draw_ocr_profile_option_label(
+                    &mut state.frame,
+                    state.target.width,
+                    state.target.height,
+                    item.rect,
+                    &profile.display_name,
+                    TOOLBAR_TEXT,
+                );
+            }
+        }
+        ToolbarAction::OcrCopyAll => draw_ocr_copy_all_label(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
         ToolbarAction::NumberTool => draw_number_glyph(
             &mut state.frame,
             state.target.width,
@@ -3178,7 +3661,6 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::StyleControl => draw_style_control(state, item.rect, hovered),
     }
 }
-
 #[cfg(test)]
 fn compose_preview_frame(
     source: &[u32],
@@ -3712,6 +4194,95 @@ fn draw_text_size_option_label(
     );
 }
 
+fn draw_ocr_glyph(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    color: u32,
+    running: bool,
+) {
+    let label = if running { "识别中" } else { "OCR" };
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        label,
+        if running { 13 } else { 15 },
+        color,
+    );
+}
+
+fn draw_ocr_profile_dropdown_button(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    name: &str,
+    color: u32,
+) {
+    let display = if name.chars().count() > 8 {
+        let mut short = name.chars().take(7).collect::<String>();
+        short.push('…');
+        short
+    } else {
+        name.to_string()
+    };
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: rect.left + (rect.width() - 16) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        &display,
+        14,
+        color,
+    );
+    draw_dropdown_chevron(frame, width, height, rect, color);
+}
+
+fn draw_ocr_profile_option_label(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    name: &str,
+    color: u32,
+) {
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        name,
+        14,
+        color,
+    );
+}
+
+fn draw_ocr_copy_all_label(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        "复制全文",
+        14,
+        color,
+    );
+}
 fn draw_number_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
     let start = map_icon_point(icon, 4.0, 4.0);
@@ -5479,7 +6050,8 @@ fn button_height(action: ToolbarAction) -> i32 {
         | ToolbarAction::TextFontDropdown
         | ToolbarAction::TextSizeDropdown
         | ToolbarAction::TextFontOption(_)
-        | ToolbarAction::TextSizeOption(_) => TOOLBAR_BUTTON + 4,
+        | ToolbarAction::TextSizeOption(_)
+        | ToolbarAction::OcrProfileOption(_) => TOOLBAR_BUTTON + 4,
         _ => TOOLBAR_BUTTON,
     }
 }
@@ -5494,6 +6066,7 @@ fn toolbar_gap_after(action: ToolbarAction, text_row: bool) -> i32 {
         match action {
             ToolbarAction::NumberTool
             | ToolbarAction::Color(4)
+            | ToolbarAction::OcrCopyAll
             | ToolbarAction::StyleControl
             | ToolbarAction::Undo => TOOLBAR_GROUP_GAP,
             _ => TOOLBAR_ITEM_GAP,
