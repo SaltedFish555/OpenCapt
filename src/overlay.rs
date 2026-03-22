@@ -23,7 +23,7 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::{
                 GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE,
-                VK_ESCAPE, VK_RETURN,
+                VK_ESCAPE, VK_RETURN, VK_SHIFT,
             },
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
@@ -44,13 +44,23 @@ use windows::{
 const PREVIEW_BRIGHTNESS_PERCENT: u32 = 60;
 const CLASS_NAME: windows::core::PCWSTR = w!("OpenCaptOverlayWindow");
 const COLOR_PRESETS: [u32; 5] = [0xF14C4C, 0xFF8C00, 0xF2C94C, 0x2ECC71, 0x4F8CFF];
-const STROKE_PRESETS: [u32; 3] = [2, 4, 6];
+const MIN_STROKE_WIDTH: u32 = 1;
+const MAX_STROKE_WIDTH: u32 = 16;
+const DEFAULT_STROKE_WIDTH: u32 = 2;
+const MIN_TEXT_SIZE: u32 = 14;
+const MAX_TEXT_SIZE: u32 = 54;
+const DEFAULT_TEXT_SIZE: u32 = 24;
+const MIN_MOSAIC_SIZE: u32 = 6;
+const MAX_MOSAIC_SIZE: u32 = 30;
+const DEFAULT_MOSAIC_SIZE: u32 = 12;
 const TOOLBAR_PADDING: i32 = 8;
 const TOOLBAR_GROUP_GAP: i32 = 8;
 const TOOLBAR_ITEM_GAP: i32 = 6;
 const TOOLBAR_BUTTON: i32 = 30;
 const TOOLBAR_COLOR: i32 = 22;
-const TOOLBAR_STROKE_WIDTH: i32 = 30;
+const TOOLBAR_STYLE_WIDTH: i32 = 118;
+const TOOLBAR_STYLE_TRACK_HEIGHT: i32 = 4;
+const TOOLBAR_STYLE_KNOB_RADIUS: i32 = 7;
 const TOOLBAR_HEIGHT: i32 = 44;
 const TOOLBAR_PANEL_RADIUS: i32 = 12;
 const TOOLBAR_BUTTON_RADIUS: i32 = 10;
@@ -65,6 +75,16 @@ const TOOLBAR_FILL: u32 = 0x1B2230;
 const TOOLBAR_BORDER: u32 = 0x3A455C;
 const TOOLBAR_ACTIVE: u32 = 0x3F78F2;
 const TOOLBAR_TEXT: u32 = 0xEEF3FF;
+const TEXT_EDIT_PADDING_X: i32 = 6;
+const TEXT_EDIT_PADDING_Y: i32 = 4;
+const TEXT_EDIT_RADIUS: i32 = 6;
+const TEXT_EDIT_FILL: u32 = 0xF7FAFF;
+const TEXT_EDIT_BORDER: u32 = 0xC7D5EA;
+const TEXT_BOX_PADDING_X: i32 = 8;
+const TEXT_BOX_PADDING_Y: i32 = 6;
+const TEXT_BOX_MIN_WIDTH: i32 = 96;
+const TEXT_BOX_MIN_HEIGHT: i32 = 40;
+const TEXT_LAYOUT_BOTTOM_PADDING: i32 = 4;
 
 type OverlayEmitter = Arc<dyn Fn(OverlaySignal) + Send + Sync + 'static>;
 
@@ -128,9 +148,25 @@ struct DraftShape {
     style: ShapeStyle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextMetrics {
+    max_width: i32,
+    total_height: i32,
+    line_height: i32,
+    line_gap: i32,
+    last_line_width: i32,
+    line_count: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrappedTextLayout {
+    lines: Vec<String>,
+    metrics: TextMetrics,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TextDraft {
-    anchor: CursorPoint,
+    box_rect: NormalizedRect,
     text: String,
     style: ShapeStyle,
     editing_shape: Option<(usize, AnnotationShape)>,
@@ -164,7 +200,7 @@ enum AnnotationShape {
         style: ShapeStyle,
     },
     Text {
-        anchor: CursorPoint,
+        box_rect: NormalizedRect,
         text: String,
         style: ShapeStyle,
     },
@@ -224,6 +260,7 @@ enum ActiveDrag {
         original_rect: NormalizedRect,
         style: ShapeStyle,
     },
+    AdjustStyleControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +274,7 @@ enum ToolbarAction {
     MosaicTool,
     TextTool,
     Color(usize),
-    Stroke(usize),
+    StyleControl,
     Undo,
     Pin,
     Confirm,
@@ -272,6 +309,13 @@ struct ToolbarItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StyleControlTarget {
+    Stroke,
+    Mosaic,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResizableShapeKind {
     Rectangle,
     Ellipse,
@@ -303,7 +347,9 @@ struct OverlayState {
     selection: Option<NormalizedRect>,
     tool: AnnotationTool,
     color_index: usize,
-    stroke_index: usize,
+    stroke_width: u32,
+    text_size: u32,
+    mosaic_size: u32,
     shapes: Vec<AnnotationShape>,
     draft: Option<DraftShape>,
     text_input: Option<TextDraft>,
@@ -348,7 +394,9 @@ impl OverlaySession {
             selection: None,
             tool: AnnotationTool::Mouse,
             color_index: 4,
-            stroke_index: 0,
+            stroke_width: DEFAULT_STROKE_WIDTH,
+            text_size: DEFAULT_TEXT_SIZE,
+            mosaic_size: DEFAULT_MOSAIC_SIZE,
             shapes: Vec::new(),
             draft: None,
             text_input: None,
@@ -448,7 +496,9 @@ impl OverlayState {
         self.selection = None;
         self.tool = AnnotationTool::Mouse;
         self.color_index = 4;
-        self.stroke_index = 0;
+        self.stroke_width = DEFAULT_STROKE_WIDTH;
+        self.text_size = DEFAULT_TEXT_SIZE;
+        self.mosaic_size = DEFAULT_MOSAIC_SIZE;
         self.shapes.clear();
         self.draft = None;
         self.text_input = None;
@@ -498,8 +548,141 @@ impl OverlayState {
     fn current_style(&self) -> ShapeStyle {
         ShapeStyle {
             color: COLOR_PRESETS[self.color_index],
-            stroke: STROKE_PRESETS[self.stroke_index],
+            stroke: self.current_style_value(),
         }
+    }
+
+    fn shape_style_target(shape: &AnnotationShape) -> StyleControlTarget {
+        match shape {
+            AnnotationShape::Mosaic { .. } => StyleControlTarget::Mosaic,
+            AnnotationShape::Text { .. } => StyleControlTarget::Text,
+            _ => StyleControlTarget::Stroke,
+        }
+    }
+
+    fn style_control_target(&self) -> StyleControlTarget {
+        if self.text_input.is_some() || self.tool == AnnotationTool::Text {
+            return StyleControlTarget::Text;
+        }
+        if self.tool == AnnotationTool::Mosaic {
+            return StyleControlTarget::Mosaic;
+        }
+        if self.tool == AnnotationTool::Select {
+            if let Some(index) = self.selected_shape {
+                if let Some(shape) = self.shapes.get(index) {
+                    return Self::shape_style_target(shape);
+                }
+            }
+        }
+        StyleControlTarget::Stroke
+    }
+
+    fn current_style_value(&self) -> u32 {
+        match self.style_control_target() {
+            StyleControlTarget::Stroke => self.stroke_width,
+            StyleControlTarget::Mosaic => self.mosaic_size,
+            StyleControlTarget::Text => self.text_size,
+        }
+    }
+
+    fn style_value_range(&self) -> (u32, u32) {
+        match self.style_control_target() {
+            StyleControlTarget::Stroke => (MIN_STROKE_WIDTH, MAX_STROKE_WIDTH),
+            StyleControlTarget::Mosaic => (MIN_MOSAIC_SIZE, MAX_MOSAIC_SIZE),
+            StyleControlTarget::Text => (MIN_TEXT_SIZE, MAX_TEXT_SIZE),
+        }
+    }
+
+    fn set_current_style_value(&mut self, value: u32) {
+        let target = self.style_control_target();
+        let (min_value, max_value) = self.style_value_range();
+        let value = value.clamp(min_value, max_value);
+        match target {
+            StyleControlTarget::Stroke => self.stroke_width = value,
+            StyleControlTarget::Mosaic => self.mosaic_size = value,
+            StyleControlTarget::Text => self.text_size = value,
+        }
+
+        if let Some(draft) = self.text_input.as_mut() {
+            if target == StyleControlTarget::Text {
+                draft.style.stroke = value;
+                if let Some(selection) = self.selection {
+                    draft.box_rect = clamp_text_box_to_bounds(
+                        draft.box_rect,
+                        &draft.text,
+                        draft.style,
+                        selection,
+                    );
+                }
+            }
+        }
+
+        if let Some(index) = self.selected_shape {
+            if let Some(shape) = self.shapes.get_mut(index) {
+                let shape_target = Self::shape_style_target(shape);
+                if shape_target == target {
+                    match shape {
+                        AnnotationShape::Rectangle { style, .. }
+                        | AnnotationShape::Ellipse { style, .. }
+                        | AnnotationShape::Line { style, .. }
+                        | AnnotationShape::Arrow { style, .. }
+                        | AnnotationShape::Mosaic { style, .. } => {
+                            style.stroke = value;
+                        }
+                        AnnotationShape::Text {
+                            box_rect,
+                            text,
+                            style,
+                        } => {
+                            style.stroke = value;
+                            if let Some(selection) = self.selection {
+                                *box_rect =
+                                    clamp_text_box_to_bounds(*box_rect, text, *style, selection);
+                            }
+                        }
+                    }
+                    self.composed_dirty = true;
+                }
+            }
+        }
+    }
+
+    fn style_control_rect(&self) -> Option<IntRect> {
+        let layout = self.toolbar_layout()?;
+        layout
+            .items
+            .into_iter()
+            .find(|item| item.action == ToolbarAction::StyleControl)
+            .map(|item| item.rect)
+    }
+
+    fn style_control_track_rect(&self) -> Option<IntRect> {
+        let rect = self.style_control_rect()?;
+        let cy = (rect.top + rect.bottom) / 2;
+        Some(IntRect {
+            left: rect.left + 12,
+            top: cy - TOOLBAR_STYLE_TRACK_HEIGHT,
+            right: rect.right - 12,
+            bottom: cy + TOOLBAR_STYLE_TRACK_HEIGHT,
+        })
+    }
+
+    fn style_control_value_from_point(&self, point: CursorPoint) -> Option<u32> {
+        let track = self.style_control_track_rect()?;
+        let (min_value, max_value) = self.style_value_range();
+        let span = (track.right - track.left - 1).max(1) as f32;
+        let ratio = ((point.x - track.left) as f32 / span).clamp(0.0, 1.0);
+        Some(min_value + ((max_value - min_value) as f32 * ratio).round() as u32)
+    }
+
+    fn style_control_ratio(&self) -> f32 {
+        let (min_value, max_value) = self.style_value_range();
+        if max_value <= min_value {
+            return 0.0;
+        }
+        (self.current_style_value().saturating_sub(min_value) as f32
+            / (max_value - min_value) as f32)
+            .clamp(0.0, 1.0)
     }
 
     fn tool_can_interact_with_shape(&self, shape: &AnnotationShape) -> bool {
@@ -665,9 +848,7 @@ impl OverlayState {
             (ToolbarAction::Color(2), TOOLBAR_COLOR),
             (ToolbarAction::Color(3), TOOLBAR_COLOR),
             (ToolbarAction::Color(4), TOOLBAR_COLOR),
-            (ToolbarAction::Stroke(0), TOOLBAR_STROKE_WIDTH),
-            (ToolbarAction::Stroke(1), TOOLBAR_STROKE_WIDTH),
-            (ToolbarAction::Stroke(2), TOOLBAR_STROKE_WIDTH),
+            (ToolbarAction::StyleControl, TOOLBAR_STYLE_WIDTH),
             (ToolbarAction::Undo, TOOLBAR_BUTTON),
             (ToolbarAction::Pin, TOOLBAR_BUTTON),
             (ToolbarAction::Confirm, TOOLBAR_BUTTON),
@@ -677,10 +858,7 @@ impl OverlayState {
         for (index, (_, width)) in item_defs.iter().enumerate() {
             total_width += *width;
             if index + 1 != item_defs.len() {
-                total_width += match index {
-                    7 | 12 | 15 | 16 => TOOLBAR_GROUP_GAP,
-                    _ => TOOLBAR_ITEM_GAP,
-                };
+                total_width += toolbar_gap_after(index);
             }
         }
 
@@ -716,10 +894,7 @@ impl OverlayState {
             });
             cursor_x += width;
             if index + 1 != item_defs.len() {
-                cursor_x += match index {
-                    7 | 12 | 15 | 16 => TOOLBAR_GROUP_GAP,
-                    _ => TOOLBAR_ITEM_GAP,
-                };
+                cursor_x += toolbar_gap_after(index);
             }
         }
 
@@ -751,6 +926,7 @@ impl OverlayState {
                 ActiveDrag::MoveSelection { .. } | ActiveDrag::MoveShape { .. } => CursorKind::Move,
                 ActiveDrag::ResizeSelection { handle, .. }
                 | ActiveDrag::ResizeShape { handle, .. } => handle.cursor_kind(),
+                ActiveDrag::AdjustStyleControl => CursorKind::Hand,
             };
         }
         if let Some(action) = self.hover_action_at(self.last_cursor) {
@@ -979,10 +1155,10 @@ impl AnnotationShape {
                 }
             }
             AnnotationShape::Text {
-                anchor,
+                box_rect,
                 text,
                 style,
-            } => text_bounds(*anchor, text, *style),
+            } => text_box_bounds(*box_rect, text, *style),
         }
     }
 
@@ -1044,13 +1220,15 @@ impl AnnotationShape {
                 style: *style,
             },
             AnnotationShape::Text {
-                anchor,
+                box_rect,
                 text,
                 style,
             } => AnnotationShape::Text {
-                anchor: CursorPoint {
-                    x: anchor.x + dx,
-                    y: anchor.y + dy,
+                box_rect: NormalizedRect {
+                    left: box_rect.left + dx,
+                    top: box_rect.top + dy,
+                    right: box_rect.right + dx,
+                    bottom: box_rect.bottom + dy,
                 },
                 text: text.clone(),
                 style: *style,
@@ -1116,10 +1294,10 @@ impl AnnotationShape {
                 rect.expanded(if selected { 6 } else { 3 }).contains(point)
             }
             AnnotationShape::Text {
-                anchor,
+                box_rect,
                 text,
                 style,
-            } => text_bounds(*anchor, text, *style)
+            } => text_box_bounds(*box_rect, text, *style)
                 .expanded(if selected { 6 } else { 4 })
                 .contains(point),
         }
@@ -1602,6 +1780,11 @@ fn handle_mouse_move(state: &mut OverlayState, point: CursorPoint) {
                 state.composed_dirty = true;
             }
         }
+        Some(ActiveDrag::AdjustStyleControl) => {
+            if let Some(value) = state.style_control_value_from_point(point) {
+                state.set_current_style_value(value);
+            }
+        }
         None => {}
     }
 }
@@ -1619,6 +1802,19 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
             false
         }
         OverlayMode::Annotating => {
+            if state
+                .style_control_rect()
+                .is_some_and(|rect| rect.contains(point))
+            {
+                if let Some(value) = state.style_control_value_from_point(point) {
+                    state.set_current_style_value(value);
+                    state.active_drag = Some(ActiveDrag::AdjustStyleControl);
+                    unsafe {
+                        let _ = SetCapture(hwnd);
+                    }
+                }
+                return false;
+            }
             if let Some(action) = state.toolbar_action_at(point) {
                 return handle_toolbar_action(hwnd, state, action);
             }
@@ -1684,15 +1880,6 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
                 }
                 return false;
             }
-            if state.tool == AnnotationTool::Text && state.point_in_selection(point) {
-                state.text_input = Some(TextDraft {
-                    anchor: state.clamp_point_to_selection(point),
-                    text: String::new(),
-                    style: state.current_style(),
-                    editing_shape: None,
-                });
-                return false;
-            }
             if matches!(
                 state.tool,
                 AnnotationTool::Rectangle
@@ -1700,6 +1887,7 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
                     | AnnotationTool::Line
                     | AnnotationTool::Arrow
                     | AnnotationTool::Mosaic
+                    | AnnotationTool::Text
             ) && state.point_in_selection(point)
             {
                 let point = state.clamp_point_to_selection(point);
@@ -1762,7 +1950,20 @@ fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> 
         }
         ActiveDrag::Drafting => {
             if let Some(draft) = state.draft.take() {
-                if let Some(shape) = draft.to_shape() {
+                if draft.tool == AnnotationTool::Text {
+                    if let Some(selection) = state.selection {
+                        if let Some(box_rect) =
+                            text_box_from_drag(draft.start, draft.current, selection)
+                        {
+                            state.text_input = Some(TextDraft {
+                                box_rect,
+                                text: String::new(),
+                                style: state.current_style(),
+                                editing_shape: None,
+                            });
+                        }
+                    }
+                } else if let Some(shape) = draft.to_shape() {
                     let new_index = state.shapes.len();
                     state.shapes.push(shape);
                     state.selected_shape = Some(new_index);
@@ -1774,7 +1975,8 @@ fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> 
         ActiveDrag::MoveSelection { .. }
         | ActiveDrag::ResizeSelection { .. }
         | ActiveDrag::MoveShape { .. }
-        | ActiveDrag::ResizeShape { .. } => false,
+        | ActiveDrag::ResizeShape { .. }
+        | ActiveDrag::AdjustStyleControl => false,
     }
 }
 
@@ -1783,8 +1985,8 @@ fn commit_text_input(state: &mut OverlayState) -> bool {
         return false;
     };
     if let Some(selection) = state.selection {
-        draft.anchor =
-            clamp_text_anchor_to_bounds(draft.anchor, &draft.text, draft.style, selection);
+        draft.box_rect =
+            clamp_text_box_to_bounds(draft.box_rect, &draft.text, draft.style, selection);
     }
 
     if draft.text.trim().is_empty() {
@@ -1797,7 +1999,7 @@ fn commit_text_input(state: &mut OverlayState) -> bool {
     }
 
     let shape = AnnotationShape::Text {
-        anchor: draft.anchor,
+        box_rect: draft.box_rect,
         text: draft.text,
         style: draft.style,
     };
@@ -1820,7 +2022,7 @@ fn begin_text_edit(state: &mut OverlayState, shape_index: usize) -> bool {
         return false;
     };
     let AnnotationShape::Text {
-        anchor,
+        box_rect,
         text,
         style,
     } = &original
@@ -1829,7 +2031,7 @@ fn begin_text_edit(state: &mut OverlayState, shape_index: usize) -> bool {
     };
     state.shapes.remove(shape_index);
     state.text_input = Some(TextDraft {
-        anchor: *anchor,
+        box_rect: *box_rect,
         text: text.clone(),
         style: *style,
         editing_shape: Some((shape_index, original)),
@@ -1864,21 +2066,7 @@ fn handle_char_input(state: &mut OverlayState, code_unit: u16) -> bool {
         return false;
     }
     if state.text_input.is_none() {
-        if state.tool != AnnotationTool::Text {
-            return false;
-        }
-        let Some(selection) = state.selection else {
-            return false;
-        };
-        state.text_input = Some(TextDraft {
-            anchor: CursorPoint {
-                x: selection.left + 8,
-                y: selection.top + 8,
-            },
-            text: String::new(),
-            style: state.current_style(),
-            editing_shape: None,
-        });
+        return false;
     }
     let style = state.current_style();
     if let Some(draft) = state.text_input.as_mut() {
@@ -1896,7 +2084,11 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
                 return false;
             }
             value if value == u32::from(VK_RETURN.0) => {
-                commit_text_input(state);
+                if is_shift_pressed() {
+                    draft.text.push('\n');
+                } else {
+                    commit_text_input(state);
+                }
                 return false;
             }
             value if value == u32::from(VK_BACK.0) || value == u32::from(VK_DELETE.0) => {
@@ -2056,12 +2248,7 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
                 draft.style.color = COLOR_PRESETS[state.color_index];
             }
         }
-        ToolbarAction::Stroke(index) => {
-            state.stroke_index = index.min(STROKE_PRESETS.len().saturating_sub(1));
-            if let Some(draft) = state.text_input.as_mut() {
-                draft.style.stroke = STROKE_PRESETS[state.stroke_index];
-            }
-        }
+        ToolbarAction::StyleControl => {}
         ToolbarAction::Undo => {
             let restored = if state.text_input.is_some() {
                 cancel_text_input(state)
@@ -2254,7 +2441,20 @@ fn paint_dynamic_shapes(state: &mut OverlayState) {
         }
     }
     if let Some(draft) = state.draft {
-        if let Some(shape) = draft.to_shape() {
+        if draft.tool == AnnotationTool::Text {
+            if let Some(selection) = state.selection {
+                if let Some(box_rect) = text_box_from_drag(draft.start, draft.current, selection) {
+                    draw_rect_outline(
+                        &mut state.frame,
+                        box_rect,
+                        state.target.width,
+                        state.target.height,
+                        1,
+                        SELECTION_ACCENT,
+                    );
+                }
+            }
+        } else if let Some(shape) = draft.to_shape() {
             draw_shape_image(
                 &mut state.frame,
                 state.target.width,
@@ -2264,11 +2464,11 @@ fn paint_dynamic_shapes(state: &mut OverlayState) {
         }
     }
     if let Some(text_input) = &state.text_input {
-        draw_text_shape(
+        draw_text_box_shape(
             &mut state.frame,
             state.target.width,
             state.target.height,
-            text_input.anchor,
+            text_input.box_rect,
             &text_input.text,
             text_input.style,
             true,
@@ -2328,7 +2528,7 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::MosaicTool => state.tool == AnnotationTool::Mosaic,
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
         ToolbarAction::Color(index) => state.color_index == index,
-        ToolbarAction::Stroke(index) => state.stroke_index == index,
+        ToolbarAction::StyleControl => false,
         ToolbarAction::Pin => false,
         _ => false,
     };
@@ -2453,14 +2653,7 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             COLOR_PRESETS[index],
             selected,
         ),
-        ToolbarAction::Stroke(index) => draw_stroke_swatch(
-            &mut state.frame,
-            state.target.width,
-            state.target.height,
-            item.rect,
-            STROKE_PRESETS[index],
-            selected,
-        ),
+        ToolbarAction::StyleControl => draw_style_control(state, item.rect, hovered),
     }
 }
 
@@ -2926,29 +3119,198 @@ fn draw_color_swatch(
     }
     draw_disc(frame, width, height, cx, cy, 5, color);
 }
-fn draw_stroke_swatch(
-    frame: &mut [u32],
-    width: u32,
-    height: u32,
-    rect: IntRect,
-    stroke: u32,
-    _selected: bool,
-) {
-    let my = (rect.top + rect.bottom) / 2;
+fn draw_style_control(state: &mut OverlayState, rect: IntRect, hovered: bool) {
+    let Some(track) = state.style_control_track_rect() else {
+        return;
+    };
+    let ratio = state.style_control_ratio();
+    let knob_x =
+        (track.left as f32 + (track.right - track.left - 1).max(1) as f32 * ratio).round() as i32;
+    let cy = (track.top + track.bottom) / 2;
+
+    let inactive = if hovered { 0x5A677F } else { 0x465369 };
     draw_line(
-        frame,
-        width,
-        height,
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
         CursorPoint {
-            x: rect.left + 6,
-            y: my,
+            x: track.left,
+            y: cy,
         },
         CursorPoint {
-            x: rect.right - 6,
-            y: my,
+            x: track.right,
+            y: cy,
         },
+        inactive,
+        TOOLBAR_STYLE_TRACK_HEIGHT,
+    );
+    draw_line(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        CursorPoint {
+            x: track.left,
+            y: cy,
+        },
+        CursorPoint { x: knob_x, y: cy },
+        TOOLBAR_ACTIVE,
+        TOOLBAR_STYLE_TRACK_HEIGHT,
+    );
+
+    match state.style_control_target() {
+        StyleControlTarget::Text => {
+            let small = ShapeStyle {
+                color: TOOLBAR_TEXT,
+                stroke: MIN_TEXT_SIZE.max(12),
+            };
+            let large = ShapeStyle {
+                color: TOOLBAR_TEXT,
+                stroke: (MIN_TEXT_SIZE + 10).min(MAX_TEXT_SIZE),
+            };
+            draw_text_shape(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                CursorPoint {
+                    x: rect.left + 6,
+                    y: rect.top + 7,
+                },
+                "A",
+                small,
+                false,
+            );
+            let large_metrics = measure_text_layout("A", large)
+                .unwrap_or_else(|| fallback_text_metrics("A", large));
+            draw_text_shape(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                CursorPoint {
+                    x: rect.right - large_metrics.max_width - 6,
+                    y: rect.top + 4,
+                },
+                "A",
+                large,
+                false,
+            );
+        }
+        StyleControlTarget::Mosaic => {
+            let left = IntRect {
+                left: rect.left + 6,
+                top: rect.top + 6,
+                right: rect.left + 18,
+                bottom: rect.bottom - 6,
+            };
+            let right = IntRect {
+                left: rect.right - 18,
+                top: rect.top + 6,
+                right: rect.right - 6,
+                bottom: rect.bottom - 6,
+            };
+            stroke_rect(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                left,
+                TOOLBAR_TEXT,
+            );
+            fill_rect(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                IntRect {
+                    left: left.left + 2,
+                    top: left.top + 2,
+                    right: left.left + 6,
+                    bottom: left.top + 6,
+                },
+                TOOLBAR_TEXT,
+            );
+            stroke_rect(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                right,
+                TOOLBAR_TEXT,
+            );
+            let mid_x = (right.left + right.right) / 2;
+            let mid_y = (right.top + right.bottom) / 2;
+            fill_rect(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                IntRect {
+                    left: right.left + 2,
+                    top: right.top + 2,
+                    right: mid_x,
+                    bottom: mid_y,
+                },
+                TOOLBAR_TEXT,
+            );
+            fill_rect(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                IntRect {
+                    left: mid_x,
+                    top: mid_y,
+                    right: right.right - 2,
+                    bottom: right.bottom - 2,
+                },
+                TOOLBAR_TEXT,
+            );
+        }
+        StyleControlTarget::Stroke => {
+            draw_line(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                CursorPoint {
+                    x: rect.left + 7,
+                    y: cy,
+                },
+                CursorPoint {
+                    x: rect.left + 18,
+                    y: cy,
+                },
+                TOOLBAR_TEXT,
+                MIN_STROKE_WIDTH as i32,
+            );
+            draw_line(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                CursorPoint {
+                    x: rect.right - 18,
+                    y: cy,
+                },
+                CursorPoint {
+                    x: rect.right - 7,
+                    y: cy,
+                },
+                TOOLBAR_TEXT,
+                MAX_STROKE_WIDTH.min(8) as i32,
+            );
+        }
+    }
+
+    draw_disc(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        knob_x,
+        cy,
+        TOOLBAR_STYLE_KNOB_RADIUS + 1,
+        TOOLBAR_BORDER,
+    );
+    draw_disc(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        knob_x,
+        cy,
+        TOOLBAR_STYLE_KNOB_RADIUS,
         TOOLBAR_TEXT,
-        stroke as i32,
     );
 }
 fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &AnnotationShape) {
@@ -2987,13 +3349,13 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
             }
         }
         AnnotationShape::Text {
-            anchor,
+            box_rect,
             text,
             style,
         } => {
             draw_rect_outline(
                 frame,
-                text_bounds(*anchor, text, *style).expanded(2),
+                text_box_bounds(*box_rect, text, *style).expanded(2),
                 width,
                 height,
                 1,
@@ -3060,33 +3422,231 @@ fn draw_shape_image(frame: &mut [u32], width: u32, height: u32, shape: &Annotati
             }
         }
         AnnotationShape::Text {
-            anchor,
+            box_rect,
             text,
             style,
-        } => draw_text_shape(frame, width, height, *anchor, text, *style, false),
+        } => draw_text_box_shape(frame, width, height, *box_rect, text, *style, false),
+    }
+}
+
+fn text_box_from_drag(
+    start: CursorPoint,
+    current: CursorPoint,
+    bounds: NormalizedRect,
+) -> Option<NormalizedRect> {
+    let mut left = start.x.min(current.x);
+    let mut top = start.y.min(current.y);
+    let mut right = start.x.max(current.x).max(left + 1);
+    let mut bottom = start.y.max(current.y).max(top + 1);
+
+    if right - left < TEXT_BOX_MIN_WIDTH {
+        if current.x >= start.x {
+            right = (left + TEXT_BOX_MIN_WIDTH).min(bounds.right);
+            left = (right - TEXT_BOX_MIN_WIDTH).max(bounds.left);
+        } else {
+            left = (right - TEXT_BOX_MIN_WIDTH).max(bounds.left);
+            right = (left + TEXT_BOX_MIN_WIDTH).min(bounds.right);
+        }
+    }
+    if bottom - top < TEXT_BOX_MIN_HEIGHT {
+        if current.y >= start.y {
+            bottom = (top + TEXT_BOX_MIN_HEIGHT).min(bounds.bottom);
+            top = (bottom - TEXT_BOX_MIN_HEIGHT).max(bounds.top);
+        } else {
+            top = (bottom - TEXT_BOX_MIN_HEIGHT).max(bounds.top);
+            bottom = (top + TEXT_BOX_MIN_HEIGHT).min(bounds.bottom);
+        }
+    }
+
+    let rect = NormalizedRect {
+        left: left.clamp(bounds.left, bounds.right - 1),
+        top: top.clamp(bounds.top, bounds.bottom - 1),
+        right: right.clamp(bounds.left + 1, bounds.right),
+        bottom: bottom.clamp(bounds.top + 1, bounds.bottom),
+    };
+    (rect.width() > 0 && rect.height() > 0).then_some(rect)
+}
+
+fn text_content_rect(box_rect: NormalizedRect) -> NormalizedRect {
+    NormalizedRect {
+        left: box_rect.left + TEXT_BOX_PADDING_X,
+        top: box_rect.top + TEXT_BOX_PADDING_Y,
+        right: (box_rect.right - TEXT_BOX_PADDING_X).max(box_rect.left + TEXT_BOX_PADDING_X + 1),
+        bottom: (box_rect.bottom - TEXT_BOX_PADDING_Y).max(box_rect.top + TEXT_BOX_PADDING_Y + 1),
+    }
+}
+
+fn measure_text_width(text: &str, style: ShapeStyle) -> i32 {
+    measure_text_layout(text, style)
+        .map(|metrics| metrics.max_width)
+        .unwrap_or_else(|| fallback_text_metrics(text, style).max_width)
+        .max(1)
+}
+
+fn wrap_text_lines(text: &str, style: ShapeStyle, max_width: i32) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut wrapped = Vec::new();
+    let paragraphs: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.split('\n').collect()
+    };
+    for paragraph in paragraphs {
+        if paragraph.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for ch in paragraph.chars() {
+            let mut candidate = current.clone();
+            candidate.push(ch);
+            if !current.is_empty() && measure_text_width(&candidate, style) > max_width {
+                wrapped.push(current);
+                current = ch.to_string();
+            } else {
+                current = candidate;
+            }
+        }
+        wrapped.push(current);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
+}
+
+fn measure_wrapped_text(text: &str, style: ShapeStyle, max_width: i32) -> WrappedTextLayout {
+    let lines = wrap_text_lines(text, style, max_width);
+    let line_height = text_font_height(style);
+    let line_gap = text_line_gap(style);
+    let widths: Vec<i32> = lines
+        .iter()
+        .map(|line| {
+            if line.is_empty() {
+                0
+            } else {
+                measure_text_width(line, style)
+            }
+        })
+        .collect();
+    let line_count = lines.len() as i32;
+    let max_width = widths.iter().copied().max().unwrap_or(0).max(1);
+    let total_height = (line_count * line_height
+        + (line_count - 1).max(0) * line_gap
+        + TEXT_LAYOUT_BOTTOM_PADDING)
+        .max(1);
+    let last_line_width = widths.last().copied().unwrap_or(0);
+    WrappedTextLayout {
+        lines,
+        metrics: TextMetrics {
+            max_width,
+            total_height,
+            line_height,
+            line_gap,
+            last_line_width,
+            line_count,
+        },
+    }
+}
+
+fn text_box_bounds(box_rect: NormalizedRect, text: &str, style: ShapeStyle) -> NormalizedRect {
+    let content = text_content_rect(box_rect);
+    let layout = measure_wrapped_text(text, style, content.width());
+    let content_height = layout.metrics.total_height.max(1);
+    let target_height = (content_height + TEXT_BOX_PADDING_Y * 2).max(box_rect.height());
+    NormalizedRect {
+        left: box_rect.left,
+        top: box_rect.top,
+        right: box_rect.right,
+        bottom: box_rect.top + target_height,
+    }
+}
+
+fn clamp_text_box_to_bounds(
+    box_rect: NormalizedRect,
+    text: &str,
+    style: ShapeStyle,
+    bounds: NormalizedRect,
+) -> NormalizedRect {
+    let actual = text_box_bounds(box_rect, text, style);
+    let dx = if actual.left < bounds.left {
+        bounds.left - actual.left
+    } else if actual.right > bounds.right {
+        bounds.right - actual.right
+    } else {
+        0
+    };
+    let dy = if actual.top < bounds.top {
+        bounds.top - actual.top
+    } else if actual.bottom > bounds.bottom {
+        bounds.bottom - actual.bottom
+    } else {
+        0
+    };
+    NormalizedRect {
+        left: box_rect.left + dx,
+        top: box_rect.top + dy,
+        right: box_rect.right + dx,
+        bottom: box_rect.bottom + dy,
     }
 }
 
 fn text_font_height(style: ShapeStyle) -> i32 {
-    match style.stroke {
-        0..=2 => 20,
-        3..=4 => 28,
-        _ => 36,
+    style.stroke.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE) as i32
+}
+
+fn text_line_gap(style: ShapeStyle) -> i32 {
+    (text_font_height(style) / 5).max(4)
+}
+
+fn fallback_text_metrics(text: &str, style: ShapeStyle) -> TextMetrics {
+    let line_height = text_font_height(style);
+    let line_gap = text_line_gap(style);
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.split('\n').collect()
+    };
+    let last_line_width = lines
+        .last()
+        .map(|line| (line.chars().count() as i32 * (line_height / 2).max(1)).max(0))
+        .unwrap_or(0);
+    let max_width = lines
+        .iter()
+        .map(|line| (line.chars().count() as i32 * (line_height / 2).max(1)).max(0))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let line_count = lines.len() as i32;
+    let total_height = (line_count * line_height
+        + (line_count - 1).max(0) * line_gap
+        + TEXT_LAYOUT_BOTTOM_PADDING)
+        .max(1);
+    TextMetrics {
+        max_width,
+        total_height,
+        line_height,
+        line_gap,
+        last_line_width,
+        line_count,
     }
 }
 
-fn measure_text_size(text: &str, style: ShapeStyle) -> Option<(i32, i32)> {
-    let font_height = text_font_height(style);
-    if text.is_empty() {
-        return Some((1, font_height));
-    }
+fn measure_text_layout(text: &str, style: ShapeStyle) -> Option<TextMetrics> {
+    let line_height = text_font_height(style);
+    let line_gap = text_line_gap(style);
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.split('\n').collect()
+    };
     let hdc = unsafe { CreateCompatibleDC(None) };
     if hdc.0.is_null() {
         return None;
     }
     let font: HFONT = unsafe {
         CreateFontW(
-            -font_height,
+            -line_height,
             0,
             0,
             0,
@@ -3109,48 +3669,222 @@ fn measure_text_size(text: &str, style: ShapeStyle) -> Option<(i32, i32)> {
         return None;
     }
     let old_font = unsafe { SelectObject(hdc, font.into()) };
-    let utf16: Vec<u16> = text.encode_utf16().collect();
-    let mut size = SIZE { cx: 0, cy: 0 };
-    let ok = unsafe { GetTextExtentPoint32W(hdc, &utf16, &mut size) }.as_bool();
+    let mut widths = Vec::with_capacity(lines.len());
+    let mut ok = true;
+    for line in &lines {
+        if line.is_empty() {
+            widths.push(0);
+            continue;
+        }
+        let utf16: Vec<u16> = line.encode_utf16().collect();
+        let mut size = SIZE { cx: 0, cy: 0 };
+        let measured = unsafe { GetTextExtentPoint32W(hdc, &utf16, &mut size) }.as_bool();
+        if !measured {
+            ok = false;
+            break;
+        }
+        widths.push(size.cx.max(1));
+    }
     unsafe {
         let _ = SelectObject(hdc, old_font);
         let _ = DeleteObject(font.into());
         let _ = DeleteDC(hdc);
     }
-    if ok {
-        Some((size.cx.max(1), size.cy.max(font_height)))
-    } else {
-        None
+    if !ok {
+        return None;
     }
+    let line_count = widths.len() as i32;
+    let max_width = widths.iter().copied().max().unwrap_or(0).max(1);
+    let total_height = (line_count * line_height
+        + (line_count - 1).max(0) * line_gap
+        + TEXT_LAYOUT_BOTTOM_PADDING)
+        .max(1);
+    let last_line_width = widths.last().copied().unwrap_or(0);
+    Some(TextMetrics {
+        max_width,
+        total_height,
+        line_height,
+        line_gap,
+        last_line_width,
+        line_count,
+    })
 }
 
+#[cfg(test)]
 fn text_bounds(anchor: CursorPoint, text: &str, style: ShapeStyle) -> NormalizedRect {
-    let (width, height) = measure_text_size(text, style).unwrap_or((1, text_font_height(style)));
+    let metrics =
+        measure_text_layout(text, style).unwrap_or_else(|| fallback_text_metrics(text, style));
     NormalizedRect {
         left: anchor.x,
         top: anchor.y,
-        right: anchor.x + width.max(1),
-        bottom: anchor.y + height.max(1),
-    }
-}
-
-fn clamp_text_anchor_to_bounds(
-    anchor: CursorPoint,
-    text: &str,
-    style: ShapeStyle,
-    bounds: NormalizedRect,
-) -> CursorPoint {
-    let rect = text_bounds(anchor, text, style);
-    let max_x = (bounds.right - rect.width()).max(bounds.left);
-    let max_y = (bounds.bottom - rect.height()).max(bounds.top);
-    CursorPoint {
-        x: anchor.x.clamp(bounds.left, max_x),
-        y: anchor.y.clamp(bounds.top, max_y),
+        right: anchor.x + metrics.max_width.max(1),
+        bottom: anchor.y + metrics.total_height.max(1),
     }
 }
 
 fn colorref_from_rgb(color: u32) -> COLORREF {
     COLORREF(((color >> 16) & 0xff) | (color & 0x00ff00) | ((color & 0xff) << 16))
+}
+
+fn draw_text_box_shape(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    box_rect: NormalizedRect,
+    text: &str,
+    style: ShapeStyle,
+    show_caret: bool,
+) {
+    let bounds = text_box_bounds(box_rect, text, style);
+    let content = text_content_rect(bounds);
+    let layout = measure_wrapped_text(text, style, content.width());
+
+    if show_caret {
+        let panel = IntRect {
+            left: bounds.left - TEXT_EDIT_PADDING_X,
+            top: bounds.top - TEXT_EDIT_PADDING_Y,
+            right: bounds.right + TEXT_EDIT_PADDING_X,
+            bottom: bounds.bottom + TEXT_EDIT_PADDING_Y,
+        };
+        fill_rounded_rect(
+            frame,
+            width,
+            height,
+            panel,
+            TEXT_EDIT_RADIUS,
+            TEXT_EDIT_FILL,
+        );
+        stroke_rounded_rect(
+            frame,
+            width,
+            height,
+            panel,
+            TEXT_EDIT_RADIUS,
+            TEXT_EDIT_BORDER,
+        );
+        draw_rect_outline(frame, bounds, width, height, 1, TEXT_EDIT_BORDER);
+    }
+
+    let bitmap_width = content.width().max(1);
+    let bitmap_height = layout.metrics.total_height.max(1);
+    let hdc = unsafe { CreateCompatibleDC(None) };
+    if hdc.0.is_null() {
+        return;
+    }
+    let mut bitmap_info = BITMAPINFO::default();
+    bitmap_info.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: bitmap_width,
+        biHeight: -bitmap_height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    bitmap_info.bmiColors[0] = RGBQUAD::default();
+    let mut bits = null_mut();
+    let bitmap = match unsafe {
+        CreateDIBSection(Some(hdc), &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0)
+    } {
+        Ok(bitmap) => bitmap,
+        Err(_) => {
+            unsafe {
+                let _ = DeleteDC(hdc);
+            }
+            return;
+        }
+    };
+    let old_bitmap = unsafe { SelectObject(hdc, bitmap.into()) };
+    if old_bitmap.0.is_null() {
+        unsafe {
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(hdc);
+        }
+        return;
+    }
+    let font: HFONT = unsafe {
+        CreateFontW(
+            -layout.metrics.line_height,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+            w!("Microsoft YaHei UI"),
+        )
+    };
+    let old_font = if font.0.is_null() {
+        HGDIOBJ::default()
+    } else {
+        unsafe { SelectObject(hdc, font.into()) }
+    };
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, colorref_from_rgb(style.color));
+    }
+    for (line_index, line) in layout.lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let utf16: Vec<u16> = line.encode_utf16().collect();
+        let y = line_index as i32 * (layout.metrics.line_height + layout.metrics.line_gap);
+        let _ = unsafe { TextOutW(hdc, 0, y, &utf16) };
+    }
+    let pixels = unsafe {
+        std::slice::from_raw_parts(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
+    };
+    for y in 0..bitmap_height {
+        for x in 0..bitmap_width {
+            let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
+            if pixel != 0 {
+                put_pixel(
+                    frame,
+                    width,
+                    height,
+                    content.left + x,
+                    content.top + y,
+                    pixel,
+                );
+            }
+        }
+    }
+    if show_caret {
+        let caret_line = (layout.metrics.line_count - 1).max(0);
+        let caret_x = content.left + layout.metrics.last_line_width + 1;
+        let caret_y =
+            content.top + caret_line * (layout.metrics.line_height + layout.metrics.line_gap);
+        draw_line(
+            frame,
+            width,
+            height,
+            CursorPoint {
+                x: caret_x,
+                y: caret_y,
+            },
+            CursorPoint {
+                x: caret_x,
+                y: caret_y + layout.metrics.line_height - 1,
+            },
+            style.color,
+            1,
+        );
+    }
+    unsafe {
+        if !font.0.is_null() {
+            let _ = SelectObject(hdc, old_font);
+            let _ = DeleteObject(font.into());
+        }
+        let _ = SelectObject(hdc, old_bitmap);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(hdc);
+    }
 }
 
 fn draw_text_shape(
@@ -3162,20 +3896,58 @@ fn draw_text_shape(
     style: ShapeStyle,
     show_caret: bool,
 ) {
-    let bounds = text_bounds(anchor, text, style);
-    let bitmap_width = bounds.width().max(1);
-    let bitmap_height = bounds.height().max(1);
+    let metrics =
+        measure_text_layout(text, style).unwrap_or_else(|| fallback_text_metrics(text, style));
+    let bounds = NormalizedRect {
+        left: anchor.x,
+        top: anchor.y,
+        right: anchor.x + metrics.max_width.max(1),
+        bottom: anchor.y + metrics.total_height.max(1),
+    };
+    if show_caret {
+        let panel = IntRect {
+            left: bounds.left - TEXT_EDIT_PADDING_X,
+            top: bounds.top - TEXT_EDIT_PADDING_Y,
+            right: bounds.right + TEXT_EDIT_PADDING_X,
+            bottom: bounds.bottom + TEXT_EDIT_PADDING_Y,
+        };
+        fill_rounded_rect(
+            frame,
+            width,
+            height,
+            panel,
+            TEXT_EDIT_RADIUS,
+            TEXT_EDIT_FILL,
+        );
+        stroke_rounded_rect(
+            frame,
+            width,
+            height,
+            panel,
+            TEXT_EDIT_RADIUS,
+            TEXT_EDIT_BORDER,
+        );
+    }
+
+    let bitmap_width = metrics.max_width.max(1);
+    let bitmap_height = metrics.total_height.max(1);
     let hdc = unsafe { CreateCompatibleDC(None) };
     if hdc.0.is_null() {
         if show_caret {
+            let caret_y = anchor.y
+                + (metrics.line_count - 1).max(0) * (metrics.line_height + metrics.line_gap);
+            let caret_x = anchor.x + metrics.last_line_width + 1;
             draw_line(
                 frame,
                 width,
                 height,
-                anchor,
                 CursorPoint {
-                    x: anchor.x,
-                    y: anchor.y + bitmap_height - 1,
+                    x: caret_x,
+                    y: caret_y,
+                },
+                CursorPoint {
+                    x: caret_x,
+                    y: caret_y + metrics.line_height - 1,
                 },
                 style.color,
                 1,
@@ -3216,7 +3988,7 @@ fn draw_text_shape(
     }
     let font: HFONT = unsafe {
         CreateFontW(
-            -text_font_height(style),
+            -metrics.line_height,
             0,
             0,
             0,
@@ -3241,9 +4013,13 @@ fn draw_text_shape(
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, colorref_from_rgb(style.color));
     }
-    if !text.is_empty() {
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        let _ = unsafe { TextOutW(hdc, 0, 0, &utf16) };
+    for (line_index, line) in text.split('\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let utf16: Vec<u16> = line.encode_utf16().collect();
+        let y = line_index as i32 * (metrics.line_height + metrics.line_gap);
+        let _ = unsafe { TextOutW(hdc, 0, y, &utf16) };
     }
     let pixels = unsafe {
         std::slice::from_raw_parts(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
@@ -3257,18 +4033,20 @@ fn draw_text_shape(
         }
     }
     if show_caret {
-        let caret_x = bounds.right + 1;
+        let caret_line = (metrics.line_count - 1).max(0);
+        let caret_x = anchor.x + metrics.last_line_width + 1;
+        let caret_y = anchor.y + caret_line * (metrics.line_height + metrics.line_gap);
         draw_line(
             frame,
             width,
             height,
             CursorPoint {
                 x: caret_x,
-                y: anchor.y,
+                y: caret_y,
             },
             CursorPoint {
                 x: caret_x,
-                y: anchor.y + bitmap_height - 1,
+                y: caret_y + metrics.line_height - 1,
             },
             style.color,
             1,
@@ -3310,11 +4088,7 @@ fn draw_rect_outline(
     }
 }
 fn mosaic_block_size(style: ShapeStyle) -> i32 {
-    match style.stroke {
-        0..=2 => 10,
-        3..=4 => 16,
-        _ => 24,
-    }
+    style.stroke.clamp(MIN_MOSAIC_SIZE, MAX_MOSAIC_SIZE) as i32
 }
 
 fn draw_mosaic_rect(
@@ -3576,8 +4350,15 @@ fn overlay_state(hwnd: HWND) -> Option<&'static mut OverlayState> {
 }
 fn button_height(action: ToolbarAction) -> i32 {
     match action {
-        ToolbarAction::Color(_) | ToolbarAction::Stroke(_) => TOOLBAR_COLOR,
+        ToolbarAction::Color(_) | ToolbarAction::StyleControl => TOOLBAR_COLOR,
         _ => TOOLBAR_BUTTON,
+    }
+}
+
+fn toolbar_gap_after(index: usize) -> i32 {
+    match index {
+        7 | 12 | 13 | 14 => TOOLBAR_GROUP_GAP,
+        _ => TOOLBAR_ITEM_GAP,
     }
 }
 fn update_overlay_cursor(state: &OverlayState) {
@@ -3600,6 +4381,9 @@ fn update_overlay_cursor(state: &OverlayState) {
 }
 fn is_control_pressed() -> bool {
     unsafe { GetKeyState(VK_CONTROL.0.into()) < 0 }
+}
+fn is_shift_pressed() -> bool {
+    unsafe { GetKeyState(VK_SHIFT.0.into()) < 0 }
 }
 fn apply_capture_exclusion(hwnd: HWND) {
     if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
@@ -3640,6 +4424,28 @@ mod tests {
         assert_eq!(rect.height, 50);
     }
 
+    #[test]
+    fn fallback_text_metrics_expand_for_multiline_text() {
+        let style = ShapeStyle {
+            color: 0xffffff,
+            stroke: 4,
+        };
+        let metrics = fallback_text_metrics("A\nBC", style);
+        assert_eq!(metrics.line_count, 2);
+        assert!(metrics.total_height > metrics.line_height);
+        assert!(metrics.max_width >= metrics.last_line_width);
+    }
+
+    #[test]
+    fn text_bounds_use_multiline_height() {
+        let style = ShapeStyle {
+            color: 0xffffff,
+            stroke: 2,
+        };
+        let single = text_bounds(CursorPoint { x: 10, y: 10 }, "Hello", style);
+        let multi = text_bounds(CursorPoint { x: 10, y: 10 }, "Hello\nWorld", style);
+        assert!(multi.height() > single.height());
+    }
     #[test]
     fn preview_composition_restores_selection_pixels() {
         let source = vec![0x112233, 0x445566, 0x778899, 0xaabbcc];
