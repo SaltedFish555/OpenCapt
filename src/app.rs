@@ -3,7 +3,7 @@ use crate::{
     config::{AppConfig, AppPaths},
     hotkey::RegisteredHotkey,
     output,
-    overlay::{OverlaySession, OverlaySignal},
+    overlay::{OverlaySession, OverlaySignal, PinnedCapture},
     pin::PinWindow,
     tray::{TrayAction, TrayHandles},
 };
@@ -267,8 +267,8 @@ impl App {
                 self.finish_capture(image);
                 self.state = AppState::Idle;
             }
-            OverlaySignal::Pinned(image) => {
-                self.show_pin_window(image);
+            OverlaySignal::Pinned(capture) => {
+                self.show_pin_window(capture);
                 self.state = AppState::Idle;
             }
         }
@@ -280,13 +280,17 @@ impl App {
         }
     }
 
-    fn show_pin_window(&mut self, image: image::RgbaImage) {
+    fn show_pin_window(&mut self, capture: PinnedCapture) {
         self.pin_windows.retain(|window| window.is_alive());
-        let (cursor_x, cursor_y) = capture::current_cursor_position().unwrap_or((120, 120));
-        match PinWindow::show(image, cursor_x + 16, cursor_y + 16, self.config.save_dir.clone()) {
+        match PinWindow::show(
+            capture.image,
+            capture.screen_x,
+            capture.screen_y,
+            self.config.save_dir.clone(),
+        ) {
             Ok(window) => {
                 self.pin_windows.push(window);
-                info!(count = self.pin_windows.len(), "pin window opened");
+                info!(count = self.pin_windows.len(), x = capture.screen_x, y = capture.screen_y, "pin window opened");
             }
             Err(error) => {
                 error!(?error, "failed to open pin window");

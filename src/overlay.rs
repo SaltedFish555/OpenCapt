@@ -77,9 +77,16 @@ pub struct SelectionRect {
 }
 
 #[derive(Debug, Clone)]
+pub struct PinnedCapture {
+    pub image: RgbaImage,
+    pub screen_x: i32,
+    pub screen_y: i32,
+}
+
+#[derive(Debug, Clone)]
 pub enum OverlaySignal {
     Completed(RgbaImage),
-    Pinned(RgbaImage),
+    Pinned(PinnedCapture),
     Cancelled,
 }
 
@@ -1973,8 +1980,8 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
         0x50 => {
             if state.mode == OverlayMode::Annotating {
                 commit_text_input(state);
-                if let Some(image) = render_annotated_image(state) {
-                    finish_with_signal(hwnd, state, OverlaySignal::Pinned(image));
+                if let Some(capture) = render_pinned_capture(state) {
+                    finish_with_signal(hwnd, state, OverlaySignal::Pinned(capture));
                     return true;
                 }
             }
@@ -2070,8 +2077,8 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
         }
         ToolbarAction::Pin => {
             commit_text_input(state);
-            if let Some(image) = render_annotated_image(state) {
-                finish_with_signal(hwnd, state, OverlaySignal::Pinned(image));
+            if let Some(capture) = render_pinned_capture(state) {
+                finish_with_signal(hwnd, state, OverlaySignal::Pinned(capture));
                 return true;
             }
         }
@@ -2102,7 +2109,7 @@ fn finish_with_signal(hwnd: HWND, state: &mut OverlayState, signal: OverlaySigna
     (state.emitter)(signal);
 }
 
-fn render_annotated_image(state: &OverlayState) -> Option<RgbaImage> {
+fn render_annotated_capture(state: &OverlayState) -> Option<(SelectionRect, RgbaImage)> {
     let selection = state.selection_rect()?.to_selection_rect()?;
     let mut framebuffer = state.target.base_frame.clone();
     for shape in &state.shapes {
@@ -2114,16 +2121,28 @@ fn render_annotated_image(state: &OverlayState) -> Option<RgbaImage> {
         );
     }
     let composed = framebuffer_to_image(framebuffer, state.target.width, state.target.height);
-    Some(
-        imageops::crop_imm(
-            &composed,
-            selection.x.max(0) as u32,
-            selection.y.max(0) as u32,
-            selection.width,
-            selection.height,
-        )
-        .to_image(),
+    let image = imageops::crop_imm(
+        &composed,
+        selection.x.max(0) as u32,
+        selection.y.max(0) as u32,
+        selection.width,
+        selection.height,
     )
+    .to_image();
+    Some((selection, image))
+}
+
+fn render_annotated_image(state: &OverlayState) -> Option<RgbaImage> {
+    render_annotated_capture(state).map(|(_, image)| image)
+}
+
+fn render_pinned_capture(state: &OverlayState) -> Option<PinnedCapture> {
+    let (selection, image) = render_annotated_capture(state)?;
+    Some(PinnedCapture {
+        image,
+        screen_x: state.target.origin_x + selection.x,
+        screen_y: state.target.origin_y + selection.y,
+    })
 }
 
 fn register_overlay_class() -> Result<()> {
