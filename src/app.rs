@@ -280,6 +280,8 @@ impl App {
 
         match action {
             TrayAction::Capture => self.start_selection(),
+            TrayAction::CaptureWindow => self.capture_ui_element(capture::UiCaptureKind::Window),
+            TrayAction::CaptureControl => self.capture_ui_element(capture::UiCaptureKind::Control),
             TrayAction::OpenSettings => self.open_settings_window(),
             TrayAction::OpenSaveDir => {
                 if let Err(error) = open_directory(&self.config.general.save_dir) {
@@ -340,6 +342,24 @@ impl App {
             }
             Err(error) => {
                 error!(?error, "failed to activate overlay window");
+                self.state = AppState::Idle;
+            }
+        }
+    }
+
+    fn capture_ui_element(&mut self, kind: capture::UiCaptureKind) {
+        if self.state != AppState::Idle {
+            return;
+        }
+
+        self.state = AppState::Capturing;
+        match capture::capture_ui_element_under_cursor(kind) {
+            Ok(image) => {
+                info!(?kind, "captured ui element under cursor");
+                self.finish_capture(image);
+            }
+            Err(error) => {
+                error!(?error, ?kind, "failed to capture ui element under cursor");
                 self.state = AppState::Idle;
             }
         }
