@@ -16,12 +16,12 @@ pub struct CaptureResult {
 }
 
 pub fn process_capture(image: RgbaImage, config: &AppConfig) -> Result<CaptureResult> {
-    if config.auto_copy {
+    if config.general.auto_copy {
         copy_to_clipboard(&image)?;
     }
 
-    let saved_path = if config.auto_save {
-        Some(save_png(&image, &config.save_dir)?)
+    let saved_path = if config.general.auto_save {
+        Some(save_png(&image, &config.general.save_dir)?)
     } else {
         None
     };

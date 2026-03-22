@@ -1,4 +1,7 @@
-use crate::capture::CaptureTarget;
+use crate::{
+    capture::CaptureTarget,
+    config::{AnnotationDefaults, TextFontFamily},
+};
 use anyhow::{Result, anyhow};
 use image::{RgbaImage, imageops};
 use std::{
@@ -349,13 +352,6 @@ enum ResizableShapeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextFontFamily {
-    YaHei,
-    DengXian,
-    KaiTi,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextDropdownKind {
     FontFamily,
     FontSize,
@@ -482,7 +478,13 @@ impl OverlaySession {
         Ok(Self { hwnd, state })
     }
 
-    pub fn show(&mut self, target: CaptureTarget, cursor_x: i32, cursor_y: i32) -> Result<()> {
+    pub fn show(
+        &mut self,
+        target: CaptureTarget,
+        cursor_x: i32,
+        cursor_y: i32,
+        defaults: &AnnotationDefaults,
+    ) -> Result<()> {
         let hwnd = self.hwnd;
         let state = self.state_mut();
         state.target = target;
@@ -497,6 +499,7 @@ impl OverlaySession {
         state.reset_for_show(
             cursor_x - state.target.origin_x,
             cursor_y - state.target.origin_y,
+            defaults,
         );
 
         info!(
@@ -544,19 +547,23 @@ impl Drop for OverlaySession {
 }
 
 impl OverlayState {
-    fn reset_for_show(&mut self, cursor_x: i32, cursor_y: i32) {
+    fn reset_for_show(&mut self, cursor_x: i32, cursor_y: i32, defaults: &AnnotationDefaults) {
         self.mode = OverlayMode::Selecting;
         self.selection = None;
         self.tool = AnnotationTool::Mouse;
-        self.color_index = 4;
-        self.stroke_width = DEFAULT_STROKE_WIDTH;
-        self.text_size = DEFAULT_TEXT_SIZE;
-        self.number_size = DEFAULT_NUMBER_SIZE;
-        self.mosaic_size = DEFAULT_MOSAIC_SIZE;
-        self.text_bold = false;
-        self.text_italic = false;
-        self.text_background = false;
-        self.text_font_family = TextFontFamily::YaHei;
+        self.color_index = defaults
+            .default_color_index
+            .min(COLOR_PRESETS.len().saturating_sub(1));
+        self.stroke_width = defaults
+            .stroke_width
+            .clamp(MIN_STROKE_WIDTH, MAX_STROKE_WIDTH);
+        self.text_size = defaults.text_size.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
+        self.number_size = defaults.number_size.clamp(MIN_NUMBER_SIZE, MAX_NUMBER_SIZE);
+        self.mosaic_size = defaults.mosaic_size.clamp(MIN_MOSAIC_SIZE, MAX_MOSAIC_SIZE);
+        self.text_bold = defaults.text_bold;
+        self.text_italic = defaults.text_italic;
+        self.text_background = defaults.text_background;
+        self.text_font_family = defaults.text_font_family;
         self.open_text_dropdown = None;
         self.shapes.clear();
         self.draft = None;
@@ -1083,7 +1090,8 @@ impl OverlayState {
         let selection_center = selection.left + selection.width() / 2;
         let overall_width = primary_width.max(secondary_width);
         let mut x = selection_center - overall_width / 2;
-        let max_left = (self.target.width as i32 - overall_width - WINDOW_MARGIN).max(WINDOW_MARGIN);
+        let max_left =
+            (self.target.width as i32 - overall_width - WINDOW_MARGIN).max(WINDOW_MARGIN);
         x = x.clamp(WINDOW_MARGIN, max_left);
 
         let primary_panel = IntRect {
@@ -1184,7 +1192,11 @@ impl OverlayState {
 
     fn toolbar_action_at(&self, point: CursorPoint) -> Option<ToolbarAction> {
         if let Some(layout) = self.text_dropdown_layout() {
-            if let Some(item) = layout.items.into_iter().find(|item| item.rect.contains(point)) {
+            if let Some(item) = layout
+                .items
+                .into_iter()
+                .find(|item| item.rect.contains(point))
+            {
                 return Some(item.action);
             }
         }
@@ -1197,7 +1209,6 @@ impl OverlayState {
     }
 
     fn current_cursor(&self) -> CursorKind {
-
         if self.mode == OverlayMode::Selecting {
             return CursorKind::Crosshair;
         }
@@ -2638,18 +2649,20 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
             state.set_text_italic(!state.current_text_italic());
         }
         ToolbarAction::TextFontDropdown => {
-            state.open_text_dropdown = if state.open_text_dropdown == Some(TextDropdownKind::FontFamily) {
-                None
-            } else {
-                Some(TextDropdownKind::FontFamily)
-            };
+            state.open_text_dropdown =
+                if state.open_text_dropdown == Some(TextDropdownKind::FontFamily) {
+                    None
+                } else {
+                    Some(TextDropdownKind::FontFamily)
+                };
         }
         ToolbarAction::TextSizeDropdown => {
-            state.open_text_dropdown = if state.open_text_dropdown == Some(TextDropdownKind::FontSize) {
-                None
-            } else {
-                Some(TextDropdownKind::FontSize)
-            };
+            state.open_text_dropdown =
+                if state.open_text_dropdown == Some(TextDropdownKind::FontSize) {
+                    None
+                } else {
+                    Some(TextDropdownKind::FontSize)
+                };
         }
         ToolbarAction::TextFontOption(font_family) => {
             state.set_text_font_family(font_family);
@@ -2972,9 +2985,15 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
         ToolbarAction::TextBoldToggle => state.current_text_bold(),
         ToolbarAction::TextItalicToggle => state.current_text_italic(),
-        ToolbarAction::TextFontDropdown => state.open_text_dropdown == Some(TextDropdownKind::FontFamily),
-        ToolbarAction::TextSizeDropdown => state.open_text_dropdown == Some(TextDropdownKind::FontSize),
-        ToolbarAction::TextFontOption(font_family) => state.current_text_font_family() == font_family,
+        ToolbarAction::TextFontDropdown => {
+            state.open_text_dropdown == Some(TextDropdownKind::FontFamily)
+        }
+        ToolbarAction::TextSizeDropdown => {
+            state.open_text_dropdown == Some(TextDropdownKind::FontSize)
+        }
+        ToolbarAction::TextFontOption(font_family) => {
+            state.current_text_font_family() == font_family
+        }
         ToolbarAction::TextSizeOption(size) => current_text_size == size,
         ToolbarAction::NumberTool => state.tool == AnnotationTool::Number,
         ToolbarAction::Color(index) => state.color_index == index,
@@ -3573,7 +3592,10 @@ fn draw_dropdown_chevron(frame: &mut [u32], width: u32, height: u32, rect: IntRe
         frame,
         width,
         height,
-        CursorPoint { x: cx - 4, y: cy - 2 },
+        CursorPoint {
+            x: cx - 4,
+            y: cy - 2,
+        },
         CursorPoint { x: cx, y: cy + 2 },
         color,
         1,
@@ -3583,7 +3605,10 @@ fn draw_dropdown_chevron(frame: &mut [u32], width: u32, height: u32, rect: IntRe
         width,
         height,
         CursorPoint { x: cx, y: cy + 2 },
-        CursorPoint { x: cx + 4, y: cy - 2 },
+        CursorPoint {
+            x: cx + 4,
+            y: cy - 2,
+        },
         color,
         1,
     );
@@ -3628,7 +3653,15 @@ fn draw_text_size_dropdown_button(
         x: rect.left + (rect.width() - 14) / 2,
         y: (rect.top + rect.bottom) / 2,
     };
-    draw_gdi_text_centered(frame, width, height, text_center, &size.to_string(), 17, color);
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        text_center,
+        &size.to_string(),
+        17,
+        color,
+    );
     draw_dropdown_chevron(frame, width, height, rect, color);
 }
 
@@ -4202,7 +4235,6 @@ fn text_content_rect(box_rect: NormalizedRect) -> NormalizedRect {
     }
 }
 
-
 fn measure_text_width_styled(
     text: &str,
     style: ShapeStyle,
@@ -4212,11 +4244,11 @@ fn measure_text_width_styled(
 ) -> i32 {
     measure_text_layout_styled(text, style, bold, italic, font_family)
         .map(|metrics| metrics.max_width)
-        .unwrap_or_else(|| fallback_text_metrics_styled(text, style, bold, italic, font_family).max_width)
+        .unwrap_or_else(|| {
+            fallback_text_metrics_styled(text, style, bold, italic, font_family).max_width
+        })
         .max(1)
 }
-
-
 
 fn measure_wrapped_text_styled(
     text: &str,
@@ -4243,7 +4275,8 @@ fn measure_wrapped_text_styled(
             let mut candidate = current.clone();
             candidate.push(ch);
             if !current.is_empty()
-                && measure_text_width_styled(&candidate, style, bold, italic, font_family) > max_width
+                && measure_text_width_styled(&candidate, style, bold, italic, font_family)
+                    > max_width
             {
                 wrapped.push(current);
                 current = ch.to_string();
@@ -4288,7 +4321,6 @@ fn measure_wrapped_text_styled(
     }
 }
 
-
 fn text_box_bounds_styled(
     box_rect: NormalizedRect,
     text: &str,
@@ -4298,7 +4330,8 @@ fn text_box_bounds_styled(
     font_family: TextFontFamily,
 ) -> NormalizedRect {
     let content = text_content_rect(box_rect);
-    let layout = measure_wrapped_text_styled(text, style, content.width(), bold, italic, font_family);
+    let layout =
+        measure_wrapped_text_styled(text, style, content.width(), bold, italic, font_family);
     let content_height = layout.metrics.total_height.max(1);
     let target_height = (content_height + TEXT_BOX_PADDING_Y * 2).max(box_rect.height());
     NormalizedRect {
@@ -4308,7 +4341,6 @@ fn text_box_bounds_styled(
         bottom: box_rect.top + target_height,
     }
 }
-
 
 fn clamp_text_box_to_bounds_styled(
     box_rect: NormalizedRect,
@@ -4784,7 +4816,8 @@ fn draw_text_box_shape(
 ) {
     let bounds = text_box_bounds_styled(box_rect, text, style, bold, italic, font_family);
     let content = text_content_rect(bounds);
-    let layout = measure_wrapped_text_styled(text, style, content.width(), bold, italic, font_family);
+    let layout =
+        measure_wrapped_text_styled(text, style, content.width(), bold, italic, font_family);
 
     if show_caret {
         let panel = IntRect {
@@ -4986,8 +5019,8 @@ fn draw_text_shape(
     style: ShapeStyle,
     show_caret: bool,
 ) {
-    let metrics =
-        measure_text_layout(text, style, false).unwrap_or_else(|| fallback_text_metrics(text, style, false));
+    let metrics = measure_text_layout(text, style, false)
+        .unwrap_or_else(|| fallback_text_metrics(text, style, false));
     let bounds = NormalizedRect {
         left: anchor.x,
         top: anchor.y,
@@ -5621,4 +5654,3 @@ mod tests {
         assert_eq!(destination[3], opaque(source[3]));
     }
 }
-

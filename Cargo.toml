@@ -8,6 +8,7 @@ anyhow = "1.0"
 arboard = "3.6"
 chrono = { version = "0.4", features = ["clock"] }
 directories-next = "2.0"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"] }
 global-hotkey = "0.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1.0", features = ["derive"] }

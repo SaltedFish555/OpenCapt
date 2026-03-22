@@ -6,6 +6,7 @@ mod logging;
 mod output;
 mod overlay;
 mod pin;
+mod settings;
 mod tray;
 
 use anyhow::Result;
@@ -17,6 +18,7 @@ pub enum StartupMode {
     Run,
     CaptureTest,
     OverlayTest,
+    Settings,
 }
 
 fn main() -> Result<()> {
@@ -33,6 +35,7 @@ fn main() -> Result<()> {
             info!(path = ?result.saved_path, "capture-test completed");
             Ok(())
         }
+        StartupMode::Settings => settings::run(config, paths),
         StartupMode::Run | StartupMode::OverlayTest => {
             app::run(config, paths, startup_mode);
         }
@@ -44,7 +47,7 @@ fn parse_startup_mode(mut args: impl Iterator<Item = String>) -> Result<StartupM
     Ok(match args.next().as_deref() {
         Some("capture-test") => StartupMode::CaptureTest,
         Some("overlay-test") => StartupMode::OverlayTest,
+        Some("settings") => StartupMode::Settings,
         _ => StartupMode::Run,
     })
 }
-

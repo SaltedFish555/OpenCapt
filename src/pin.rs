@@ -1,4 +1,4 @@
-use crate::output;
+use crate::{config::PinDefaults, output};
 use anyhow::{Result, anyhow};
 use image::{RgbaImage, imageops::FilterType};
 use std::{mem::size_of, path::PathBuf, ptr::null_mut, sync::OnceLock};
@@ -96,7 +96,13 @@ struct PinLayout {
 }
 
 impl PinWindow {
-    pub fn show(image: RgbaImage, x: i32, y: i32, save_dir: PathBuf) -> Result<Self> {
+    pub fn show(
+        image: RgbaImage,
+        x: i32,
+        y: i32,
+        save_dir: PathBuf,
+        defaults: &PinDefaults,
+    ) -> Result<Self> {
         register_pin_class()?;
         let state = Box::new(PinState {
             original: image,
@@ -105,9 +111,9 @@ impl PinWindow {
             scale: 1.0,
             image_x: x,
             image_y: y,
-            always_on_top: true,
-            show_decoration: true,
-            opacity_percent: 100,
+            always_on_top: defaults.always_on_top,
+            show_decoration: defaults.show_decoration,
+            opacity_percent: defaults.opacity_percent,
             dragging: None,
         });
         let layout = layout_for_state(&state);
@@ -412,25 +418,25 @@ fn show_context_menu(hwnd: HWND, state: &mut PinState, cursor: POINT) {
             menu,
             opacity_100_flags,
             CMD_OPACITY_100 as usize,
-            w!("透明度 100%"),
+            w!("不透明度 100%"),
         );
         let _ = AppendMenuW(
             menu,
             opacity_80_flags,
             CMD_OPACITY_80 as usize,
-            w!("透明度 80%"),
+            w!("不透明度 80%"),
         );
         let _ = AppendMenuW(
             menu,
             opacity_60_flags,
             CMD_OPACITY_60 as usize,
-            w!("透明度 60%"),
+            w!("不透明度 60%"),
         );
         let _ = AppendMenuW(
             menu,
             opacity_40_flags,
             CMD_OPACITY_40 as usize,
-            w!("透明度 40%"),
+            w!("不透明度 40%"),
         );
         let _ = AppendMenuW(menu, MF_STRING, CMD_RESET_ZOOM as usize, w!("重置缩放"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);

@@ -5,10 +5,17 @@ use crate::{
     output,
     overlay::{OverlaySession, OverlaySignal, PinnedCapture},
     pin::PinWindow,
+    settings,
     tray::{TrayAction, TrayHandles},
 };
 use global_hotkey::GlobalHotKeyEvent;
-use std::process::Command;
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    thread,
+    time::{Duration, SystemTime},
+};
 use tao::{
     event::{Event, StartCause},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
@@ -30,6 +37,13 @@ pub(crate) enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     TrayMenu(MenuEvent),
     Overlay(OverlaySignal),
+    ConfigFileChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 pub fn run(config: AppConfig, paths: AppPaths, startup_mode: StartupMode) -> ! {
@@ -59,6 +73,7 @@ fn install_event_forwarders(proxy: EventLoopProxy<UserEvent>) {
 
 struct App {
     config: AppConfig,
+    config_file_stamp: Option<ConfigFileStamp>,
     paths: AppPaths,
     state: AppState,
     startup_mode: StartupMode,
@@ -79,6 +94,7 @@ impl App {
     ) -> Self {
         Self {
             config,
+            config_file_stamp: config_file_stamp(&paths.config_file),
             paths,
             state: AppState::Idle,
             startup_mode: startup_mode.clone(),
@@ -105,6 +121,7 @@ impl App {
                 self.handle_tray_menu_event(control_flow, event)
             }
             Event::UserEvent(UserEvent::Overlay(signal)) => self.handle_overlay_signal(signal),
+            Event::UserEvent(UserEvent::ConfigFileChanged) => self.reload_config_from_disk(),
             Event::LoopDestroyed => self.state = AppState::Exiting,
             _ => {}
         }
@@ -128,19 +145,89 @@ impl App {
             Err(error) => error!(?error, "failed to create tray"),
         }
 
-        match RegisteredHotkey::register(&self.config.hotkey) {
+        match RegisteredHotkey::register(&self.config.general.hotkey) {
             Ok(hotkey) => {
                 info!(hotkey = ?hotkey.hotkey(), "registered global hotkey");
                 self.hotkey = Some(hotkey);
             }
             Err(error) => error!(
                 ?error,
-                hotkey = self.config.hotkey,
+                hotkey = self.config.general.hotkey,
                 "failed to register hotkey"
             ),
         }
 
+        self.spawn_config_watcher();
         self.prewarm_overlay();
+    }
+
+    fn spawn_config_watcher(&self) {
+        let proxy = self.event_proxy.clone();
+        let config_path = self.paths.config_file.clone();
+        thread::spawn(move || {
+            let mut last_stamp = config_file_stamp(&config_path);
+            loop {
+                thread::sleep(Duration::from_millis(600));
+                let next_stamp = config_file_stamp(&config_path);
+                if next_stamp != last_stamp {
+                    last_stamp = next_stamp;
+                    let _ = proxy.send_event(UserEvent::ConfigFileChanged);
+                }
+            }
+        });
+    }
+
+    fn reload_config_from_disk(&mut self) {
+        let next_stamp = config_file_stamp(&self.paths.config_file);
+        if self.config_file_stamp == next_stamp {
+            return;
+        }
+        self.config_file_stamp = next_stamp;
+
+        let previous = self.config.clone();
+        let next = match crate::config::load_from_path(&self.paths.config_file) {
+            Ok(config) => config,
+            Err(error) => {
+                warn!(?error, path = ?self.paths.config_file, "failed to reload config from disk");
+                return;
+            }
+        };
+
+        if let Err(error) = self.apply_runtime_config(next.clone()) {
+            warn!(
+                ?error,
+                "failed to apply reloaded config; restoring previous config"
+            );
+            if let Err(write_error) =
+                crate::config::write_config(&self.paths.config_file, &previous)
+            {
+                warn!(
+                    ?write_error,
+                    "failed to restore previous config after reload error"
+                );
+            }
+            self.config_file_stamp = config_file_stamp(&self.paths.config_file);
+            return;
+        }
+
+        info!("configuration reloaded");
+    }
+
+    fn apply_runtime_config(&mut self, next: AppConfig) -> anyhow::Result<()> {
+        fs::create_dir_all(&next.general.save_dir)?;
+        if self.config.general.hotkey != next.general.hotkey {
+            let replacement = RegisteredHotkey::register(&next.general.hotkey)?;
+            self.hotkey = Some(replacement);
+            info!(hotkey = next.general.hotkey, "re-registered global hotkey");
+        }
+        self.config = next;
+        Ok(())
+    }
+
+    fn open_settings_window(&self) {
+        if let Err(error) = settings::open_or_focus() {
+            warn!(?error, "failed to open settings window");
+        }
     }
 
     fn prewarm_overlay(&mut self) {
@@ -193,8 +280,9 @@ impl App {
 
         match action {
             TrayAction::Capture => self.start_selection(),
+            TrayAction::OpenSettings => self.open_settings_window(),
             TrayAction::OpenSaveDir => {
-                if let Err(error) = open_directory(&self.config.save_dir) {
+                if let Err(error) = open_directory(&self.config.general.save_dir) {
                     warn!(?error, "failed to open save directory");
                 }
             }
@@ -245,7 +333,7 @@ impl App {
             return;
         };
 
-        match overlay.show(target, cursor_x, cursor_y) {
+        match overlay.show(target, cursor_x, cursor_y, &self.config.annotation_defaults) {
             Ok(()) => {
                 self.state = AppState::Selecting;
                 info!(startup = ?self.startup_mode, "overlay opened");
@@ -286,11 +374,17 @@ impl App {
             capture.image,
             capture.screen_x,
             capture.screen_y,
-            self.config.save_dir.clone(),
+            self.config.general.save_dir.clone(),
+            &self.config.pin_defaults,
         ) {
             Ok(window) => {
                 self.pin_windows.push(window);
-                info!(count = self.pin_windows.len(), x = capture.screen_x, y = capture.screen_y, "pin window opened");
+                info!(
+                    count = self.pin_windows.len(),
+                    x = capture.screen_x,
+                    y = capture.screen_y,
+                    "pin window opened"
+                );
             }
             Err(error) => {
                 error!(?error, "failed to open pin window");
@@ -319,10 +413,18 @@ impl App {
     }
 }
 
-fn open_directory(path: &std::path::Path) -> anyhow::Result<()> {
+fn open_directory(path: &Path) -> anyhow::Result<()> {
     Command::new("explorer.exe")
         .arg(path)
         .spawn()
         .map(|_| ())
         .map_err(Into::into)
+}
+
+fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(ConfigFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
