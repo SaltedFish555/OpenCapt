@@ -50,6 +50,9 @@ const DEFAULT_STROKE_WIDTH: u32 = 2;
 const MIN_TEXT_SIZE: u32 = 14;
 const MAX_TEXT_SIZE: u32 = 54;
 const DEFAULT_TEXT_SIZE: u32 = 24;
+const MIN_NUMBER_SIZE: u32 = 18;
+const MAX_NUMBER_SIZE: u32 = 52;
+const DEFAULT_NUMBER_SIZE: u32 = 28;
 const MIN_MOSAIC_SIZE: u32 = 6;
 const MAX_MOSAIC_SIZE: u32 = 30;
 const DEFAULT_MOSAIC_SIZE: u32 = 12;
@@ -132,6 +135,7 @@ enum AnnotationTool {
     Arrow,
     Mosaic,
     Text,
+    Number,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +208,11 @@ enum AnnotationShape {
         text: String,
         style: ShapeStyle,
     },
+    Number {
+        center: CursorPoint,
+        value: u32,
+        style: ShapeStyle,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +282,7 @@ enum ToolbarAction {
     ArrowTool,
     MosaicTool,
     TextTool,
+    NumberTool,
     Color(usize),
     StyleControl,
     Undo,
@@ -313,6 +323,7 @@ enum StyleControlTarget {
     Stroke,
     Mosaic,
     Text,
+    Badge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +360,7 @@ struct OverlayState {
     color_index: usize,
     stroke_width: u32,
     text_size: u32,
+    number_size: u32,
     mosaic_size: u32,
     shapes: Vec<AnnotationShape>,
     draft: Option<DraftShape>,
@@ -356,6 +368,7 @@ struct OverlayState {
     selected_shape: Option<usize>,
     active_drag: Option<ActiveDrag>,
     last_cursor: CursorPoint,
+    next_number: u32,
 }
 
 struct LayeredSurface {
@@ -396,6 +409,7 @@ impl OverlaySession {
             color_index: 4,
             stroke_width: DEFAULT_STROKE_WIDTH,
             text_size: DEFAULT_TEXT_SIZE,
+            number_size: DEFAULT_NUMBER_SIZE,
             mosaic_size: DEFAULT_MOSAIC_SIZE,
             shapes: Vec::new(),
             draft: None,
@@ -403,6 +417,7 @@ impl OverlaySession {
             selected_shape: None,
             active_drag: None,
             last_cursor: CursorPoint { x: 0, y: 0 },
+            next_number: 1,
         });
         let state_ptr = &mut *state as *mut OverlayState;
         let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.map_err(windows_error)?.0);
@@ -498,6 +513,7 @@ impl OverlayState {
         self.color_index = 4;
         self.stroke_width = DEFAULT_STROKE_WIDTH;
         self.text_size = DEFAULT_TEXT_SIZE;
+        self.number_size = DEFAULT_NUMBER_SIZE;
         self.mosaic_size = DEFAULT_MOSAIC_SIZE;
         self.shapes.clear();
         self.draft = None;
@@ -512,6 +528,20 @@ impl OverlayState {
             self.target.width.saturating_sub(1) as i32,
             self.target.height.saturating_sub(1) as i32,
         );
+        self.next_number = 1;
+    }
+
+    fn renumber_next_value(&mut self) {
+        self.next_number = self
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                AnnotationShape::Number { value, .. } => Some(*value),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
     }
 
     fn rebuild_base_frames(&mut self) {
@@ -556,6 +586,7 @@ impl OverlayState {
         match shape {
             AnnotationShape::Mosaic { .. } => StyleControlTarget::Mosaic,
             AnnotationShape::Text { .. } => StyleControlTarget::Text,
+            AnnotationShape::Number { .. } => StyleControlTarget::Badge,
             _ => StyleControlTarget::Stroke,
         }
     }
@@ -563,6 +594,9 @@ impl OverlayState {
     fn style_control_target(&self) -> StyleControlTarget {
         if self.text_input.is_some() || self.tool == AnnotationTool::Text {
             return StyleControlTarget::Text;
+        }
+        if self.tool == AnnotationTool::Number {
+            return StyleControlTarget::Badge;
         }
         if self.tool == AnnotationTool::Mosaic {
             return StyleControlTarget::Mosaic;
@@ -582,6 +616,7 @@ impl OverlayState {
             StyleControlTarget::Stroke => self.stroke_width,
             StyleControlTarget::Mosaic => self.mosaic_size,
             StyleControlTarget::Text => self.text_size,
+            StyleControlTarget::Badge => self.number_size,
         }
     }
 
@@ -590,6 +625,7 @@ impl OverlayState {
             StyleControlTarget::Stroke => (MIN_STROKE_WIDTH, MAX_STROKE_WIDTH),
             StyleControlTarget::Mosaic => (MIN_MOSAIC_SIZE, MAX_MOSAIC_SIZE),
             StyleControlTarget::Text => (MIN_TEXT_SIZE, MAX_TEXT_SIZE),
+            StyleControlTarget::Badge => (MIN_NUMBER_SIZE, MAX_NUMBER_SIZE),
         }
     }
 
@@ -601,6 +637,7 @@ impl OverlayState {
             StyleControlTarget::Stroke => self.stroke_width = value,
             StyleControlTarget::Mosaic => self.mosaic_size = value,
             StyleControlTarget::Text => self.text_size = value,
+            StyleControlTarget::Badge => self.number_size = value,
         }
 
         if let Some(draft) = self.text_input.as_mut() {
@@ -639,6 +676,9 @@ impl OverlayState {
                                 *box_rect =
                                     clamp_text_box_to_bounds(*box_rect, text, *style, selection);
                             }
+                        }
+                        AnnotationShape::Number { style, .. } => {
+                            style.stroke = value;
                         }
                     }
                     self.composed_dirty = true;
@@ -695,6 +735,7 @@ impl OverlayState {
             AnnotationTool::Arrow => matches!(shape, AnnotationShape::Arrow { .. }),
             AnnotationTool::Mosaic => matches!(shape, AnnotationShape::Mosaic { .. }),
             AnnotationTool::Text => matches!(shape, AnnotationShape::Text { .. }),
+            AnnotationTool::Number => matches!(shape, AnnotationShape::Number { .. }),
         }
     }
 
@@ -779,7 +820,8 @@ impl OverlayState {
             )),
             AnnotationShape::Line { .. }
             | AnnotationShape::Arrow { .. }
-            | AnnotationShape::Text { .. } => None,
+            | AnnotationShape::Text { .. }
+            | AnnotationShape::Number { .. } => None,
         }
     }
 
@@ -843,6 +885,7 @@ impl OverlayState {
             (ToolbarAction::ArrowTool, TOOLBAR_BUTTON),
             (ToolbarAction::MosaicTool, TOOLBAR_BUTTON),
             (ToolbarAction::TextTool, TOOLBAR_BUTTON),
+            (ToolbarAction::NumberTool, TOOLBAR_BUTTON),
             (ToolbarAction::Color(0), TOOLBAR_COLOR),
             (ToolbarAction::Color(1), TOOLBAR_COLOR),
             (ToolbarAction::Color(2), TOOLBAR_COLOR),
@@ -1068,7 +1111,10 @@ impl NormalizedRect {
 impl DraftShape {
     fn to_shape(self) -> Option<AnnotationShape> {
         match self.tool {
-            AnnotationTool::Mouse | AnnotationTool::Select | AnnotationTool::Text => None,
+            AnnotationTool::Mouse
+            | AnnotationTool::Select
+            | AnnotationTool::Text
+            | AnnotationTool::Number => None,
             AnnotationTool::Rectangle => {
                 let rect = NormalizedRect::from_points(self.start, self.current)?;
                 if rect.width() < MIN_SELECTION_SPAN || rect.height() < MIN_SELECTION_SPAN {
@@ -1159,6 +1205,7 @@ impl AnnotationShape {
                 text,
                 style,
             } => text_box_bounds(*box_rect, text, *style),
+            AnnotationShape::Number { center, style, .. } => number_badge_bounds(*center, *style),
         }
     }
 
@@ -1233,6 +1280,18 @@ impl AnnotationShape {
                 text: text.clone(),
                 style: *style,
             },
+            AnnotationShape::Number {
+                center,
+                value,
+                style,
+            } => AnnotationShape::Number {
+                center: CursorPoint {
+                    x: center.x + dx,
+                    y: center.y + dy,
+                },
+                value: *value,
+                style: *style,
+            },
         }
     }
 
@@ -1300,6 +1359,12 @@ impl AnnotationShape {
             } => text_box_bounds(*box_rect, text, *style)
                 .expanded(if selected { 6 } else { 4 })
                 .contains(point),
+            AnnotationShape::Number { center, style, .. } => {
+                let radius = number_badge_radius(*style) + if selected { 8 } else { 5 };
+                let dx = point.x - center.x;
+                let dy = point.y - center.y;
+                dx * dx + dy * dy <= radius * radius
+            }
         }
     }
 }
@@ -1868,6 +1933,18 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
                 return false;
             }
             state.selected_shape = None;
+            if state.tool == AnnotationTool::Number && state.point_in_selection(point) {
+                let new_index = state.shapes.len();
+                state.shapes.push(AnnotationShape::Number {
+                    center: state.clamp_point_to_selection(point),
+                    value: state.next_number,
+                    style: state.current_style(),
+                });
+                state.selected_shape = Some(new_index);
+                state.next_number = state.next_number.saturating_add(1);
+                state.composed_dirty = true;
+                return false;
+            }
             if state.tool == AnnotationTool::Select && state.point_in_selection(point) {
                 if let Some(selection) = state.selection {
                     state.active_drag = Some(ActiveDrag::MoveSelection {
@@ -2169,6 +2246,14 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
             }
             false
         }
+        0x4E => {
+            if state.mode == OverlayMode::Annotating {
+                commit_text_input(state);
+                state.tool = AnnotationTool::Number;
+                state.sync_selected_shape_with_tool();
+            }
+            false
+        }
         0x50 => {
             if state.mode == OverlayMode::Annotating {
                 commit_text_input(state);
@@ -2184,6 +2269,7 @@ fn handle_key_down(hwnd: HWND, state: &mut OverlayState, key: u32) -> bool {
                 if index < state.shapes.len() {
                     state.shapes.remove(index);
                     state.composed_dirty = true;
+                    state.renumber_next_value();
                 }
             }
             false
@@ -2242,6 +2328,10 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
             commit_text_input(state);
             state.tool = AnnotationTool::Text;
         }
+        ToolbarAction::NumberTool => {
+            commit_text_input(state);
+            state.tool = AnnotationTool::Number;
+        }
         ToolbarAction::Color(index) => {
             state.color_index = index.min(COLOR_PRESETS.len().saturating_sub(1));
             if let Some(draft) = state.text_input.as_mut() {
@@ -2258,6 +2348,7 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
             if !restored {
                 if state.shapes.pop().is_some() {
                     state.composed_dirty = true;
+                    state.renumber_next_value();
                 }
                 state.selected_shape = None;
             }
@@ -2527,6 +2618,7 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::ArrowTool => state.tool == AnnotationTool::Arrow,
         ToolbarAction::MosaicTool => state.tool == AnnotationTool::Mosaic,
         ToolbarAction::TextTool => state.tool == AnnotationTool::Text,
+        ToolbarAction::NumberTool => state.tool == AnnotationTool::Number,
         ToolbarAction::Color(index) => state.color_index == index,
         ToolbarAction::StyleControl => false,
         ToolbarAction::Pin => false,
@@ -2611,6 +2703,13 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             TOOLBAR_TEXT,
         ),
         ToolbarAction::TextTool => draw_text_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+        ),
+        ToolbarAction::NumberTool => draw_number_glyph(
             &mut state.frame,
             state.target.width,
             state.target.height,
@@ -3011,6 +3110,36 @@ fn draw_text_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, co
         draw_line(frame, width, height, start, end, color, 1);
     }
 }
+fn draw_number_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let start = map_icon_point(icon, 4.0, 4.0);
+    let end = map_icon_point(icon, 20.0, 20.0);
+    draw_ellipse_outline(
+        frame,
+        NormalizedRect {
+            left: start.x,
+            top: start.y,
+            right: end.x + 1,
+            bottom: end.y + 1,
+        },
+        width,
+        height,
+        1,
+        color,
+    );
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: (start.x + end.x) / 2,
+            y: (start.y + end.y) / 2,
+        },
+        "1",
+        ((end.y - start.y) / 2 + 5).max(10),
+        color,
+    );
+}
 fn draw_undo_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
     let arrow = [
@@ -3292,6 +3421,30 @@ fn draw_style_control(state: &mut OverlayState, rect: IntRect, hovered: bool) {
                 MAX_STROKE_WIDTH.min(8) as i32,
             );
         }
+        StyleControlTarget::Badge => {
+            draw_number_badge_preview(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                CursorPoint {
+                    x: rect.left + 14,
+                    y: cy,
+                },
+                MIN_NUMBER_SIZE,
+                TOOLBAR_TEXT,
+            );
+            draw_number_badge_preview(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                CursorPoint {
+                    x: rect.right - 14,
+                    y: cy,
+                },
+                MAX_NUMBER_SIZE.min(34),
+                TOOLBAR_TEXT,
+            );
+        }
     }
 
     draw_disc(
@@ -3362,6 +3515,9 @@ fn draw_shape_highlight(frame: &mut [u32], width: u32, height: u32, shape: &Anno
                 SELECTION_ACCENT,
             );
         }
+        AnnotationShape::Number { center, style, .. } => {
+            draw_number_outline(frame, width, height, *center, *style, SELECTION_ACCENT, 3);
+        }
     }
 }
 
@@ -3426,6 +3582,11 @@ fn draw_shape_image(frame: &mut [u32], width: u32, height: u32, shape: &Annotati
             text,
             style,
         } => draw_text_box_shape(frame, width, height, *box_rect, text, *style, false),
+        AnnotationShape::Number {
+            center,
+            value,
+            style,
+        } => draw_number_shape(frame, width, height, *center, *value, *style),
     }
 }
 
@@ -3724,6 +3885,219 @@ fn text_bounds(anchor: CursorPoint, text: &str, style: ShapeStyle) -> Normalized
 
 fn colorref_from_rgb(color: u32) -> COLORREF {
     COLORREF(((color >> 16) & 0xff) | (color & 0x00ff00) | ((color & 0xff) << 16))
+}
+
+fn number_badge_radius(style: ShapeStyle) -> i32 {
+    (style.stroke.clamp(MIN_NUMBER_SIZE, MAX_NUMBER_SIZE) as i32 / 2).max(9)
+}
+
+fn number_badge_bounds(center: CursorPoint, style: ShapeStyle) -> NormalizedRect {
+    let radius = number_badge_radius(style) + 2;
+    NormalizedRect {
+        left: center.x - radius,
+        top: center.y - radius,
+        right: center.x + radius + 1,
+        bottom: center.y + radius + 1,
+    }
+}
+
+fn number_badge_font_height(value: u32, style: ShapeStyle) -> i32 {
+    let digits = value.to_string().chars().count() as i32;
+    let radius = number_badge_radius(style);
+    match digits {
+        1 => (radius + 8).max(14),
+        2 => (radius + 3).max(13),
+        _ => radius.max(12),
+    }
+}
+
+fn contrast_ink(color: u32) -> u32 {
+    let red = ((color >> 16) & 0xff) as i32;
+    let green = ((color >> 8) & 0xff) as i32;
+    let blue = (color & 0xff) as i32;
+    let luminance = (red * 299 + green * 587 + blue * 114) / 1000;
+    if luminance >= 150 { 0x1B2230 } else { 0xFFFFFF }
+}
+
+fn draw_gdi_text_centered(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    center: CursorPoint,
+    text: &str,
+    font_height: i32,
+    color: u32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let hdc = unsafe { CreateCompatibleDC(None) };
+    if hdc.0.is_null() {
+        return;
+    }
+    let font: HFONT = unsafe {
+        CreateFontW(
+            -font_height.max(1),
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+            w!("Microsoft YaHei UI"),
+        )
+    };
+    if font.0.is_null() {
+        unsafe {
+            let _ = DeleteDC(hdc);
+        }
+        return;
+    }
+    let old_font = unsafe { SelectObject(hdc, font.into()) };
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE { cx: 0, cy: 0 };
+    let measured = unsafe { GetTextExtentPoint32W(hdc, &utf16, &mut size) }.as_bool();
+    if !measured {
+        unsafe {
+            let _ = SelectObject(hdc, old_font);
+            let _ = DeleteObject(font.into());
+            let _ = DeleteDC(hdc);
+        }
+        return;
+    }
+    let bitmap_width = size.cx.max(1);
+    let bitmap_height = size.cy.max(font_height.max(1));
+    let mut bitmap_info = BITMAPINFO::default();
+    bitmap_info.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: bitmap_width,
+        biHeight: -bitmap_height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    bitmap_info.bmiColors[0] = RGBQUAD::default();
+    let mut bits = null_mut();
+    let bitmap = match unsafe {
+        CreateDIBSection(Some(hdc), &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0)
+    } {
+        Ok(bitmap) => bitmap,
+        Err(_) => {
+            unsafe {
+                let _ = SelectObject(hdc, old_font);
+                let _ = DeleteObject(font.into());
+                let _ = DeleteDC(hdc);
+            }
+            return;
+        }
+    };
+    let old_bitmap = unsafe { SelectObject(hdc, bitmap.into()) };
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, colorref_from_rgb(color));
+        let _ = TextOutW(hdc, 0, ((bitmap_height - size.cy) / 2).max(0), &utf16);
+    }
+    let pixels = unsafe {
+        std::slice::from_raw_parts(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
+    };
+    let start_x = center.x - bitmap_width / 2;
+    let start_y = center.y - bitmap_height / 2;
+    for y in 0..bitmap_height {
+        for x in 0..bitmap_width {
+            let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
+            if pixel != 0 {
+                put_pixel(frame, width, height, start_x + x, start_y + y, pixel);
+            }
+        }
+    }
+    unsafe {
+        let _ = SelectObject(hdc, old_bitmap);
+        let _ = DeleteObject(bitmap.into());
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font.into());
+        let _ = DeleteDC(hdc);
+    }
+}
+
+fn draw_number_outline(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    center: CursorPoint,
+    style: ShapeStyle,
+    color: u32,
+    expand: i32,
+) {
+    let radius = number_badge_radius(style) + expand.max(0);
+    let rect = NormalizedRect {
+        left: center.x - radius,
+        top: center.y - radius,
+        right: center.x + radius + 1,
+        bottom: center.y + radius + 1,
+    };
+    draw_ellipse_outline(frame, rect, width, height, 2, color);
+}
+
+fn draw_number_shape(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    center: CursorPoint,
+    value: u32,
+    style: ShapeStyle,
+) {
+    let radius = number_badge_radius(style);
+    let border = contrast_ink(style.color);
+    draw_disc(frame, width, height, center.x, center.y, radius + 2, border);
+    draw_disc(
+        frame,
+        width,
+        height,
+        center.x,
+        center.y,
+        radius,
+        style.color,
+    );
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        center,
+        &value.to_string(),
+        number_badge_font_height(value, style),
+        contrast_ink(style.color),
+    );
+}
+
+fn draw_number_badge_preview(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    center: CursorPoint,
+    size: u32,
+    color: u32,
+) {
+    let style = ShapeStyle {
+        color,
+        stroke: size,
+    };
+    draw_number_outline(frame, width, height, center, style, color, 0);
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        center,
+        "1",
+        (number_badge_radius(style) + 4).max(12),
+        color,
+    );
 }
 
 fn draw_text_box_shape(
@@ -4357,7 +4731,7 @@ fn button_height(action: ToolbarAction) -> i32 {
 
 fn toolbar_gap_after(index: usize) -> i32 {
     match index {
-        7 | 12 | 13 | 14 => TOOLBAR_GROUP_GAP,
+        8 | 13 | 14 | 15 => TOOLBAR_GROUP_GAP,
         _ => TOOLBAR_ITEM_GAP,
     }
 }
