@@ -57,18 +57,18 @@ const DEFAULT_NUMBER_SIZE: u32 = 28;
 const MIN_MOSAIC_SIZE: u32 = 6;
 const MAX_MOSAIC_SIZE: u32 = 30;
 const DEFAULT_MOSAIC_SIZE: u32 = 12;
-const TOOLBAR_PADDING: i32 = 8;
-const TOOLBAR_GROUP_GAP: i32 = 8;
-const TOOLBAR_ITEM_GAP: i32 = 6;
-const TOOLBAR_BUTTON: i32 = 30;
-const TOOLBAR_COLOR: i32 = 22;
-const TOOLBAR_STYLE_WIDTH: i32 = 118;
-const TOOLBAR_STYLE_TRACK_HEIGHT: i32 = 4;
-const TOOLBAR_STYLE_KNOB_RADIUS: i32 = 7;
-const TOOLBAR_HEIGHT: i32 = 44;
-const TOOLBAR_PANEL_RADIUS: i32 = 12;
-const TOOLBAR_BUTTON_RADIUS: i32 = 10;
-const TOOLBAR_ICON_MARGIN: i32 = 5;
+const TOOLBAR_PADDING: i32 = 10;
+const TOOLBAR_GROUP_GAP: i32 = 10;
+const TOOLBAR_ITEM_GAP: i32 = 8;
+const TOOLBAR_BUTTON: i32 = 36;
+const TOOLBAR_COLOR: i32 = 26;
+const TOOLBAR_STYLE_WIDTH: i32 = 132;
+const TOOLBAR_STYLE_TRACK_HEIGHT: i32 = 5;
+const TOOLBAR_STYLE_KNOB_RADIUS: i32 = 8;
+const TOOLBAR_HEIGHT: i32 = 52;
+const TOOLBAR_PANEL_RADIUS: i32 = 14;
+const TOOLBAR_BUTTON_RADIUS: i32 = 12;
+const TOOLBAR_ICON_MARGIN: i32 = 4;
 const TOOLBAR_MARGIN: i32 = 18;
 const WINDOW_MARGIN: i32 = 10;
 const HANDLE_SIZE: i32 = 7;
@@ -1056,8 +1056,8 @@ impl OverlayState {
             vec![
                 (ToolbarAction::TextBoldToggle, TOOLBAR_BUTTON),
                 (ToolbarAction::TextItalicToggle, TOOLBAR_BUTTON),
-                (ToolbarAction::TextFontDropdown, 118),
-                (ToolbarAction::TextSizeDropdown, 58),
+                (ToolbarAction::TextFontDropdown, 132),
+                (ToolbarAction::TextSizeDropdown, 68),
             ]
         } else {
             Vec::new()
@@ -1132,13 +1132,13 @@ impl OverlayState {
         let anchor = self.toolbar_item_rect(anchor_action)?;
         let items_defs: Vec<(ToolbarAction, i32)> = match kind {
             TextDropdownKind::FontFamily => vec![
-                (ToolbarAction::TextFontOption(TextFontFamily::YaHei), 118),
-                (ToolbarAction::TextFontOption(TextFontFamily::DengXian), 118),
-                (ToolbarAction::TextFontOption(TextFontFamily::KaiTi), 118),
+                (ToolbarAction::TextFontOption(TextFontFamily::YaHei), 132),
+                (ToolbarAction::TextFontOption(TextFontFamily::DengXian), 132),
+                (ToolbarAction::TextFontOption(TextFontFamily::KaiTi), 132),
             ],
             TextDropdownKind::FontSize => TEXT_SIZE_OPTIONS
                 .into_iter()
-                .map(|size| (ToolbarAction::TextSizeOption(size), 58))
+                .map(|size| (ToolbarAction::TextSizeOption(size), 68))
                 .collect(),
         };
         let panel_width = TOOLBAR_PADDING * 2
@@ -3515,30 +3515,55 @@ fn draw_text_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, co
     }
 }
 fn draw_text_bold_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
-    let center = CursorPoint {
-        x: (rect.left + rect.right) / 2,
-        y: (rect.top + rect.bottom) / 2,
-    };
-    draw_gdi_text_centered_weighted(frame, width, height, center, "B", 15, color, true);
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let left_top = map_icon_point(icon, 7.0, 4.0);
+    let left_bottom = map_icon_point(icon, 7.0, 20.0);
+    draw_line(frame, width, height, left_top, left_bottom, color, 1);
+
+    let upper = [
+        map_icon_point(icon, 7.0, 4.0),
+        map_icon_point(icon, 12.0, 4.0),
+        map_icon_point(icon, 14.5, 5.0),
+        map_icon_point(icon, 16.0, 8.0),
+        map_icon_point(icon, 14.5, 11.0),
+        map_icon_point(icon, 12.0, 12.0),
+        map_icon_point(icon, 7.0, 12.0),
+    ];
+    let lower = [
+        map_icon_point(icon, 7.0, 12.0),
+        map_icon_point(icon, 13.0, 12.0),
+        map_icon_point(icon, 15.5, 13.0),
+        map_icon_point(icon, 17.0, 16.0),
+        map_icon_point(icon, 15.5, 19.0),
+        map_icon_point(icon, 13.0, 20.0),
+        map_icon_point(icon, 7.0, 20.0),
+    ];
+    for segment in upper.windows(2) {
+        draw_line(frame, width, height, segment[0], segment[1], color, 1);
+    }
+    for segment in lower.windows(2) {
+        draw_line(frame, width, height, segment[0], segment[1], color, 1);
+    }
 }
 
 fn draw_text_italic_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
-    let center = CursorPoint {
-        x: (rect.left + rect.right) / 2,
-        y: (rect.top + rect.bottom) / 2,
-    };
-    draw_gdi_text_centered_styled(
-        frame,
-        width,
-        height,
-        center,
-        "I",
-        15,
-        color,
-        false,
-        true,
-        TextFontFamily::YaHei,
-    );
+    let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let segments = [
+        ((11.0, 4.0), (18.0, 4.0)),
+        ((14.5, 4.0), (9.5, 20.0)),
+        ((6.0, 20.0), (13.0, 20.0)),
+    ];
+    for ((x1, y1), (x2, y2)) in segments {
+        draw_line(
+            frame,
+            width,
+            height,
+            map_icon_point(icon, x1, y1),
+            map_icon_point(icon, x2, y2),
+            color,
+            1,
+        );
+    }
 }
 
 fn draw_dropdown_chevron(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
@@ -3582,7 +3607,7 @@ fn draw_text_font_dropdown_button(
         height,
         text_center,
         font_face_label(font_family),
-        17,
+        19,
         color,
         false,
         false,
@@ -3603,7 +3628,7 @@ fn draw_text_size_dropdown_button(
         x: rect.left + (rect.width() - 14) / 2,
         y: (rect.top + rect.bottom) / 2,
     };
-    draw_gdi_text_centered(frame, width, height, text_center, &size.to_string(), 13, color);
+    draw_gdi_text_centered(frame, width, height, text_center, &size.to_string(), 17, color);
     draw_dropdown_chevron(frame, width, height, rect, color);
 }
 
@@ -3624,7 +3649,7 @@ fn draw_text_font_option_label(
             y: (rect.top + rect.bottom) / 2,
         },
         font_face_label(font_family),
-        17,
+        19,
         color,
         false,
         false,
@@ -3649,7 +3674,7 @@ fn draw_text_size_option_label(
             y: (rect.top + rect.bottom) / 2,
         },
         &size.to_string(),
-        13,
+        17,
         color,
     );
 }
@@ -3714,51 +3739,26 @@ fn draw_undo_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, co
 }
 fn draw_pin_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
-    draw_line(
-        frame,
-        width,
-        height,
-        map_icon_point(icon, 7.0, 6.0),
-        map_icon_point(icon, 17.0, 6.0),
-        color,
-        1,
-    );
-    draw_line(
-        frame,
-        width,
-        height,
-        map_icon_point(icon, 7.0, 6.0),
-        map_icon_point(icon, 12.0, 11.0),
-        color,
-        1,
-    );
-    draw_line(
-        frame,
-        width,
-        height,
-        map_icon_point(icon, 17.0, 6.0),
-        map_icon_point(icon, 12.0, 11.0),
-        color,
-        1,
-    );
-    draw_line(
-        frame,
-        width,
-        height,
-        map_icon_point(icon, 12.0, 11.0),
-        map_icon_point(icon, 12.0, 19.0),
-        color,
-        1,
-    );
-    draw_line(
-        frame,
-        width,
-        height,
-        map_icon_point(icon, 12.0, 19.0),
-        map_icon_point(icon, 9.5, 22.0),
-        color,
-        1,
-    );
+    let segments = [
+        ((8.0, 4.0), (16.0, 4.0)),
+        ((10.0, 4.0), (7.0, 14.0)),
+        ((7.0, 14.0), (10.0, 14.0)),
+        ((10.0, 14.0), (12.0, 22.0)),
+        ((12.0, 22.0), (14.0, 14.0)),
+        ((14.0, 14.0), (17.0, 14.0)),
+        ((17.0, 14.0), (14.0, 4.0)),
+    ];
+    for ((x1, y1), (x2, y2)) in segments {
+        draw_line(
+            frame,
+            width,
+            height,
+            map_icon_point(icon, x1, y1),
+            map_icon_point(icon, x2, y2),
+            color,
+            1,
+        );
+    }
 }
 fn draw_confirm_glyph(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
     let icon = inset_rect(rect, TOOLBAR_ICON_MARGIN);
@@ -4560,30 +4560,6 @@ fn font_face_label(font_family: TextFontFamily) -> &'static str {
 
 fn font_weight(bold: bool) -> i32 {
     if bold { 700 } else { FW_NORMAL.0 as i32 }
-}
-
-fn draw_gdi_text_centered_weighted(
-    frame: &mut [u32],
-    width: u32,
-    height: u32,
-    center: CursorPoint,
-    text: &str,
-    font_height: i32,
-    color: u32,
-    bold: bool,
-) {
-    draw_gdi_text_centered_styled(
-        frame,
-        width,
-        height,
-        center,
-        text,
-        font_height,
-        color,
-        bold,
-        false,
-        TextFontFamily::YaHei,
-    );
 }
 
 fn draw_gdi_text_centered_styled(
@@ -5465,6 +5441,12 @@ fn overlay_state(hwnd: HWND) -> Option<&'static mut OverlayState> {
 fn button_height(action: ToolbarAction) -> i32 {
     match action {
         ToolbarAction::Color(_) | ToolbarAction::StyleControl => TOOLBAR_COLOR,
+        ToolbarAction::TextBoldToggle
+        | ToolbarAction::TextItalicToggle
+        | ToolbarAction::TextFontDropdown
+        | ToolbarAction::TextSizeDropdown
+        | ToolbarAction::TextFontOption(_)
+        | ToolbarAction::TextSizeOption(_) => TOOLBAR_BUTTON + 4,
         _ => TOOLBAR_BUTTON,
     }
 }
