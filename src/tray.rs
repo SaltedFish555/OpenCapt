@@ -7,6 +7,8 @@ use tray_icon::{
 pub struct TrayHandles {
     _tray_icon: TrayIcon,
     capture_id: MenuId,
+    capture_window_id: MenuId,
+    capture_control_id: MenuId,
     settings_id: MenuId,
     open_save_dir_id: MenuId,
     open_config_dir_id: MenuId,
@@ -16,6 +18,8 @@ pub struct TrayHandles {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     Capture,
+    CaptureWindow,
+    CaptureControl,
     OpenSettings,
     OpenSaveDir,
     OpenConfigDir,
@@ -26,6 +30,8 @@ impl TrayHandles {
     pub fn new() -> Result<Self> {
         let menu = Menu::new();
         let capture = MenuItem::new("截图", true, None);
+        let capture_window = MenuItem::new("窗口截图", true, None);
+        let capture_control = MenuItem::new("控件截图", true, None);
         let settings = MenuItem::new("设置", true, None);
         let open_save_dir = MenuItem::new("打开截图目录", true, None);
         let open_config_dir = MenuItem::new("打开配置目录", true, None);
@@ -33,6 +39,10 @@ impl TrayHandles {
 
         menu.append(&capture)
             .context("failed to add capture menu item")?;
+        menu.append(&capture_window)
+            .context("failed to add window capture menu item")?;
+        menu.append(&capture_control)
+            .context("failed to add control capture menu item")?;
         menu.append(&settings)
             .context("failed to add settings menu item")?;
         menu.append(&open_save_dir)
@@ -51,6 +61,8 @@ impl TrayHandles {
         Ok(Self {
             _tray_icon: tray_icon,
             capture_id: capture.id().clone(),
+            capture_window_id: capture_window.id().clone(),
+            capture_control_id: capture_control.id().clone(),
             settings_id: settings.id().clone(),
             open_save_dir_id: open_save_dir.id().clone(),
             open_config_dir_id: open_config_dir.id().clone(),
@@ -61,6 +73,12 @@ impl TrayHandles {
     pub fn resolve_action(&self, menu_id: &MenuId) -> Option<TrayAction> {
         if *menu_id == self.capture_id {
             return Some(TrayAction::Capture);
+        }
+        if *menu_id == self.capture_window_id {
+            return Some(TrayAction::CaptureWindow);
+        }
+        if *menu_id == self.capture_control_id {
+            return Some(TrayAction::CaptureControl);
         }
         if *menu_id == self.settings_id {
             return Some(TrayAction::OpenSettings);

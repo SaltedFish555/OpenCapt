@@ -1,5 +1,8 @@
 use crate::{
-    capture::CaptureTarget,
+    capture::{
+        CaptureTarget, UiSelectionCandidate, best_ui_selection_candidate_at_point,
+        collect_ui_selection_candidates, ui_automation_selection_for_point_ignoring,
+    },
     config::{AnnotationDefaults, OcrConfig, OcrProfile, TextFontFamily},
     ocr,
 };
@@ -12,6 +15,7 @@ use std::{
     mem::size_of,
     ptr::null_mut,
     sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tracing::{info, warn};
 use windows::{
@@ -80,6 +84,8 @@ const WINDOW_MARGIN: i32 = 10;
 const HANDLE_SIZE: i32 = 7;
 const HANDLE_HIT_RADIUS: i32 = 11;
 const MIN_SELECTION_SPAN: i32 = 8;
+const UI_SELECTION_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const UIA_PROBE_INTERVAL: Duration = Duration::from_millis(45);
 const SELECTION_ACCENT: u32 = 0x56_9C_FF;
 const TOOLBAR_FILL: u32 = 0x1B2230;
 const TOOLBAR_BORDER: u32 = 0x3A455C;
@@ -390,6 +396,12 @@ struct OverlayState {
     surface: LayeredSurface,
     mode: OverlayMode,
     selection: Option<NormalizedRect>,
+    hover_selection: Option<NormalizedRect>,
+    ui_selection_candidates: Vec<UiSelectionCandidate>,
+    last_ui_selection_refresh: Instant,
+    uia_hover_selection: Option<NormalizedRect>,
+    last_uia_probe: Instant,
+    last_uia_probe_point: CursorPoint,
     tool: AnnotationTool,
     color_index: usize,
     stroke_width: u32,
@@ -467,6 +479,12 @@ impl OverlaySession {
             surface,
             mode: OverlayMode::Selecting,
             selection: None,
+            hover_selection: None,
+            ui_selection_candidates: Vec::new(),
+            last_ui_selection_refresh: Instant::now(),
+            uia_hover_selection: None,
+            last_uia_probe: Instant::now(),
+            last_uia_probe_point: CursorPoint { x: 0, y: 0 },
             tool: AnnotationTool::Mouse,
             color_index: 4,
             stroke_width: DEFAULT_STROKE_WIDTH,
@@ -545,6 +563,8 @@ impl OverlaySession {
             defaults,
             ocr_config,
         );
+        state.refresh_ui_selection_candidates(hwnd);
+        state.update_hover_selection(hwnd, state.last_cursor);
 
         info!(
             viewport_x = state.target.origin_x,
@@ -600,6 +620,15 @@ impl OverlayState {
     ) {
         self.mode = OverlayMode::Selecting;
         self.selection = None;
+        self.hover_selection = None;
+        self.ui_selection_candidates.clear();
+        self.last_ui_selection_refresh = Instant::now()
+            .checked_sub(UI_SELECTION_REFRESH_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        self.uia_hover_selection = None;
+        self.last_uia_probe = Instant::now()
+            .checked_sub(UIA_PROBE_INTERVAL)
+            .unwrap_or_else(Instant::now);
         self.tool = AnnotationTool::Mouse;
         self.color_index = defaults
             .default_color_index
@@ -639,6 +668,7 @@ impl OverlayState {
             self.target.width.saturating_sub(1) as i32,
             self.target.height.saturating_sub(1) as i32,
         );
+        self.last_uia_probe_point = self.last_cursor;
         self.next_number = 1;
     }
 
@@ -1060,10 +1090,80 @@ impl OverlayState {
                 Some(ActiveDrag::Selecting { start, current }) => {
                     SelectionRect::from_points(start, current)
                 }
-                _ => None,
+                _ => self
+                    .hover_selection
+                    .and_then(NormalizedRect::to_selection_rect),
             },
             OverlayMode::Annotating => self.selection.and_then(NormalizedRect::to_selection_rect),
         }
+    }
+
+    fn refresh_ui_selection_candidates(&mut self, overlay_hwnd: HWND) {
+        self.ui_selection_candidates = collect_ui_selection_candidates(&self.target, overlay_hwnd);
+        self.last_ui_selection_refresh = Instant::now();
+    }
+
+    fn maybe_refresh_ui_selection_candidates(&mut self, overlay_hwnd: HWND) {
+        let now = Instant::now();
+        if self.ui_selection_candidates.is_empty()
+            || now.duration_since(self.last_ui_selection_refresh) >= UI_SELECTION_REFRESH_INTERVAL
+        {
+            self.refresh_ui_selection_candidates(overlay_hwnd);
+        }
+    }
+
+    fn maybe_refresh_uia_hover_selection(&mut self, overlay_hwnd: HWND, point: CursorPoint) {
+        let now = Instant::now();
+        let moved = point != self.last_uia_probe_point;
+        if !moved && now.duration_since(self.last_uia_probe) < UIA_PROBE_INTERVAL {
+            return;
+        }
+
+        self.last_uia_probe = now;
+        self.last_uia_probe_point = point;
+        let screen_x = self.target.origin_x + point.x;
+        let screen_y = self.target.origin_y + point.y;
+        self.uia_hover_selection = ui_automation_selection_for_point_ignoring(
+            &self.target,
+            screen_x,
+            screen_y,
+            overlay_hwnd,
+        )
+        .map(NormalizedRect::from_selection_rect)
+        .filter(|rect| {
+            rect.width() >= MIN_SELECTION_SPAN
+                && rect.height() >= MIN_SELECTION_SPAN
+                && rect.contains(point)
+        });
+    }
+
+    fn update_hover_selection(&mut self, overlay_hwnd: HWND, point: CursorPoint) {
+        if self.mode != OverlayMode::Selecting {
+            self.hover_selection = None;
+            return;
+        }
+
+        self.maybe_refresh_ui_selection_candidates(overlay_hwnd);
+        self.maybe_refresh_uia_hover_selection(overlay_hwnd, point);
+        let static_hover =
+            best_ui_selection_candidate_at_point(&self.ui_selection_candidates, point.x, point.y)
+                .map(|candidate| NormalizedRect::from_selection_rect(candidate.rect));
+        let uia_hover = self.uia_hover_selection.filter(|rect| rect.contains(point));
+
+        self.hover_selection = match (uia_hover, static_hover) {
+            (Some(uia_rect), Some(static_rect)) => {
+                let uia_area = uia_rect.area();
+                let static_area = static_rect.area();
+                if uia_area <= static_area {
+                    Some(uia_rect)
+                } else {
+                    Some(static_rect)
+                }
+            }
+            (Some(uia_rect), None) => Some(uia_rect),
+            (None, Some(static_rect)) => Some(static_rect),
+            (None, None) => None,
+        };
     }
 
     fn selection_rect(&self) -> Option<NormalizedRect> {
@@ -1532,6 +1632,11 @@ impl NormalizedRect {
     }
     fn height(self) -> i32 {
         self.bottom - self.top
+    }
+    fn area(self) -> u64 {
+        let width = self.width().max(0) as u64;
+        let height = self.height().max(0) as u64;
+        width * height
     }
     fn max_inclusive_x(self) -> i32 {
         self.right - 1
@@ -2149,7 +2254,7 @@ unsafe extern "system" fn overlay_wndproc(
                     state.target.height.saturating_sub(1) as i32,
                 );
                 state.last_cursor = point;
-                handle_mouse_move(state, point);
+                handle_mouse_move(hwnd, state, point);
                 let _ = render_overlay(hwnd, state);
                 update_overlay_cursor(state);
             }
@@ -2233,7 +2338,7 @@ unsafe extern "system" fn overlay_wndproc(
     }
 }
 
-fn handle_mouse_move(state: &mut OverlayState, point: CursorPoint) {
+fn handle_mouse_move(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) {
     match state.active_drag.as_ref() {
         Some(ActiveDrag::Selecting { start, .. }) => {
             state.active_drag = Some(ActiveDrag::Selecting {
@@ -2347,7 +2452,11 @@ fn handle_mouse_move(state: &mut OverlayState, point: CursorPoint) {
                 state.set_current_style_value(value);
             }
         }
-        None => {}
+        None => {
+            if state.mode == OverlayMode::Selecting {
+                state.update_hover_selection(hwnd, point);
+            }
+        }
     }
 }
 
@@ -2533,8 +2642,29 @@ fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> 
     match active_drag {
         ActiveDrag::Selecting { start, .. } => {
             if let Some(rect) = SelectionRect::from_points(start, point) {
+                let looks_like_click = rect.width < MIN_SELECTION_SPAN as u32
+                    || rect.height < MIN_SELECTION_SPAN as u32;
+                let selected_rect = if looks_like_click {
+                    state
+                        .hover_selection
+                        .and_then(NormalizedRect::to_selection_rect)
+                        .unwrap_or(rect)
+                } else {
+                    rect
+                };
                 state.mode = OverlayMode::Annotating;
-                state.selection = Some(NormalizedRect::from_selection_rect(rect));
+                state.selection = Some(NormalizedRect::from_selection_rect(selected_rect));
+                state.hover_selection = None;
+                state.tool = AnnotationTool::Mouse;
+                state.draft = None;
+                state.text_input = None;
+                state.selected_shape = None;
+                return false;
+            }
+            if let Some(hover) = state.hover_selection {
+                state.mode = OverlayMode::Annotating;
+                state.selection = Some(hover);
+                state.hover_selection = None;
                 state.tool = AnnotationTool::Mouse;
                 state.draft = None;
                 state.text_input = None;
