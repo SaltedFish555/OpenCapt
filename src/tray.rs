@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
+use image::ImageFormat;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuId, MenuItem},
 };
+
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tray.ico");
 
 pub struct TrayHandles {
     _tray_icon: TrayIcon,
@@ -97,25 +100,11 @@ impl TrayHandles {
 }
 
 fn build_icon() -> Result<Icon> {
-    let width = 32;
-    let height = 32;
-    let mut rgba = Vec::with_capacity(width * height * 4);
+    let image = image::load_from_memory_with_format(TRAY_ICON_BYTES, ImageFormat::Ico)
+        .context("failed to decode embedded tray icon")?;
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
 
-    for y in 0..height {
-        for x in 0..width {
-            let (r, g, b, a) = if x > 4 && x < 28 && y > 6 && y < 24 {
-                if x > 8 && x < 24 && y > 10 && y < 20 {
-                    (243, 247, 250, 255)
-                } else {
-                    (52, 131, 235, 255)
-                }
-            } else {
-                (0, 0, 0, 0)
-            };
-
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-
-    Icon::from_rgba(rgba, width as u32, height as u32).context("failed to construct tray icon")
+    Icon::from_rgba(rgba.into_raw(), width, height)
+        .context("failed to construct tray icon from embedded ico")
 }
