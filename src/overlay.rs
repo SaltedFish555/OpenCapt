@@ -4253,15 +4253,28 @@ fn draw_panel(frame: &mut [u32], width: u32, height: u32, rect: IntRect) {
     );
 }
 fn fill_rect(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u32) {
-    let sx = rect.left.max(0) as u32;
-    let sy = rect.top.max(0) as u32;
-    let ex = rect.right.min(width as i32).max(0) as u32;
-    let ey = rect.bottom.min(height as i32).max(0) as u32;
-    for row in sy..ey {
-        let off = row as usize * width as usize;
-        for col in sx..ex {
-            let idx = off + col as usize;
-            frame[idx] = alpha_blend(frame[idx], color);
+    let sx = rect.left.max(0) as usize;
+    let sy = rect.top.max(0) as usize;
+    let ex = rect.right.min(width as i32).max(0) as usize;
+    let ey = rect.bottom.min(height as i32).max(0) as usize;
+    let a = effective_alpha(color);
+    if a == 0 { return; }
+    let w = width as usize;
+    if a == 255 {
+        let c = color | 0xff00_0000;
+        for row in sy..ey {
+            let off = row * w;
+            for col in sx..ex {
+                frame[off + col] = c;
+            }
+        }
+    } else {
+        for row in sy..ey {
+            let off = row * w;
+            for col in sx..ex {
+                let idx = off + col;
+                frame[idx] = alpha_blend(frame[idx], color);
+            }
         }
     }
 }
@@ -4283,34 +4296,27 @@ fn rounded_rect_radius(rect: IntRect, radius: i32) -> i32 {
     radius.max(0).min(max_radius)
 }
 
-fn rounded_rect_contains(rect: IntRect, radius: i32, x: i32, y: i32) -> bool {
-    if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom {
-        return false;
-    }
-    let radius = rounded_rect_radius(rect, radius);
+
+fn rounded_rect_row_span(rect: IntRect, radius: i32, y: i32) -> (i32, i32) {
     if radius <= 0 {
-        return true;
+        return (rect.left, rect.right);
     }
-    let inner_left = rect.left + radius;
-    let inner_right = rect.right - radius - 1;
     let inner_top = rect.top + radius;
     let inner_bottom = rect.bottom - radius - 1;
-    if (x >= inner_left && x <= inner_right) || (y >= inner_top && y <= inner_bottom) {
-        return true;
+    if y >= inner_top && y <= inner_bottom {
+        return (rect.left, rect.right);
     }
-    let corner_x = if x < inner_left {
-        inner_left
-    } else {
-        inner_right
-    };
-    let corner_y = if y < inner_top {
-        inner_top
-    } else {
-        inner_bottom
-    };
-    let dx = x - corner_x;
+    let corner_y = if y < inner_top { inner_top } else { inner_bottom };
     let dy = y - corner_y;
-    dx * dx + dy * dy <= radius * radius
+    let r_sq = radius * radius;
+    let dy_sq = dy * dy;
+    if dy_sq > r_sq {
+        return (rect.right, rect.left);
+    }
+    let dx = ((r_sq - dy_sq) as f32).sqrt() as i32;
+    let inner_left = rect.left + radius;
+    let inner_right = rect.right - radius - 1;
+    (inner_left - dx, inner_right + dx + 1)
 }
 
 fn fill_rounded_rect(
@@ -4321,10 +4327,34 @@ fn fill_rounded_rect(
     radius: i32,
     color: u32,
 ) {
-    for y in rect.top..rect.bottom {
-        for x in rect.left..rect.right {
-            if rounded_rect_contains(rect, radius, x, y) {
-                put_pixel(frame, width, height, x, y, color);
+    let a = effective_alpha(color);
+    if a == 0 { return; }
+    let radius = rounded_rect_radius(rect, radius);
+    let sy = rect.top.max(0);
+    let ey = rect.bottom.min(height as i32);
+    let clip_left = 0i32;
+    let clip_right = width as i32;
+    let w = width as usize;
+    if a == 255 {
+        let c = color | 0xff00_0000;
+        for y in sy..ey {
+            let (rl, rr) = rounded_rect_row_span(rect, radius, y);
+            let xl = rl.max(clip_left) as usize;
+            let xr = rr.min(clip_right) as usize;
+            let off = y as usize * w;
+            for x in xl..xr {
+                frame[off + x] = c;
+            }
+        }
+    } else {
+        for y in sy..ey {
+            let (rl, rr) = rounded_rect_row_span(rect, radius, y);
+            let xl = rl.max(clip_left) as usize;
+            let xr = rr.min(clip_right) as usize;
+            let off = y as usize * w;
+            for x in xl..xr {
+                let idx = off + x;
+                frame[idx] = alpha_blend(frame[idx], color);
             }
         }
     }
@@ -4338,20 +4368,35 @@ fn stroke_rounded_rect(
     radius: i32,
     color: u32,
 ) {
-    if rounded_rect_radius(rect, radius) <= 0 {
+    let radius = rounded_rect_radius(rect, radius);
+    if radius <= 0 {
         stroke_rect(frame, width, height, rect, color);
         return;
     }
-    for y in rect.top..rect.bottom {
-        for x in rect.left..rect.right {
-            if !rounded_rect_contains(rect, radius, x, y) {
-                continue;
-            }
-            if !rounded_rect_contains(rect, radius, x - 1, y)
-                || !rounded_rect_contains(rect, radius, x + 1, y)
-                || !rounded_rect_contains(rect, radius, x, y - 1)
-                || !rounded_rect_contains(rect, radius, x, y + 1)
-            {
+    let sy = rect.top.max(0);
+    let ey = rect.bottom.min(height as i32);
+    let clip_left = 0i32;
+    let clip_right = width as i32;
+    for y in sy..ey {
+        let (rl, rr) = rounded_rect_row_span(rect, radius, y);
+        let (rl_above, rr_above) = if y > rect.top {
+            rounded_rect_row_span(rect, radius, y - 1)
+        } else {
+            (rr, rl)
+        };
+        let (rl_below, rr_below) = if y + 1 < rect.bottom {
+            rounded_rect_row_span(rect, radius, y + 1)
+        } else {
+            (rr, rl)
+        };
+        let xl = rl.max(clip_left);
+        let xr = rr.min(clip_right);
+        for x in xl..xr {
+            let is_border = x == rl || x == rr - 1
+                || y == rect.top || y == rect.bottom - 1
+                || x < rl_above || x >= rr_above
+                || x < rl_below || x >= rr_below;
+            if is_border {
                 put_pixel(frame, width, height, x, y, color);
             }
         }
@@ -6955,11 +7000,15 @@ fn opaque(pixel: u32) -> u32 {
     0xff00_0000 | pixel
 }
 
+#[inline(always)]
+fn effective_alpha(color: u32) -> u32 {
+    let a = (color >> 24) & 0xff;
+    if a == 0 && color > 0 { 255 } else { a }
+}
+
+#[inline(always)]
 fn alpha_blend(bg: u32, fg: u32) -> u32 {
-    let mut a = (fg >> 24) & 0xff;
-    if a == 0 && fg > 0 {
-        a = 255;
-    }
+    let a = effective_alpha(fg);
     if a == 255 {
         return fg | 0xff00_0000;
     }
