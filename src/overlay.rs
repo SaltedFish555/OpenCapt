@@ -81,8 +81,8 @@ const TOOLBAR_STYLE_WIDTH: i32 = 132;
 const TOOLBAR_STYLE_TRACK_HEIGHT: i32 = 5;
 const TOOLBAR_STYLE_KNOB_RADIUS: i32 = 8;
 const TOOLBAR_HEIGHT: i32 = 52;
-const TOOLBAR_PANEL_RADIUS: i32 = 14;
-const TOOLBAR_BUTTON_RADIUS: i32 = 12;
+const TOOLBAR_PANEL_RADIUS: i32 = 16;
+const TOOLBAR_BUTTON_RADIUS: i32 = 14;
 const TOOLBAR_ICON_MARGIN: i32 = 4;
 const TOOLBAR_SVG_ICON_SIZE: i32 = 22;
 const TOOLBAR_MARGIN: i32 = 18;
@@ -93,9 +93,9 @@ const MIN_SELECTION_SPAN: i32 = 8;
 const UI_SELECTION_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UIA_PROBE_INTERVAL: Duration = Duration::from_millis(45);
 const SELECTION_ACCENT: u32 = 0x56_9C_FF;
-const TOOLBAR_FILL: u32 = 0x1B2230;
-const TOOLBAR_BORDER: u32 = 0x3A455C;
-const TOOLBAR_ACTIVE: u32 = 0x3F78F2;
+const TOOLBAR_FILL: u32 = 0xA0_151A23;
+const TOOLBAR_BORDER: u32 = 0x40_FFFFFF;
+const TOOLBAR_ACTIVE: u32 = 0xFF_2A69F6;
 const TOOLBAR_TEXT: u32 = 0xEEF3FF;
 const TEXT_EDIT_PADDING_X: i32 = 6;
 const TEXT_EDIT_PADDING_Y: i32 = 4;
@@ -3555,14 +3555,8 @@ fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
                 state.target.width,
                 selection,
             );
-            draw_rect_outline(
-                &mut state.frame,
-                NormalizedRect::from_selection_rect(selection),
-                state.target.width,
-                state.target.height,
-                2,
-                SELECTION_ACCENT,
-            );
+            let norm_rect = NormalizedRect::from_selection_rect(selection);
+            draw_selection_frame(state, norm_rect);
         }
     }
     state.surface.update_pixels(&state.frame);
@@ -3655,26 +3649,55 @@ fn paint_dynamic_shapes(state: &mut OverlayState) {
     }
 }
 
-fn paint_selection(state: &mut OverlayState) {
-    let Some(selection) = state.selection else {
-        return;
-    };
+fn draw_selection_frame(state: &mut OverlayState, selection: NormalizedRect) {
+    draw_rect_outline(
+        &mut state.frame,
+        selection.expanded(1),
+        state.target.width,
+        state.target.height,
+        1,
+        0x60_000000,
+    );
     draw_rect_outline(
         &mut state.frame,
         selection,
         state.target.width,
         state.target.height,
-        2,
+        1,
+        0xFF_FFFFFF,
+    );
+    draw_rect_outline(
+        &mut state.frame,
+        selection.expanded(-1),
+        state.target.width,
+        state.target.height,
+        1,
         SELECTION_ACCENT,
     );
+}
+
+fn paint_selection(state: &mut OverlayState) {
+    let Some(selection) = state.selection else {
+        return;
+    };
+    draw_selection_frame(state, selection);
     for (_, center) in ResizeHandle::positions(selection) {
         draw_handle_square(
             &mut state.frame,
             state.target.width,
             state.target.height,
             center,
+            HANDLE_SIZE + 2,
+            0x60_000000,
+            0x00_000000,
+        );
+        draw_handle_square(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            center,
             HANDLE_SIZE,
-            pack_rgb(255, 255, 255),
+            0xFF_FFFFFF,
             SELECTION_ACCENT,
         );
     }
@@ -3883,9 +3906,9 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         _ => false,
     };
     let fill = if selected {
-        TOOLBAR_ACTIVE
+        0x80_2A69F6
     } else if hovered {
-        0x293244
+        0x1F_FFFFFF
     } else {
         TOOLBAR_FILL
     };
@@ -3897,6 +3920,16 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         TOOLBAR_BUTTON_RADIUS,
         fill,
     );
+    if selected {
+        stroke_rounded_rect(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_BUTTON_RADIUS,
+            0x80_FFFFFF,
+        );
+    }
     if let Some(icon_id) = toolbar_action_icon_id(item.action) {
         if paint_svg_toolbar_icon(state, item.rect, icon_id, TOOLBAR_TEXT) {
             return;
@@ -4227,7 +4260,8 @@ fn fill_rect(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u
     for row in sy..ey {
         let off = row as usize * width as usize;
         for col in sx..ex {
-            frame[off + col as usize] = opaque(color);
+            let idx = off + col as usize;
+            frame[idx] = alpha_blend(frame[idx], color);
         }
     }
 }
@@ -6920,6 +6954,25 @@ fn framebuffer_to_image(framebuffer: Vec<u32>, width: u32, height: u32) -> RgbaI
 fn opaque(pixel: u32) -> u32 {
     0xff00_0000 | pixel
 }
+
+fn alpha_blend(bg: u32, fg: u32) -> u32 {
+    let mut a = (fg >> 24) & 0xff;
+    if a == 0 && fg > 0 {
+        a = 255;
+    }
+    if a == 255 {
+        return fg | 0xff00_0000;
+    }
+    if a == 0 {
+        return bg;
+    }
+    let inv_a = 255 - a;
+    let r = (((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * inv_a) / 255;
+    let g = (((fg >> 8) & 0xff) * a + ((bg >> 8) & 0xff) * inv_a) / 255;
+    let b = ((fg & 0xff) * a + (bg & 0xff) * inv_a) / 255;
+    0xff00_0000 | (r << 16) | (g << 8) | b
+}
+
 fn dim_color(pixel: u32, brightness_percent: u32) -> u32 {
     let red = (pixel >> 16) & 0xff;
     let green = (pixel >> 8) & 0xff;
@@ -6934,7 +6987,8 @@ fn put_pixel(frame: &mut [u32], width: u32, height: u32, x: i32, y: i32, color: 
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
     }
-    frame[y as usize * width as usize + x as usize] = opaque(color);
+    let idx = y as usize * width as usize + x as usize;
+    frame[idx] = alpha_blend(frame[idx], color);
 }
 fn point_from_lparam(lparam: LPARAM) -> CursorPoint {
     let value = lparam.0 as i32;

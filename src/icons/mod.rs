@@ -58,7 +58,6 @@ pub struct RasterizedIcon {
     pub alpha: Vec<u8>,
 }
 
-const ICON_OVERSAMPLE: u32 = 4;
 
 #[derive(Debug, Default)]
 pub struct IconCache {
@@ -167,42 +166,19 @@ fn rasterize_svg_icon(id: IconId, size_px: u32) -> Result<RasterizedIcon> {
     let scale = size_px as f32 / svg_size.width().max(svg_size.height()).max(1.0);
     let target_width = (svg_size.width() * scale).round().max(1.0) as u32;
     let target_height = (svg_size.height() * scale).round().max(1.0) as u32;
-    let render_width = target_width * ICON_OVERSAMPLE;
-    let render_height = target_height * ICON_OVERSAMPLE;
-    let mut pixmap = tiny_skia::Pixmap::new(render_width, render_height)
+    let mut pixmap = tiny_skia::Pixmap::new(target_width, target_height)
         .ok_or_else(|| anyhow!("failed to allocate pixmap for icon {:?}", id))?;
-    let transform = tiny_skia::Transform::from_scale(
-        scale * ICON_OVERSAMPLE as f32,
-        scale * ICON_OVERSAMPLE as f32,
-    );
+    let transform = tiny_skia::Transform::from_scale(scale, scale);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    let alpha = downsample_alpha(pixmap.data(), target_width, target_height, ICON_OVERSAMPLE);
+    
+    // Extract the alpha channel directly (tiny_skia uses RGBA natively)
+    let alpha: Vec<u8> = pixmap.data().iter().skip(3).step_by(4).cloned().collect();
 
     Ok(RasterizedIcon {
         width: target_width,
         height: target_height,
         alpha,
     })
-}
-
-fn downsample_alpha(source: &[u8], target_width: u32, target_height: u32, factor: u32) -> Vec<u8> {
-    let mut alpha = Vec::with_capacity((target_width * target_height) as usize);
-    let source_width = target_width * factor;
-    for ty in 0..target_height {
-        for tx in 0..target_width {
-            let mut sum = 0u32;
-            for oy in 0..factor {
-                let sy = ty * factor + oy;
-                let row = sy as usize * source_width as usize;
-                for ox in 0..factor {
-                    let sx = tx * factor + ox;
-                    sum += source[(row + sx as usize) * 4 + 3] as u32;
-                }
-            }
-            alpha.push((sum / (factor * factor)) as u8);
-        }
-    }
-    alpha
 }
 
 fn icon_source_path(id: IconId) -> PathBuf {
@@ -280,6 +256,7 @@ fn scale_bucket(scale: f32) -> u16 {
 fn blend_rgb(background: u32, foreground: u32, alpha: u8) -> u32 {
     let alpha = alpha as u32;
     let inv_alpha = 255 - alpha;
+    let bg_a = background & 0xff00_0000;
     let bg_r = (background >> 16) & 0xff;
     let bg_g = (background >> 8) & 0xff;
     let bg_b = background & 0xff;
@@ -289,5 +266,5 @@ fn blend_rgb(background: u32, foreground: u32, alpha: u8) -> u32 {
     let red = (fg_r * alpha + bg_r * inv_alpha + 127) / 255;
     let green = (fg_g * alpha + bg_g * inv_alpha + 127) / 255;
     let blue = (fg_b * alpha + bg_b * inv_alpha + 127) / 255;
-    (red << 16) | (green << 8) | blue
+    bg_a | (red << 16) | (green << 8) | blue
 }
