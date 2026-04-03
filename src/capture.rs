@@ -19,6 +19,7 @@ pub struct CaptureTarget {
     pub origin_y: i32,
     pub width: u32,
     pub height: u32,
+    pub scale_factor: f32,
     pub background: RgbaImage,
     pub base_frame: Vec<u32>,
 }
@@ -450,6 +451,9 @@ fn create_target(monitor: Monitor) -> Result<CaptureTarget> {
     let origin_y = monitor.y().context("failed to read monitor y coordinate")?;
     let width = monitor.width().context("failed to read monitor width")?;
     let height = monitor.height().context("failed to read monitor height")?;
+    let scale_factor = monitor
+        .scale_factor()
+        .context("failed to read monitor scale factor")?;
     let background = monitor
         .capture_image()
         .context("failed to capture monitor background")?;
@@ -460,6 +464,7 @@ fn create_target(monitor: Monitor) -> Result<CaptureTarget> {
         origin_y,
         width,
         height,
+        scale_factor,
         background,
         base_frame,
     })

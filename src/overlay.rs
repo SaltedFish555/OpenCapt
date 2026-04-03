@@ -3,12 +3,17 @@ use crate::{
         CaptureTarget, UiSelectionCandidate, best_ui_selection_candidate_at_point,
         collect_ui_selection_candidates, ui_automation_selection_for_point_ignoring,
     },
-    config::{AnnotationDefaults, OcrConfig, OcrProfile, TextFontFamily},
-    ocr,
+    config::{
+        AnnotationDefaults, OcrConfig, OcrProfile, TextFontFamily, TranslationConfig,
+        TranslationProfile,
+    },
+    icons::{self, IconCache, IconId},
+    ocr, translation,
 };
 use anyhow::{Result, anyhow};
 use arboard::Clipboard;
 use image::{DynamicImage, ImageFormat, RgbaImage, imageops};
+use resvg::tiny_skia;
 use std::{
     ffi::c_void,
     io::Cursor,
@@ -22,12 +27,12 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
         Graphics::Gdi::{
-            AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-            CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
-            CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-            FF_DONTCARE, FW_NORMAL, GetTextExtentPoint32W, HBITMAP, HDC, HFONT, HGDIOBJ,
-            OUT_DEFAULT_PRECIS, RGBQUAD, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
-            TextOutW,
+            AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+            BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
+            CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
+            DeleteDC, DeleteObject, FF_DONTCARE, FONT_QUALITY, FW_NORMAL, GetTextExtentPoint32W,
+            HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, RGBQUAD, SelectObject, SetBkMode,
+            SetTextColor, TRANSPARENT, TextOutW,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -79,6 +84,7 @@ const TOOLBAR_HEIGHT: i32 = 52;
 const TOOLBAR_PANEL_RADIUS: i32 = 14;
 const TOOLBAR_BUTTON_RADIUS: i32 = 12;
 const TOOLBAR_ICON_MARGIN: i32 = 4;
+const TOOLBAR_SVG_ICON_SIZE: i32 = 22;
 const TOOLBAR_MARGIN: i32 = 18;
 const WINDOW_MARGIN: i32 = 10;
 const HANDLE_SIZE: i32 = 7;
@@ -102,6 +108,7 @@ const TEXT_BOX_MIN_WIDTH: i32 = 96;
 const TEXT_BOX_MIN_HEIGHT: i32 = 40;
 const TEXT_LAYOUT_BOTTOM_PADDING: i32 = 4;
 const WM_APP_OCR_READY: u32 = WM_APP + 1;
+const WM_APP_TRANSLATION_READY: u32 = WM_APP + 2;
 const OCR_BLOCK_BORDER: u32 = 0x36A3FF;
 const OCR_BLOCK_ACTIVE: u32 = 0xF6B10A;
 
@@ -308,6 +315,7 @@ enum ToolbarAction {
     TextTool,
     NumberTool,
     OcrRun,
+    TranslateRun,
     OcrProfileDropdown,
     OcrProfileOption(usize),
     OcrCopyAll,
@@ -402,6 +410,7 @@ struct OverlayState {
     uia_hover_selection: Option<NormalizedRect>,
     last_uia_probe: Instant,
     last_uia_probe_point: CursorPoint,
+    icon_cache: IconCache,
     tool: AnnotationTool,
     color_index: usize,
     stroke_width: u32,
@@ -416,12 +425,17 @@ struct OverlayState {
     open_ocr_profile_dropdown: bool,
     ocr_config: OcrConfig,
     ocr_profile_index: usize,
+    translation_config: TranslationConfig,
+    translation_profile_index: usize,
     ocr_blocks: Vec<OcrOverlayBlock>,
     ocr_full_text: String,
+    translated_full_text: String,
     ocr_selected_block: Option<usize>,
     ocr_running: bool,
+    translation_running: bool,
     ocr_status: Option<String>,
     ocr_worker: Arc<Mutex<Option<OcrWorkerResult>>>,
+    translation_worker: Arc<Mutex<Option<TranslationWorkerResult>>>,
     shapes: Vec<AnnotationShape>,
     draft: Option<DraftShape>,
     text_input: Option<TextDraft>,
@@ -433,13 +447,23 @@ struct OverlayState {
 
 #[derive(Debug, Clone)]
 struct OcrOverlayBlock {
-    text: String,
+    source_text: String,
+    translated_text: Option<String>,
     rect: NormalizedRect,
 }
 
 enum OcrWorkerResult {
     Success {
         output: ocr::OcrResult,
+        selection: NormalizedRect,
+    },
+    Failure(String),
+}
+
+enum TranslationWorkerResult {
+    Success {
+        output: ocr::OcrResult,
+        translated_blocks: Vec<String>,
         selection: NormalizedRect,
     },
     Failure(String),
@@ -485,6 +509,7 @@ impl OverlaySession {
             uia_hover_selection: None,
             last_uia_probe: Instant::now(),
             last_uia_probe_point: CursorPoint { x: 0, y: 0 },
+            icon_cache: IconCache::default(),
             tool: AnnotationTool::Mouse,
             color_index: 4,
             stroke_width: DEFAULT_STROKE_WIDTH,
@@ -499,12 +524,17 @@ impl OverlaySession {
             open_ocr_profile_dropdown: false,
             ocr_config: OcrConfig::default(),
             ocr_profile_index: 0,
+            translation_config: TranslationConfig::default(),
+            translation_profile_index: 0,
             ocr_blocks: Vec::new(),
             ocr_full_text: String::new(),
+            translated_full_text: String::new(),
             ocr_selected_block: None,
             ocr_running: false,
+            translation_running: false,
             ocr_status: None,
             ocr_worker: Arc::new(Mutex::new(None)),
+            translation_worker: Arc::new(Mutex::new(None)),
             shapes: Vec::new(),
             draft: None,
             text_input: None,
@@ -545,6 +575,7 @@ impl OverlaySession {
         cursor_y: i32,
         defaults: &AnnotationDefaults,
         ocr_config: &OcrConfig,
+        translation_config: &TranslationConfig,
     ) -> Result<()> {
         let hwnd = self.hwnd;
         let state = self.state_mut();
@@ -562,6 +593,7 @@ impl OverlaySession {
             cursor_y - state.target.origin_y,
             defaults,
             ocr_config,
+            translation_config,
         );
         state.refresh_ui_selection_candidates(hwnd);
         state.update_hover_selection(hwnd, state.last_cursor);
@@ -617,6 +649,7 @@ impl OverlayState {
         cursor_y: i32,
         defaults: &AnnotationDefaults,
         ocr_config: &OcrConfig,
+        translation_config: &TranslationConfig,
     ) {
         self.mode = OverlayMode::Selecting;
         self.selection = None;
@@ -647,12 +680,19 @@ impl OverlayState {
         self.open_ocr_profile_dropdown = false;
         self.ocr_config = ocr_config.clone();
         self.ocr_profile_index = self.default_ocr_profile_index();
+        self.translation_config = translation_config.clone();
+        self.translation_profile_index = self.default_translation_profile_index();
         self.ocr_blocks.clear();
         self.ocr_full_text.clear();
+        self.translated_full_text.clear();
         self.ocr_selected_block = None;
         self.ocr_running = false;
+        self.translation_running = false;
         self.ocr_status = None;
         if let Ok(mut worker) = self.ocr_worker.lock() {
+            *worker = None;
+        }
+        if let Ok(mut worker) = self.translation_worker.lock() {
             *worker = None;
         }
         self.shapes.clear();
@@ -1012,6 +1052,23 @@ impl OverlayState {
         self.ocr_config.profiles.get(self.ocr_profile_index)
     }
 
+    fn default_translation_profile_index(&self) -> usize {
+        if self.translation_config.profiles.is_empty() {
+            return 0;
+        }
+        self.translation_config
+            .profiles
+            .iter()
+            .position(|profile| profile.id == self.translation_config.default_profile_id)
+            .unwrap_or(0)
+    }
+
+    fn current_translation_profile(&self) -> Option<&TranslationProfile> {
+        self.translation_config
+            .profiles
+            .get(self.translation_profile_index)
+    }
+
     fn ocr_profile_name(&self) -> String {
         self.current_ocr_profile()
             .map(|profile| profile.display_name.clone())
@@ -1042,6 +1099,7 @@ impl OverlayState {
         match result {
             OcrWorkerResult::Success { output, selection } => {
                 self.ocr_full_text = output.full_text;
+                self.translated_full_text.clear();
                 self.ocr_blocks.clear();
                 let width = selection.width().max(1) as f32;
                 let height = selection.height().max(1) as f32;
@@ -1058,7 +1116,8 @@ impl OverlayState {
                         },
                     ) {
                         self.ocr_blocks.push(OcrOverlayBlock {
-                            text: block.text,
+                            source_text: block.text,
+                            translated_text: None,
                             rect,
                         });
                     }
@@ -1072,6 +1131,62 @@ impl OverlayState {
                 self.ocr_blocks.clear();
                 self.ocr_selected_block = None;
                 self.ocr_full_text.clear();
+                self.translated_full_text.clear();
+            }
+        }
+    }
+
+    fn consume_translation_worker_result(&mut self) {
+        let result = {
+            let Ok(mut worker) = self.translation_worker.lock() else {
+                return;
+            };
+            worker.take()
+        };
+        let Some(result) = result else {
+            return;
+        };
+
+        self.translation_running = false;
+        match result {
+            TranslationWorkerResult::Success {
+                output,
+                translated_blocks,
+                selection,
+            } => {
+                self.ocr_full_text = output.full_text;
+                self.translated_full_text = translated_blocks.join("\n");
+                self.ocr_blocks.clear();
+                let width = selection.width().max(1) as f32;
+                let height = selection.height().max(1) as f32;
+                for (index, block) in output.blocks.into_iter().enumerate() {
+                    let left = selection.left + (block.bbox_norm[0] * width).round() as i32;
+                    let top = selection.top + (block.bbox_norm[1] * height).round() as i32;
+                    let right = selection.left + (block.bbox_norm[2] * width).round() as i32;
+                    let bottom = selection.top + (block.bbox_norm[3] * height).round() as i32;
+                    if let Some(rect) = NormalizedRect::from_points(
+                        CursorPoint { x: left, y: top },
+                        CursorPoint {
+                            x: right,
+                            y: bottom,
+                        },
+                    ) {
+                        self.ocr_blocks.push(OcrOverlayBlock {
+                            source_text: block.text,
+                            translated_text: translated_blocks.get(index).cloned(),
+                            rect,
+                        });
+                    }
+                }
+                self.ocr_selected_block = None;
+                self.ocr_status = Some(format!(
+                    "翻译完成：生成 {} 个文本块译文",
+                    self.ocr_blocks.len()
+                ));
+            }
+            TranslationWorkerResult::Failure(error) => {
+                self.ocr_status = Some(format!("翻译失败：{}", error));
+                self.translated_full_text.clear();
             }
         }
     }
@@ -1287,6 +1402,7 @@ impl OverlayState {
             (ToolbarAction::Color(3), TOOLBAR_COLOR),
             (ToolbarAction::Color(4), TOOLBAR_COLOR),
             (ToolbarAction::OcrRun, TOOLBAR_BUTTON),
+            (ToolbarAction::TranslateRun, TOOLBAR_BUTTON),
             (ToolbarAction::OcrProfileDropdown, 156),
             (ToolbarAction::OcrCopyAll, 96),
         ];
@@ -2330,6 +2446,14 @@ unsafe extern "system" fn overlay_wndproc(
             }
             LRESULT(0)
         }
+        WM_APP_TRANSLATION_READY => {
+            if let Some(state) = overlay_state(hwnd) {
+                state.consume_translation_worker_result();
+                let _ = render_overlay(hwnd, state);
+                update_overlay_cursor(state);
+            }
+            LRESULT(0)
+        }
         WM_NCDESTROY => {
             let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -2363,7 +2487,8 @@ fn handle_mouse_move(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) {
                 state.ocr_blocks.clear();
                 state.ocr_selected_block = None;
                 state.ocr_full_text.clear();
-                state.ocr_status = Some("选区已调整，请重新执行 OCR".to_string());
+                state.translated_full_text.clear();
+                state.ocr_status = Some("选区已调整，请重新执行 OCR/翻译".to_string());
             }
             state.selection = Some(next);
         }
@@ -2376,7 +2501,8 @@ fn handle_mouse_move(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) {
                 state.ocr_blocks.clear();
                 state.ocr_selected_block = None;
                 state.ocr_full_text.clear();
-                state.ocr_status = Some("选区已调整，请重新执行 OCR".to_string());
+                state.translated_full_text.clear();
+                state.ocr_status = Some("选区已调整，请重新执行 OCR/翻译".to_string());
             }
             state.selection = Some(next);
         }
@@ -2502,10 +2628,14 @@ fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -
                 if let Some(index) = state.ocr_block_at(point) {
                     state.ocr_selected_block = Some(index);
                     if let Some(block) = state.ocr_blocks.get(index) {
-                        if let Err(error) = copy_text_to_clipboard(&block.text) {
-                            state.ocr_status = Some(format!("复制 OCR 文本失败: {}", error));
+                        let text = block
+                            .translated_text
+                            .as_deref()
+                            .unwrap_or(block.source_text.as_str());
+                        if let Err(error) = copy_text_to_clipboard(text) {
+                            state.ocr_status = Some(format!("复制 OCR/翻译文本失败: {}", error));
                         } else {
-                            state.ocr_status = Some("已复制 OCR 文本块".to_string());
+                            state.ocr_status = Some("已复制文本块".to_string());
                         }
                     }
                     return false;
@@ -3062,6 +3192,9 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
         ToolbarAction::OcrRun => {
             start_ocr_request(hwnd, state);
         }
+        ToolbarAction::TranslateRun => {
+            start_translation_request(hwnd, state);
+        }
         ToolbarAction::OcrProfileDropdown => {
             state.open_ocr_profile_dropdown = !state.open_ocr_profile_dropdown;
         }
@@ -3072,14 +3205,22 @@ fn handle_toolbar_action(hwnd: HWND, state: &mut OverlayState, action: ToolbarAc
             state.open_ocr_profile_dropdown = false;
         }
         ToolbarAction::OcrCopyAll => {
-            if !state.ocr_full_text.trim().is_empty() {
-                if let Err(error) = copy_text_to_clipboard(&state.ocr_full_text) {
-                    state.ocr_status = Some(format!("复制 OCR 结果失败: {}", error));
+            let is_translated = !state.translated_full_text.trim().is_empty();
+            let text = if is_translated {
+                state.translated_full_text.as_str()
+            } else {
+                state.ocr_full_text.as_str()
+            };
+            if !text.trim().is_empty() {
+                if let Err(error) = copy_text_to_clipboard(text) {
+                    state.ocr_status = Some(format!("复制文本失败: {}", error));
+                } else if is_translated {
+                    state.ocr_status = Some("已复制全部翻译文本".to_string());
                 } else {
                     state.ocr_status = Some("已复制全部 OCR 文本".to_string());
                 }
             } else {
-                state.ocr_status = Some("暂无 OCR 文本可复制".to_string());
+                state.ocr_status = Some("暂无文本可复制".to_string());
             }
         }
         ToolbarAction::StyleControl => {}
@@ -3128,7 +3269,7 @@ fn copy_text_to_clipboard(text: &str) -> Result<()> {
 }
 
 fn start_ocr_request(hwnd: HWND, state: &mut OverlayState) {
-    if state.ocr_running {
+    if state.ocr_running || state.translation_running {
         return;
     }
     if !state.ocr_config.enabled {
@@ -3171,6 +3312,7 @@ fn start_ocr_request(hwnd: HWND, state: &mut OverlayState) {
     }
 
     state.ocr_running = true;
+    state.translation_running = false;
     state.ocr_status = Some("OCR 识别中...".to_string());
     state.ocr_selected_block = None;
     if let Ok(mut worker) = state.ocr_worker.lock() {
@@ -3206,6 +3348,117 @@ fn start_ocr_request(hwnd: HWND, state: &mut OverlayState) {
         }
     });
 }
+fn start_translation_request(hwnd: HWND, state: &mut OverlayState) {
+    if state.ocr_running || state.translation_running {
+        return;
+    }
+    if !state.ocr_config.enabled {
+        state.ocr_status = Some("OCR 已关闭，请在设置中启用".to_string());
+        return;
+    }
+    if !state.translation_config.enabled {
+        state.ocr_status = Some("翻译已关闭，请在设置中启用".to_string());
+        return;
+    }
+
+    let Some(selection) = state.selection else {
+        state.ocr_status = Some("当前没有可用选区".to_string());
+        return;
+    };
+    let Some(ocr_profile) = state.current_ocr_profile().cloned() else {
+        state.ocr_status = Some("未配置 OCR 模型".to_string());
+        return;
+    };
+    let Some(translation_profile) = state.current_translation_profile().cloned() else {
+        state.ocr_status = Some("未配置翻译模型".to_string());
+        return;
+    };
+
+    let selection_width = selection.width().max(1) as u32;
+    let selection_height = selection.height().max(1) as u32;
+    let source = framebuffer_to_image(
+        state.target.base_frame.clone(),
+        state.target.width,
+        state.target.height,
+    );
+    let crop = imageops::crop_imm(
+        &source,
+        selection.left.max(0) as u32,
+        selection.top.max(0) as u32,
+        selection_width,
+        selection_height,
+    )
+    .to_image();
+
+    let mut buffer = Cursor::new(Vec::<u8>::new());
+    if DynamicImage::ImageRgba8(crop)
+        .write_to(&mut buffer, ImageFormat::Png)
+        .is_err()
+    {
+        state.ocr_status = Some("翻译输入图片编码失败".to_string());
+        return;
+    }
+
+    state.translation_running = true;
+    state.ocr_running = false;
+    state.ocr_status = Some("OCR + 翻译处理中...".to_string());
+    state.ocr_selected_block = None;
+    if let Ok(mut worker) = state.translation_worker.lock() {
+        *worker = None;
+    }
+
+    let ocr_timeout_ms = state.ocr_config.request_timeout_ms;
+    let translation_timeout_ms = state.translation_config.request_timeout_ms;
+    let image_png = buffer.into_inner();
+    let image_width = selection_width;
+    let image_height = selection_height;
+    let worker_slot = Arc::clone(&state.translation_worker);
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let request = ocr::OcrRecognizeRequest {
+            image_png,
+            timeout_ms: ocr_timeout_ms,
+            language_hint: None,
+        };
+
+        let result =
+            match ocr::recognize_with_profile(&ocr_profile, &request, image_width, image_height) {
+                Ok(output) => {
+                    let source_texts = output
+                        .blocks
+                        .iter()
+                        .map(|block| block.text.clone())
+                        .collect::<Vec<_>>();
+                    match translation::translate_blocks_parallel(
+                        &translation_profile,
+                        &source_texts,
+                        translation_timeout_ms,
+                    ) {
+                        Ok(translated_blocks) => TranslationWorkerResult::Success {
+                            output,
+                            translated_blocks,
+                            selection,
+                        },
+                        Err(error) => TranslationWorkerResult::Failure(error.to_string()),
+                    }
+                }
+                Err(error) => TranslationWorkerResult::Failure(format!("OCR 失败：{}", error)),
+            };
+
+        if let Ok(mut slot) = worker_slot.lock() {
+            *slot = Some(result);
+        }
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd_raw as *mut c_void)),
+                WM_APP_TRANSLATION_READY,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    });
+}
+
 fn finish_with_signal(hwnd: HWND, state: &mut OverlayState, signal: OverlaySignal) {
     state.active_drag = None;
     state.draft = None;
@@ -3453,6 +3706,55 @@ fn paint_ocr_blocks(state: &mut OverlayState) {
                 OCR_BLOCK_BORDER
             },
         );
+
+        let raw_text = block
+            .translated_text
+            .as_deref()
+            .unwrap_or(block.source_text.as_str())
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim();
+        if raw_text.is_empty() {
+            continue;
+        }
+        let text = if raw_text.chars().count() > 18 {
+            let mut short = raw_text.chars().take(17).collect::<String>();
+            short.push('…');
+            short
+        } else {
+            raw_text.to_string()
+        };
+
+        let label = IntRect {
+            left: block.rect.left + 3,
+            top: block.rect.top + 3,
+            right: (block.rect.right - 3).max(block.rect.left + 22),
+            bottom: (block.rect.top + 24).min(block.rect.bottom - 3),
+        };
+        if label.width() < 20 || (label.bottom - label.top) < 12 {
+            continue;
+        }
+        fill_rounded_rect(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            label,
+            5,
+            0x0F1725,
+        );
+        draw_gdi_text_centered(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            CursorPoint {
+                x: (label.left + label.right) / 2,
+                y: (label.top + label.bottom) / 2,
+            },
+            &text,
+            13,
+            TOOLBAR_TEXT,
+        );
     }
 }
 
@@ -3572,6 +3874,7 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::NumberTool => state.tool == AnnotationTool::Number,
         ToolbarAction::Color(index) => state.color_index == index,
         ToolbarAction::OcrRun => state.ocr_running,
+        ToolbarAction::TranslateRun => state.translation_running,
         ToolbarAction::OcrProfileDropdown => state.open_ocr_profile_dropdown,
         ToolbarAction::OcrProfileOption(index) => state.ocr_profile_index == index,
         ToolbarAction::OcrCopyAll => false,
@@ -3586,11 +3889,6 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
     } else {
         TOOLBAR_FILL
     };
-    let border = if selected {
-        TOOLBAR_TEXT
-    } else {
-        TOOLBAR_BORDER
-    };
     fill_rounded_rect(
         &mut state.frame,
         state.target.width,
@@ -3599,14 +3897,11 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         TOOLBAR_BUTTON_RADIUS,
         fill,
     );
-    stroke_rounded_rect(
-        &mut state.frame,
-        state.target.width,
-        state.target.height,
-        item.rect,
-        TOOLBAR_BUTTON_RADIUS,
-        border,
-    );
+    if let Some(icon_id) = toolbar_action_icon_id(item.action) {
+        if paint_svg_toolbar_icon(state, item.rect, icon_id, TOOLBAR_TEXT) {
+            return;
+        }
+    }
     match item.action {
         ToolbarAction::MouseTool => draw_mouse_glyph(
             &mut state.frame,
@@ -3718,6 +4013,14 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
             TOOLBAR_TEXT,
             state.ocr_running,
         ),
+        ToolbarAction::TranslateRun => draw_translate_glyph(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            item.rect,
+            TOOLBAR_TEXT,
+            state.translation_running,
+        ),
         ToolbarAction::OcrProfileDropdown => draw_ocr_profile_dropdown_button(
             &mut state.frame,
             state.target.width,
@@ -3791,6 +4094,62 @@ fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
         ToolbarAction::StyleControl => draw_style_control(state, item.rect, hovered),
     }
 }
+
+fn toolbar_action_icon_id(action: ToolbarAction) -> Option<IconId> {
+    match action {
+        ToolbarAction::MouseTool => Some(IconId::Mouse),
+        ToolbarAction::SelectTool => Some(IconId::Select),
+        ToolbarAction::RectangleTool => Some(IconId::Rectangle),
+        ToolbarAction::EllipseTool => Some(IconId::Ellipse),
+        ToolbarAction::LineTool => Some(IconId::Line),
+        ToolbarAction::ArrowTool => Some(IconId::Arrow),
+        ToolbarAction::MosaicTool => Some(IconId::Mosaic),
+        ToolbarAction::TextTool => Some(IconId::Text),
+        ToolbarAction::NumberTool => Some(IconId::Number),
+        ToolbarAction::Undo => Some(IconId::Undo),
+        ToolbarAction::Pin => Some(IconId::Pin),
+        ToolbarAction::Confirm => Some(IconId::Confirm),
+        ToolbarAction::Cancel => Some(IconId::Cancel),
+        _ => None,
+    }
+}
+
+fn paint_svg_toolbar_icon(
+    state: &mut OverlayState,
+    rect: IntRect,
+    icon_id: IconId,
+    color: u32,
+) -> bool {
+    let icon_rect = inset_rect(rect, TOOLBAR_ICON_MARGIN);
+    let icon_height = icon_rect.bottom - icon_rect.top;
+    let icon_size = icon_rect
+        .width()
+        .min(icon_height)
+        .min(TOOLBAR_SVG_ICON_SIZE)
+        .max(1) as u32;
+    let icon = match icons::rasterize_icon(
+        &mut state.icon_cache,
+        icon_id,
+        icon_size,
+        state.target.scale_factor,
+    ) {
+        Ok(icon) => icon.clone(),
+        Err(_) => return false,
+    };
+    icons::blit_icon_mask(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        icon_rect.left,
+        icon_rect.top,
+        icon_rect.width(),
+        icon_height,
+        &icon,
+        color,
+    );
+    true
+}
+
 #[cfg(test)]
 fn compose_preview_frame(
     source: &[u32],
@@ -4343,6 +4702,29 @@ fn draw_ocr_glyph(
         },
         label,
         if running { 13 } else { 15 },
+        color,
+    );
+}
+
+fn draw_translate_glyph(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    color: u32,
+    running: bool,
+) {
+    let label = if running { "翻译中" } else { "译" };
+    draw_gdi_text_centered(
+        frame,
+        width,
+        height,
+        CursorPoint {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        label,
+        if running { 13 } else { 18 },
         color,
     );
 }
@@ -5295,6 +5677,21 @@ fn font_weight(bold: bool) -> i32 {
     if bold { 700 } else { FW_NORMAL.0 as i32 }
 }
 
+fn text_preview_font_quality(show_caret: bool) -> FONT_QUALITY {
+    if show_caret {
+        ANTIALIASED_QUALITY
+    } else {
+        CLEARTYPE_QUALITY
+    }
+}
+
+fn text_bitmap_coverage(pixel: u32) -> u8 {
+    let red = ((pixel >> 16) & 0xff) as u8;
+    let green = ((pixel >> 8) & 0xff) as u8;
+    let blue = (pixel & 0xff) as u8;
+    red.max(green).max(blue)
+}
+
 fn draw_gdi_text_centered_styled(
     frame: &mut [u32],
     width: u32,
@@ -5520,6 +5917,13 @@ fn draw_text_box_shape(
     let layout =
         measure_wrapped_text_styled(text, style, content.width(), bold, italic, font_family);
 
+    let bounds_rect = IntRect {
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+    };
+
     if show_caret {
         let panel = IntRect {
             left: bounds.left - TEXT_EDIT_PADDING_X,
@@ -5527,65 +5931,45 @@ fn draw_text_box_shape(
             right: bounds.right + TEXT_EDIT_PADDING_X,
             bottom: bounds.bottom + TEXT_EDIT_PADDING_Y,
         };
-        fill_rounded_rect(
+        draw_text_round_panel(
             frame,
             width,
             height,
             panel,
             TEXT_EDIT_RADIUS,
-            TEXT_EDIT_FILL,
-        );
-        stroke_rounded_rect(
-            frame,
-            width,
-            height,
-            panel,
-            TEXT_EDIT_RADIUS,
-            TEXT_EDIT_BORDER,
+            Some(TEXT_EDIT_FILL),
+            Some((TEXT_EDIT_BORDER, 1.0)),
         );
     }
 
     if background {
-        fill_rounded_rect(
+        draw_text_round_panel(
             frame,
             width,
             height,
-            IntRect {
-                left: bounds.left,
-                top: bounds.top,
-                right: bounds.right,
-                bottom: bounds.bottom,
-            },
+            bounds_rect,
             6,
-            text_background_fill(style.color),
-        );
-        stroke_rounded_rect(
-            frame,
-            width,
-            height,
-            IntRect {
-                left: bounds.left,
-                top: bounds.top,
-                right: bounds.right,
-                bottom: bounds.bottom,
-            },
-            6,
-            text_background_border(style.color),
+            Some(text_background_fill(style.color)),
+            Some((text_background_border(style.color), 1.0)),
         );
     }
 
     if show_caret {
-        draw_rect_outline(
+        draw_text_round_panel(
             frame,
-            bounds,
             width,
             height,
-            1,
-            if background {
-                text_background_border(style.color)
-            } else {
-                TEXT_EDIT_BORDER
-            },
+            bounds_rect,
+            if background { 6 } else { 4 },
+            None,
+            Some((
+                if background {
+                    text_background_border(style.color)
+                } else {
+                    TEXT_EDIT_BORDER
+                },
+                if background { 1.5 } else { 1.0 },
+            )),
         );
     }
 
@@ -5639,7 +6023,7 @@ fn draw_text_box_shape(
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
+            text_preview_font_quality(show_caret),
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             font_face_name(font_family),
         )
@@ -5651,8 +6035,15 @@ fn draw_text_box_shape(
     };
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, colorref_from_rgb(style.color));
+        let _ = SetTextColor(
+            hdc,
+            colorref_from_rgb(if show_caret { 0xFFFFFF } else { style.color }),
+        );
     }
+    let pixels = unsafe {
+        std::slice::from_raw_parts_mut(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
+    };
+    pixels.fill(0);
     for (line_index, line) in layout.lines.iter().enumerate() {
         if line.is_empty() {
             continue;
@@ -5661,13 +6052,23 @@ fn draw_text_box_shape(
         let y = line_index as i32 * (layout.metrics.line_height + layout.metrics.line_gap);
         let _ = unsafe { TextOutW(hdc, 0, y, &utf16) };
     }
-    let pixels = unsafe {
-        std::slice::from_raw_parts(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
-    };
     for y in 0..bitmap_height {
         for x in 0..bitmap_width {
             let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
-            if pixel != 0 {
+            if show_caret {
+                let coverage = text_bitmap_coverage(pixel);
+                if coverage != 0 {
+                    blend_pixel(
+                        frame,
+                        width,
+                        height,
+                        content.left + x,
+                        content.top + y,
+                        style.color,
+                        coverage,
+                    );
+                }
+            } else if pixel != 0 {
                 put_pixel(
                     frame,
                     width,
@@ -5735,21 +6136,14 @@ fn draw_text_shape(
             right: bounds.right + TEXT_EDIT_PADDING_X,
             bottom: bounds.bottom + TEXT_EDIT_PADDING_Y,
         };
-        fill_rounded_rect(
+        draw_text_round_panel(
             frame,
             width,
             height,
             panel,
             TEXT_EDIT_RADIUS,
-            TEXT_EDIT_FILL,
-        );
-        stroke_rounded_rect(
-            frame,
-            width,
-            height,
-            panel,
-            TEXT_EDIT_RADIUS,
-            TEXT_EDIT_BORDER,
+            Some(TEXT_EDIT_FILL),
+            Some((TEXT_EDIT_BORDER, 1.0)),
         );
     }
 
@@ -5823,7 +6217,7 @@ fn draw_text_shape(
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
+            text_preview_font_quality(show_caret),
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             w!("Microsoft YaHei UI"),
         )
@@ -5835,8 +6229,15 @@ fn draw_text_shape(
     };
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, colorref_from_rgb(style.color));
+        let _ = SetTextColor(
+            hdc,
+            colorref_from_rgb(if show_caret { 0xFFFFFF } else { style.color }),
+        );
     }
+    let pixels = unsafe {
+        std::slice::from_raw_parts_mut(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
+    };
+    pixels.fill(0);
     for (line_index, line) in text.split('\n').enumerate() {
         if line.is_empty() {
             continue;
@@ -5845,13 +6246,23 @@ fn draw_text_shape(
         let y = line_index as i32 * (metrics.line_height + metrics.line_gap);
         let _ = unsafe { TextOutW(hdc, 0, y, &utf16) };
     }
-    let pixels = unsafe {
-        std::slice::from_raw_parts(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
-    };
     for y in 0..bitmap_height {
         for x in 0..bitmap_width {
             let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
-            if pixel != 0 {
+            if show_caret {
+                let coverage = text_bitmap_coverage(pixel);
+                if coverage != 0 {
+                    blend_pixel(
+                        frame,
+                        width,
+                        height,
+                        anchor.x + x,
+                        anchor.y + y,
+                        style.color,
+                        coverage,
+                    );
+                }
+            } else if pixel != 0 {
                 put_pixel(frame, width, height, anchor.x + x, anchor.y + y, pixel);
             }
         }
@@ -5895,21 +6306,31 @@ fn draw_rect_outline(
     thickness: i32,
     color: u32,
 ) {
-    let thickness = thickness.max(1);
-    for offset in 0..thickness {
-        let top = rect.top + offset;
-        let bottom = rect.bottom - 1 - offset;
-        let left = rect.left + offset;
-        let right = rect.right - 1 - offset;
-        for x in left..=right {
-            put_pixel(frame, width, height, x, top, color);
-            put_pixel(frame, width, height, x, bottom, color);
-        }
-        for y in top..=bottom {
-            put_pixel(frame, width, height, left, y, color);
-            put_pixel(frame, width, height, right, y, color);
-        }
-    }
+    let stroke_width = thickness.max(1) as f32;
+    let padding = stroke_width.ceil() as i32 + 3;
+    let local_width = (rect.width().max(1) + padding * 2 + 2) as u32;
+    let local_height = (rect.height().max(1) + padding * 2 + 2) as u32;
+    let Some(local_rect) = tiny_skia::Rect::from_xywh(
+        padding as f32 + 1.0,
+        padding as f32 + 1.0,
+        rect.width().max(1) as f32,
+        rect.height().max(1) as f32,
+    ) else {
+        return;
+    };
+    let path = tiny_skia::PathBuilder::from_rect(local_rect);
+    draw_tiny_skia_stroked_path(
+        frame,
+        width,
+        height,
+        rect.left - padding - 1,
+        rect.top - padding - 1,
+        local_width,
+        local_height,
+        &path,
+        stroke_width,
+        color,
+    );
 }
 fn mosaic_block_size(style: ShapeStyle) -> i32 {
     style.stroke.clamp(MIN_MOSAIC_SIZE, MAX_MOSAIC_SIZE) as i32
@@ -6012,26 +6433,33 @@ fn draw_ellipse_outline(
     thickness: i32,
     color: u32,
 ) {
-    let rx = rect.width().max(1) as f32 / 2.0;
-    let ry = rect.height().max(1) as f32 / 2.0;
-    let cx = rect.left as f32 + rx;
-    let cy = rect.top as f32 + ry;
-    let steps = ((rx.max(ry) * 6.0).round() as i32).clamp(48, 256);
-    let radius = (thickness.max(1) + 1) / 2;
-    for step in 0..=steps {
-        let theta = (step as f32 / steps as f32) * std::f32::consts::TAU;
-        let x = cx + rx * theta.cos();
-        let y = cy + ry * theta.sin();
-        draw_disc(
-            frame,
-            width,
-            height,
-            x.round() as i32,
-            y.round() as i32,
-            radius,
-            color,
-        );
-    }
+    let stroke_width = thickness.max(1) as f32;
+    let padding = stroke_width.ceil() as i32 + 3;
+    let local_width = (rect.width().max(1) + padding * 2 + 2) as u32;
+    let local_height = (rect.height().max(1) + padding * 2 + 2) as u32;
+    let Some(oval) = tiny_skia::Rect::from_xywh(
+        padding as f32 + 1.0,
+        padding as f32 + 1.0,
+        rect.width().max(1) as f32,
+        rect.height().max(1) as f32,
+    ) else {
+        return;
+    };
+    let Some(path) = tiny_skia::PathBuilder::from_oval(oval) else {
+        return;
+    };
+    draw_tiny_skia_stroked_path(
+        frame,
+        width,
+        height,
+        rect.left - padding - 1,
+        rect.top - padding - 1,
+        local_width,
+        local_height,
+        &path,
+        stroke_width,
+        color,
+    );
 }
 
 fn draw_arrow(
@@ -6043,28 +6471,81 @@ fn draw_arrow(
     thickness: i32,
     color: u32,
 ) {
-    draw_line(frame, width, height, start, end, color, thickness);
+    let stroke_width = thickness.max(1) as f32;
     let dx = (end.x - start.x) as f32;
     let dy = (end.y - start.y) as f32;
     let length = (dx * dx + dy * dy).sqrt();
     if length < 1.0 {
+        draw_disc(
+            frame,
+            width,
+            height,
+            start.x,
+            start.y,
+            (stroke_width / 2.0).ceil() as i32,
+            color,
+        );
         return;
     }
-    let head = (thickness.max(1) as f32 * 4.0).max(12.0);
+    let head = (stroke_width * 4.0).max(12.0);
     let angle = dy.atan2(dx);
-    let left = angle + std::f32::consts::PI - std::f32::consts::FRAC_PI_6;
-    let right = angle + std::f32::consts::PI + std::f32::consts::FRAC_PI_6;
     let left_point = CursorPoint {
-        x: (end.x as f32 + head * left.cos()).round() as i32,
-        y: (end.y as f32 + head * left.sin()).round() as i32,
+        x: (end.x as f32
+            + head * (angle + std::f32::consts::PI - std::f32::consts::FRAC_PI_6).cos())
+        .round() as i32,
+        y: (end.y as f32
+            + head * (angle + std::f32::consts::PI - std::f32::consts::FRAC_PI_6).sin())
+        .round() as i32,
     };
     let right_point = CursorPoint {
-        x: (end.x as f32 + head * right.cos()).round() as i32,
-        y: (end.y as f32 + head * right.sin()).round() as i32,
+        x: (end.x as f32
+            + head * (angle + std::f32::consts::PI + std::f32::consts::FRAC_PI_6).cos())
+        .round() as i32,
+        y: (end.y as f32
+            + head * (angle + std::f32::consts::PI + std::f32::consts::FRAC_PI_6).sin())
+        .round() as i32,
     };
-    draw_line(frame, width, height, end, left_point, color, thickness);
-    draw_line(frame, width, height, end, right_point, color, thickness);
+    let padding = stroke_width.ceil() as i32 + 4;
+    let min_x = start.x.min(end.x).min(left_point.x).min(right_point.x) - padding;
+    let min_y = start.y.min(end.y).min(left_point.y).min(right_point.y) - padding;
+    let max_x = start.x.max(end.x).max(left_point.x).max(right_point.x) + padding;
+    let max_y = start.y.max(end.y).max(left_point.y).max(right_point.y) + padding;
+    let local_width = (max_x - min_x + 1).max(1) as u32;
+    let local_height = (max_y - min_y + 1).max(1) as u32;
+    let to_local = |point: CursorPoint| -> (f32, f32) {
+        (
+            (point.x - min_x) as f32 + 0.5,
+            (point.y - min_y) as f32 + 0.5,
+        )
+    };
+    let (sx, sy) = to_local(start);
+    let (ex, ey) = to_local(end);
+    let (lx, ly) = to_local(left_point);
+    let (rx, ry) = to_local(right_point);
+    let mut builder = tiny_skia::PathBuilder::new();
+    builder.move_to(sx, sy);
+    builder.line_to(ex, ey);
+    builder.move_to(ex, ey);
+    builder.line_to(lx, ly);
+    builder.move_to(ex, ey);
+    builder.line_to(rx, ry);
+    let Some(path) = builder.finish() else {
+        return;
+    };
+    draw_tiny_skia_stroked_path(
+        frame,
+        width,
+        height,
+        min_x,
+        min_y,
+        local_width,
+        local_height,
+        &path,
+        stroke_width,
+        color,
+    );
 }
+
 fn draw_line(
     frame: &mut [u32],
     width: u32,
@@ -6074,25 +6555,49 @@ fn draw_line(
     color: u32,
     thickness: i32,
 ) {
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let steps = dx.abs().max(dy.abs()).max(1);
-    let radius = (thickness.max(1) + 1) / 2;
-    for step in 0..=steps {
-        let progress = step as f32 / steps as f32;
-        let x = start.x as f32 + dx as f32 * progress;
-        let y = start.y as f32 + dy as f32 * progress;
+    let stroke_width = thickness.max(1) as f32;
+    if start == end {
         draw_disc(
             frame,
             width,
             height,
-            x.round() as i32,
-            y.round() as i32,
-            radius,
+            start.x,
+            start.y,
+            (stroke_width / 2.0).ceil() as i32,
             color,
         );
+        return;
     }
+    let padding = stroke_width.ceil() as i32 + 4;
+    let min_x = start.x.min(end.x) - padding;
+    let min_y = start.y.min(end.y) - padding;
+    let max_x = start.x.max(end.x) + padding;
+    let max_y = start.y.max(end.y) + padding;
+    let local_width = (max_x - min_x + 1).max(1) as u32;
+    let local_height = (max_y - min_y + 1).max(1) as u32;
+    let mut builder = tiny_skia::PathBuilder::new();
+    builder.move_to(
+        (start.x - min_x) as f32 + 0.5,
+        (start.y - min_y) as f32 + 0.5,
+    );
+    builder.line_to((end.x - min_x) as f32 + 0.5, (end.y - min_y) as f32 + 0.5);
+    let Some(path) = builder.finish() else {
+        return;
+    };
+    draw_tiny_skia_stroked_path(
+        frame,
+        width,
+        height,
+        min_x,
+        min_y,
+        local_width,
+        local_height,
+        &path,
+        stroke_width,
+        color,
+    );
 }
+
 fn draw_disc(
     frame: &mut [u32],
     width: u32,
@@ -6103,12 +6608,283 @@ fn draw_disc(
     color: u32,
 ) {
     let radius = radius.max(1);
-    let radius_sq = radius * radius;
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
-            if dx * dx + dy * dy <= radius_sq {
-                put_pixel(frame, width, height, cx + dx, cy + dy, color);
+    let padding = 3;
+    let dst_left = cx - radius - padding;
+    let dst_top = cy - radius - padding;
+    let local_size = (radius * 2 + padding * 2 + 1).max(1) as u32;
+    let Some(path) = tiny_skia::PathBuilder::from_circle(
+        (cx - dst_left) as f32 + 0.5,
+        (cy - dst_top) as f32 + 0.5,
+        radius as f32,
+    ) else {
+        return;
+    };
+    draw_tiny_skia_filled_path(
+        frame, width, height, dst_left, dst_top, local_size, local_size, &path, color,
+    );
+}
+
+fn blend_pixel(frame: &mut [u32], width: u32, height: u32, x: i32, y: i32, color: u32, alpha: u8) {
+    if alpha == 0 || x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let index = y as usize * width as usize + x as usize;
+    let background = frame[index];
+    let bg_alpha = if background & 0xff00_0000 == 0 {
+        0xff00_0000
+    } else {
+        background & 0xff00_0000
+    };
+    let alpha = alpha as u32;
+    let inv_alpha = 255 - alpha;
+    let bg_r = (background >> 16) & 0xff;
+    let bg_g = (background >> 8) & 0xff;
+    let bg_b = background & 0xff;
+    let fg_r = (color >> 16) & 0xff;
+    let fg_g = (color >> 8) & 0xff;
+    let fg_b = color & 0xff;
+    let red = (fg_r * alpha + bg_r * inv_alpha + 127) / 255;
+    let green = (fg_g * alpha + bg_g * inv_alpha + 127) / 255;
+    let blue = (fg_b * alpha + bg_b * inv_alpha + 127) / 255;
+    frame[index] = bg_alpha | (red << 16) | (green << 8) | blue;
+}
+
+fn tiny_skia_mask_paint() -> tiny_skia::Paint<'static> {
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color_rgba8(255, 255, 255, 255);
+    paint.anti_alias = true;
+    paint
+}
+
+fn tiny_skia_round_stroke(width: f32) -> tiny_skia::Stroke {
+    tiny_skia::Stroke {
+        width: width.max(1.0),
+        line_cap: tiny_skia::LineCap::Round,
+        line_join: tiny_skia::LineJoin::Round,
+        ..Default::default()
+    }
+}
+
+fn draw_tiny_skia_stroked_path(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    dst_left: i32,
+    dst_top: i32,
+    surface_width: u32,
+    surface_height: u32,
+    path: &tiny_skia::Path,
+    stroke_width: f32,
+    color: u32,
+) {
+    let Some(mut pixmap) = tiny_skia::Pixmap::new(surface_width.max(1), surface_height.max(1))
+    else {
+        return;
+    };
+    let paint = tiny_skia_mask_paint();
+    let stroke = tiny_skia_round_stroke(stroke_width);
+    pixmap.stroke_path(
+        path,
+        &paint,
+        &stroke,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+    blend_tiny_skia_alpha(
+        frame,
+        width,
+        height,
+        dst_left,
+        dst_top,
+        pixmap.data(),
+        surface_width.max(1),
+        surface_height.max(1),
+        color,
+    );
+}
+
+fn draw_tiny_skia_filled_path(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    dst_left: i32,
+    dst_top: i32,
+    surface_width: u32,
+    surface_height: u32,
+    path: &tiny_skia::Path,
+    color: u32,
+) {
+    let Some(mut pixmap) = tiny_skia::Pixmap::new(surface_width.max(1), surface_height.max(1))
+    else {
+        return;
+    };
+    let paint = tiny_skia_mask_paint();
+    pixmap.fill_path(
+        path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+    blend_tiny_skia_alpha(
+        frame,
+        width,
+        height,
+        dst_left,
+        dst_top,
+        pixmap.data(),
+        surface_width.max(1),
+        surface_height.max(1),
+        color,
+    );
+}
+
+fn draw_text_round_panel(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    rect: IntRect,
+    radius: i32,
+    fill: Option<u32>,
+    stroke: Option<(u32, f32)>,
+) {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let stroke_width = stroke.map(|(_, width)| width.max(1.0)).unwrap_or(0.0);
+    let padding = stroke_width.ceil() as i32 + 3;
+    let surface_width = (rect.right - rect.left + padding * 2 + 2).max(1) as u32;
+    let surface_height = (rect.bottom - rect.top + padding * 2 + 2).max(1) as u32;
+    let Some(path) = build_tiny_skia_rounded_rect_path(
+        padding as f32 + 1.0,
+        padding as f32 + 1.0,
+        (rect.right - rect.left).max(1) as f32,
+        (rect.bottom - rect.top).max(1) as f32,
+        radius as f32,
+    ) else {
+        return;
+    };
+    let dst_left = rect.left - padding - 1;
+    let dst_top = rect.top - padding - 1;
+    if let Some(fill_color) = fill {
+        draw_tiny_skia_filled_path(
+            frame,
+            width,
+            height,
+            dst_left,
+            dst_top,
+            surface_width,
+            surface_height,
+            &path,
+            fill_color,
+        );
+    }
+    if let Some((stroke_color, stroke_width)) = stroke {
+        draw_tiny_skia_stroked_path(
+            frame,
+            width,
+            height,
+            dst_left,
+            dst_top,
+            surface_width,
+            surface_height,
+            &path,
+            stroke_width,
+            stroke_color,
+        );
+    }
+}
+
+fn build_tiny_skia_rounded_rect_path(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+) -> Option<tiny_skia::Path> {
+    if !(width > 0.0 && height > 0.0) {
+        return None;
+    }
+    let radius = radius.max(0.0).min(width / 2.0).min(height / 2.0);
+    if radius <= f32::EPSILON {
+        return tiny_skia::Rect::from_xywh(x, y, width, height)
+            .map(tiny_skia::PathBuilder::from_rect);
+    }
+    let kappa = 0.552_284_8_f32;
+    let curve = radius * kappa;
+    let left = x;
+    let top = y;
+    let right = x + width;
+    let bottom = y + height;
+    let mut builder = tiny_skia::PathBuilder::new();
+    builder.move_to(left + radius, top);
+    builder.line_to(right - radius, top);
+    builder.cubic_to(
+        right - radius + curve,
+        top,
+        right,
+        top + radius - curve,
+        right,
+        top + radius,
+    );
+    builder.line_to(right, bottom - radius);
+    builder.cubic_to(
+        right,
+        bottom - radius + curve,
+        right - radius + curve,
+        bottom,
+        right - radius,
+        bottom,
+    );
+    builder.line_to(left + radius, bottom);
+    builder.cubic_to(
+        left + radius - curve,
+        bottom,
+        left,
+        bottom - radius + curve,
+        left,
+        bottom - radius,
+    );
+    builder.line_to(left, top + radius);
+    builder.cubic_to(
+        left,
+        top + radius - curve,
+        left + radius - curve,
+        top,
+        left + radius,
+        top,
+    );
+    builder.close();
+    builder.finish()
+}
+
+fn blend_tiny_skia_alpha(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    dst_left: i32,
+    dst_top: i32,
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    color: u32,
+) {
+    for sy in 0..source_height {
+        let dst_y = dst_top + sy as i32;
+        if dst_y < 0 || dst_y >= height as i32 {
+            continue;
+        }
+        let src_row = sy as usize * source_width as usize;
+        for sx in 0..source_width {
+            let dst_x = dst_left + sx as i32;
+            if dst_x < 0 || dst_x >= width as i32 {
+                continue;
             }
+            let alpha = source[(src_row + sx as usize) * 4 + 3];
+            if alpha == 0 {
+                continue;
+            }
+            blend_pixel(frame, width, height, dst_x, dst_y, color, alpha);
         }
     }
 }

@@ -2,10 +2,11 @@ use crate::{
     config::{
         ANNOTATION_COLOR_PRESETS, AppConfig, AppPaths, GeneralConfig, OCR_TIMEOUT_MAX_MS,
         OCR_TIMEOUT_MIN_MS, OcrBboxScaleMode, OcrProfile, OcrProviderKind, PIN_OPACITY_OPTIONS,
-        TextFontFamily,
+        TRANSLATION_TIMEOUT_MAX_MS, TRANSLATION_TIMEOUT_MIN_MS, TextFontFamily, TranslationProfile,
+        TranslationProviderKind,
     },
     hotkey::RegisteredHotkey,
-    ocr,
+    ocr, translation,
 };
 use anyhow::{Context, Result, bail};
 use eframe::{App, CreationContext, NativeOptions, egui};
@@ -75,10 +76,17 @@ enum SettingsPage {
     Annotation,
     Pin,
     Ocr,
+    Translation,
 }
 
 impl SettingsPage {
-    const ALL: [Self; 4] = [Self::General, Self::Annotation, Self::Pin, Self::Ocr];
+    const ALL: [Self; 5] = [
+        Self::General,
+        Self::Annotation,
+        Self::Pin,
+        Self::Ocr,
+        Self::Translation,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -86,6 +94,7 @@ impl SettingsPage {
             Self::Annotation => "标注",
             Self::Pin => "贴图",
             Self::Ocr => "OCR",
+            Self::Translation => "翻译",
         }
     }
 
@@ -95,6 +104,7 @@ impl SettingsPage {
             Self::Annotation => "新截图进入标注时的默认值",
             Self::Pin => "贴图窗口的默认行为",
             Self::Ocr => "OCR 模型与接口配置",
+            Self::Translation => "翻译模型与 Prompt 配置",
         }
     }
 }
@@ -113,6 +123,7 @@ struct SettingsApp {
     hotkey_input: String,
     save_dir_input: String,
     selected_ocr_profile: Option<usize>,
+    selected_translation_profile: Option<usize>,
     status: Option<UiStatus>,
 }
 
@@ -128,6 +139,11 @@ impl SettingsApp {
         } else {
             Some(0)
         };
+        let selected_translation_profile = if config.translation.profiles.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         Self {
             original: config.clone(),
             draft: config,
@@ -136,6 +152,7 @@ impl SettingsApp {
             hotkey_input,
             save_dir_input,
             selected_ocr_profile,
+            selected_translation_profile,
             status: None,
         }
     }
@@ -144,12 +161,21 @@ impl SettingsApp {
         self.hotkey_input = self.draft.general.hotkey.clone();
         self.save_dir_input = self.draft.general.save_dir.display().to_string();
         self.fix_ocr_selection();
+        self.fix_translation_selection();
     }
 
     fn fix_ocr_selection(&mut self) {
         self.selected_ocr_profile = match self.selected_ocr_profile {
             Some(index) if index < self.draft.ocr.profiles.len() => Some(index),
             _ if self.draft.ocr.profiles.is_empty() => None,
+            _ => Some(0),
+        };
+    }
+
+    fn fix_translation_selection(&mut self) {
+        self.selected_translation_profile = match self.selected_translation_profile {
+            Some(index) if index < self.draft.translation.profiles.len() => Some(index),
+            _ if self.draft.translation.profiles.is_empty() => None,
             _ => Some(0),
         };
     }
@@ -172,6 +198,24 @@ impl SettingsApp {
         }
     }
 
+    fn next_translation_profile_id(&self) -> String {
+        let used: std::collections::HashSet<&str> = self
+            .draft
+            .translation
+            .profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect();
+        let mut index = 1usize;
+        loop {
+            let candidate = format!("translate_profile_{}", index);
+            if !used.contains(candidate.as_str()) {
+                return candidate;
+            }
+            index += 1;
+        }
+    }
+
     fn reset_current_page(&mut self) {
         let defaults = AppConfig::default();
         match self.current_page {
@@ -181,6 +225,7 @@ impl SettingsApp {
             }
             SettingsPage::Pin => self.draft.pin_defaults = defaults.pin_defaults,
             SettingsPage::Ocr => self.draft.ocr = defaults.ocr,
+            SettingsPage::Translation => self.draft.translation = defaults.translation,
         }
         self.sync_text_inputs_from_draft();
         self.status = None;
@@ -255,7 +300,7 @@ impl SettingsApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("截图、标注、贴图与 OCR 默认行为")
+                    egui::RichText::new("截图、标注、贴图与 OCR/翻译 默认行为")
                         .size(13.0)
                         .color(egui::Color32::from_rgb(106, 114, 128)),
                 );
@@ -371,6 +416,7 @@ impl SettingsApp {
                         SettingsPage::Annotation => self.page_annotation(ui),
                         SettingsPage::Pin => self.page_pin(ui),
                         SettingsPage::Ocr => self.page_ocr(ui),
+                        SettingsPage::Translation => self.page_translation(ui),
                     }
                 });
         });
@@ -667,6 +713,175 @@ impl SettingsApp {
                                         self.status = Some(UiStatus {
                                             is_error: false,
                                             text: "OCR 模型连接成功".to_string(),
+                                        });
+                                    }
+                                    Err(error) => {
+                                        self.status = Some(UiStatus {
+                                            is_error: true,
+                                            text: format!("连接测试失败: {}", error),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ui.label(label_text("请先在左侧选择一个模型"));
+                    }
+                });
+            });
+        });
+    }
+
+    fn page_translation(&mut self, ui: &mut egui::Ui) {
+        section_card(ui, "翻译总开关与请求超时", |ui| {
+            ui.checkbox(&mut self.draft.translation.enabled, "启用翻译");
+            ui.add_sized(
+                [420.0, 0.0],
+                egui::Slider::new(
+                    &mut self.draft.translation.request_timeout_ms,
+                    TRANSLATION_TIMEOUT_MIN_MS..=TRANSLATION_TIMEOUT_MAX_MS,
+                )
+                .text("请求超时(ms)"),
+            );
+
+            let selected = self
+                .draft
+                .translation
+                .profiles
+                .iter()
+                .find(|profile| profile.id == self.draft.translation.default_profile_id)
+                .map(|profile| profile.display_name.as_str())
+                .unwrap_or("未选择");
+
+            egui::ComboBox::from_label("默认翻译模型")
+                .selected_text(selected)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for profile in &self.draft.translation.profiles {
+                        ui.selectable_value(
+                            &mut self.draft.translation.default_profile_id,
+                            profile.id.clone(),
+                            &profile.display_name,
+                        );
+                    }
+                });
+        });
+
+        section_card(ui, "翻译模型配置", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("新增模型").clicked() {
+                    let index = self.draft.translation.profiles.len() + 1;
+                    let id = self.next_translation_profile_id();
+                    self.draft.translation.profiles.push(TranslationProfile {
+                        id: id.clone(),
+                        display_name: format!("翻译模型{}", index),
+                        provider_kind: TranslationProviderKind::OpenAiCompatible,
+                        base_url: "https://api.openai.com/v1".to_string(),
+                        api_key: String::new(),
+                        model: "gpt-4.1-mini".to_string(),
+                        prompt_template: translation::DEFAULT_PROMPT_TEMPLATE.to_string(),
+                    });
+                    self.selected_translation_profile =
+                        Some(self.draft.translation.profiles.len() - 1);
+                    if self.draft.translation.default_profile_id.is_empty() {
+                        self.draft.translation.default_profile_id = id;
+                    }
+                }
+
+                if ui
+                    .add_enabled(
+                        self.selected_translation_profile.is_some(),
+                        egui::Button::new("删除当前模型"),
+                    )
+                    .clicked()
+                {
+                    if let Some(index) = self.selected_translation_profile {
+                        if index < self.draft.translation.profiles.len() {
+                            let removed = self.draft.translation.profiles.remove(index);
+                            if self.draft.translation.default_profile_id == removed.id {
+                                self.draft.translation.default_profile_id = self
+                                    .draft
+                                    .translation
+                                    .profiles
+                                    .first()
+                                    .map(|profile| profile.id.clone())
+                                    .unwrap_or_default();
+                            }
+                            self.fix_translation_selection();
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.columns(2, |columns| {
+                columns[0].set_min_width(240.0);
+                columns[0].vertical(|ui| {
+                    ui.label(egui::RichText::new("模型列表").strong());
+                    ui.add_space(6.0);
+                    for (index, profile) in self.draft.translation.profiles.iter().enumerate() {
+                        let selected = self.selected_translation_profile == Some(index);
+                        if ui
+                            .selectable_label(selected, profile.display_name.as_str())
+                            .clicked()
+                        {
+                            self.selected_translation_profile = Some(index);
+                        }
+                    }
+                    if self.draft.translation.profiles.is_empty() {
+                        ui.label(label_text("暂无模型，请先新增"));
+                    }
+                });
+
+                columns[1].vertical(|ui| {
+                    if let Some(index) = self.selected_translation_profile {
+                        if let Some(profile) = self.draft.translation.profiles.get_mut(index) {
+                            ui.label(egui::RichText::new("模型详情").strong());
+                            ui.add_space(8.0);
+
+                            ui.label(label_text("显示名称"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.display_name)
+                                    .desired_width(280.0),
+                            );
+
+                            ui.label(label_text("Base URL"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.base_url)
+                                    .desired_width(360.0),
+                            );
+
+                            ui.label(label_text("API Key"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.api_key)
+                                    .desired_width(360.0)
+                                    .password(true),
+                            );
+
+                            ui.label(label_text("模型名称"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.model).desired_width(280.0),
+                            );
+
+                            ui.label(label_text(
+                                "Prompt 模板（使用 {{text}} 占位符，建议返回纯文本）",
+                            ));
+                            ui.add(
+                                egui::TextEdit::multiline(&mut profile.prompt_template)
+                                    .desired_width(460.0)
+                                    .desired_rows(8),
+                            );
+
+                            ui.add_space(8.0);
+                            if ui.button("连接测试").clicked() {
+                                match translation::test_profile(
+                                    profile,
+                                    self.draft.translation.request_timeout_ms,
+                                ) {
+                                    Ok(()) => {
+                                        self.status = Some(UiStatus {
+                                            is_error: false,
+                                            text: "翻译模型连接成功".to_string(),
                                         });
                                     }
                                     Err(error) => {

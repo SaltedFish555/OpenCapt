@@ -33,6 +33,31 @@ cargo run -- capture-test
 cargo run -- overlay-test
 ```
 
+## 打包发布
+
+一键打包（构建 release + 产出 zip）：
+
+```powershell
+Set-Location I:\MyCode\OpenCapt
+.\build-release.ps1
+```
+
+可选参数：
+
+```powershell
+# 使用静态 CRT，减少目标机 VC 运行库依赖
+.\build-release.ps1 -StaticCRT
+
+# 只构建并导出目录，不压缩 zip
+.\build-release.ps1 -SkipZip
+```
+
+默认输出目录：
+
+```text
+I:\MyCode\OpenCapt\dist\
+```
+
 ## 配置
 
 配置文件位置：

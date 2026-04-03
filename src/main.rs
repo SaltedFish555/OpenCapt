@@ -2,12 +2,14 @@ mod app;
 mod capture;
 mod config;
 mod hotkey;
+mod icons;
 mod logging;
 mod ocr;
 mod output;
 mod overlay;
 mod pin;
 mod settings;
+mod translation;
 mod tray;
 
 use anyhow::Result;

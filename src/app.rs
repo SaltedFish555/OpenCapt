@@ -341,6 +341,7 @@ impl App {
             cursor_y,
             &self.config.annotation_defaults,
             &self.config.ocr,
+            &self.config.translation,
         ) {
             Ok(()) => {
                 self.state = AppState::Selecting;

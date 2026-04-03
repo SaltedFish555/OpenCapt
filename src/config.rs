@@ -23,6 +23,9 @@ pub const PIN_OPACITY_OPTIONS: [u8; 4] = [100, 80, 60, 40];
 pub const OCR_TIMEOUT_MIN_MS: u64 = 2_000;
 pub const OCR_TIMEOUT_MAX_MS: u64 = 120_000;
 pub const OCR_TIMEOUT_DEFAULT_MS: u64 = 20_000;
+pub const TRANSLATION_TIMEOUT_MIN_MS: u64 = 2_000;
+pub const TRANSLATION_TIMEOUT_MAX_MS: u64 = 120_000;
+pub const TRANSLATION_TIMEOUT_DEFAULT_MS: u64 = 20_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TextFontFamily {
@@ -49,6 +52,13 @@ impl TextFontFamily {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum OcrProviderKind {
+    #[default]
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum TranslationProviderKind {
     #[default]
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
@@ -136,12 +146,33 @@ pub struct OcrConfig {
     pub profiles: Vec<OcrProfile>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranslationProfile {
+    pub id: String,
+    pub display_name: String,
+    pub provider_kind: TranslationProviderKind,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub prompt_template: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TranslationConfig {
+    pub enabled: bool,
+    pub default_profile_id: String,
+    pub request_timeout_ms: u64,
+    pub profiles: Vec<TranslationProfile>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub general: GeneralConfig,
     pub annotation_defaults: AnnotationDefaults,
     pub pin_defaults: PinDefaults,
     pub ocr: OcrConfig,
+    pub translation: TranslationConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +231,17 @@ impl Default for OcrConfig {
     }
 }
 
+impl Default for TranslationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_profile_id: String::new(),
+            request_timeout_ms: TRANSLATION_TIMEOUT_DEFAULT_MS,
+            profiles: Vec::new(),
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -207,6 +249,7 @@ impl Default for AppConfig {
             annotation_defaults: AnnotationDefaults::default(),
             pin_defaults: PinDefaults::default(),
             ocr: OcrConfig::default(),
+            translation: TranslationConfig::default(),
         }
     }
 }
@@ -275,6 +318,62 @@ impl AppConfig {
             }
         }
 
+        if !(TRANSLATION_TIMEOUT_MIN_MS..=TRANSLATION_TIMEOUT_MAX_MS)
+            .contains(&self.translation.request_timeout_ms)
+        {
+            bail!(
+                "translation timeout must be between {} and {} ms",
+                TRANSLATION_TIMEOUT_MIN_MS,
+                TRANSLATION_TIMEOUT_MAX_MS
+            );
+        }
+
+        let mut translation_ids = std::collections::HashSet::new();
+        for profile in &self.translation.profiles {
+            if profile.id.trim().is_empty() {
+                bail!("translation profile id may not be empty");
+            }
+            if !translation_ids.insert(profile.id.trim().to_string()) {
+                bail!("duplicate translation profile id: {}", profile.id);
+            }
+            if profile.display_name.trim().is_empty() {
+                bail!("translation profile display_name may not be empty");
+            }
+            if profile.base_url.trim().is_empty() {
+                bail!("translation profile base_url may not be empty");
+            }
+            if profile.api_key.trim().is_empty() {
+                bail!("translation profile api_key may not be empty");
+            }
+            if profile.model.trim().is_empty() {
+                bail!("translation profile model may not be empty");
+            }
+            if profile.prompt_template.trim().is_empty() {
+                bail!("translation profile prompt_template may not be empty");
+            }
+        }
+
+        if self.translation.enabled && self.translation.profiles.is_empty() {
+            bail!("translation enabled but no profile configured");
+        }
+
+        if !self.translation.profiles.is_empty() {
+            if self.translation.default_profile_id.trim().is_empty() {
+                bail!("translation default profile may not be empty when profiles are configured");
+            }
+            if !self
+                .translation
+                .profiles
+                .iter()
+                .any(|profile| profile.id == self.translation.default_profile_id)
+            {
+                bail!(
+                    "translation default profile not found: {}",
+                    self.translation.default_profile_id
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -320,6 +419,24 @@ impl AppConfig {
             self.ocr.default_profile_id = self.ocr.profiles[0].id.clone();
         }
 
+        self.translation.request_timeout_ms = self
+            .translation
+            .request_timeout_ms
+            .clamp(TRANSLATION_TIMEOUT_MIN_MS, TRANSLATION_TIMEOUT_MAX_MS);
+        normalize_translation_profile_ids(&mut self.translation.profiles);
+
+        if self.translation.profiles.is_empty() {
+            self.translation.enabled = false;
+            self.translation.default_profile_id.clear();
+        } else if !self
+            .translation
+            .profiles
+            .iter()
+            .any(|profile| profile.id == self.translation.default_profile_id)
+        {
+            self.translation.default_profile_id = self.translation.profiles[0].id.clone();
+        }
+
         self
     }
 }
@@ -348,6 +465,30 @@ fn normalize_ocr_profile_ids(profiles: &mut [OcrProfile]) {
     }
 }
 
+fn normalize_translation_profile_ids(profiles: &mut [TranslationProfile]) {
+    let mut used = std::collections::HashSet::new();
+    let mut next_index = 1usize;
+
+    for profile in profiles {
+        let trimmed = profile.id.trim();
+        if !trimmed.is_empty() && used.insert(trimmed.to_string()) {
+            if trimmed != profile.id {
+                profile.id = trimmed.to_string();
+            }
+            continue;
+        }
+
+        loop {
+            let candidate = format!("translate_profile_{}", next_index);
+            next_index += 1;
+            if used.insert(candidate.clone()) {
+                profile.id = candidate;
+                break;
+            }
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for AppConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -365,6 +506,7 @@ struct AppConfigCompat {
     annotation_defaults: Option<AnnotationDefaultsCompat>,
     pin_defaults: Option<PinDefaultsCompat>,
     ocr: Option<OcrConfigCompat>,
+    translation: Option<TranslationConfigCompat>,
     hotkey: Option<String>,
     auto_copy: Option<bool>,
     auto_save: Option<bool>,
@@ -411,6 +553,15 @@ struct OcrConfigCompat {
     profiles: Option<Vec<OcrProfile>>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TranslationConfigCompat {
+    enabled: Option<bool>,
+    default_profile_id: Option<String>,
+    request_timeout_ms: Option<u64>,
+    profiles: Option<Vec<TranslationProfile>>,
+}
+
 impl AppConfigCompat {
     fn into_config(self) -> AppConfig {
         let mut config = AppConfig::default();
@@ -426,6 +577,9 @@ impl AppConfigCompat {
         }
         if let Some(ocr) = self.ocr {
             apply_ocr(&mut config.ocr, ocr);
+        }
+        if let Some(translation) = self.translation {
+            apply_translation(&mut config.translation, translation);
         }
 
         if let Some(hotkey) = self.hotkey {
@@ -503,6 +657,21 @@ fn apply_pin(target: &mut PinDefaults, value: PinDefaultsCompat) {
 }
 
 fn apply_ocr(target: &mut OcrConfig, value: OcrConfigCompat) {
+    if let Some(enabled) = value.enabled {
+        target.enabled = enabled;
+    }
+    if let Some(default_profile_id) = value.default_profile_id {
+        target.default_profile_id = default_profile_id;
+    }
+    if let Some(request_timeout_ms) = value.request_timeout_ms {
+        target.request_timeout_ms = request_timeout_ms;
+    }
+    if let Some(profiles) = value.profiles {
+        target.profiles = profiles;
+    }
+}
+
+fn apply_translation(target: &mut TranslationConfig, value: TranslationConfigCompat) {
     if let Some(enabled) = value.enabled {
         target.enabled = enabled;
     }
@@ -608,6 +777,11 @@ mod tests {
         assert_eq!(config.pin_defaults.opacity_percent, 100);
         assert!(!config.ocr.enabled);
         assert_eq!(config.ocr.request_timeout_ms, OCR_TIMEOUT_DEFAULT_MS);
+        assert!(!config.translation.enabled);
+        assert_eq!(
+            config.translation.request_timeout_ms,
+            TRANSLATION_TIMEOUT_DEFAULT_MS
+        );
     }
 
     #[test]
@@ -624,6 +798,18 @@ mod tests {
         });
         config.ocr.enabled = true;
         config.ocr.default_profile_id = "default".to_string();
+
+        config.translation.profiles.push(TranslationProfile {
+            id: "tr_default".to_string(),
+            display_name: "默认翻译".to_string(),
+            provider_kind: TranslationProviderKind::OpenAiCompatible,
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "translate-key".to_string(),
+            model: "gpt-4.1-mini".to_string(),
+            prompt_template: "Translate the following text into Chinese. Return only the translated text without explanation.\n{{text}}".to_string(),
+        });
+        config.translation.enabled = true;
+        config.translation.default_profile_id = "tr_default".to_string();
 
         let serialized = toml::to_string_pretty(&config).expect("serialize config");
         let parsed: AppConfig = toml::from_str(&serialized).expect("parse config");
@@ -752,6 +938,81 @@ model = "gpt-4.1-mini"
         );
     }
 
+    #[test]
+    fn missing_translation_prompt_is_rejected() {
+        let parsed = toml::from_str::<AppConfig>(
+            r#"
+[translation]
+enabled = true
+default_profile_id = "t1"
+request_timeout_ms = 20000
+
+[[translation.profiles]]
+id = "t1"
+display_name = "Translate"
+provider_kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "abc"
+model = "gpt-4.1-mini"
+"#,
+        );
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn sanitize_translation_profile_ids_when_missing_or_duplicated() {
+        let mut config = AppConfig::default();
+        config.translation.profiles = vec![
+            TranslationProfile {
+                id: String::new(),
+                display_name: "A".to_string(),
+                provider_kind: TranslationProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "a".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                prompt_template: "{{texts}}".to_string(),
+            },
+            TranslationProfile {
+                id: "translate_profile_1".to_string(),
+                display_name: "B".to_string(),
+                provider_kind: TranslationProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "b".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                prompt_template: "{{texts}}".to_string(),
+            },
+            TranslationProfile {
+                id: "translate_profile_1".to_string(),
+                display_name: "C".to_string(),
+                provider_kind: TranslationProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "c".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                prompt_template: "{{texts}}".to_string(),
+            },
+        ];
+        config.translation.default_profile_id = "missing".to_string();
+
+        let sanitized = config.sanitize();
+        let ids: std::collections::HashSet<_> = sanitized
+            .translation
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect();
+        assert_eq!(ids.len(), sanitized.translation.profiles.len());
+        assert!(
+            sanitized
+                .translation
+                .profiles
+                .iter()
+                .all(|profile| !profile.id.trim().is_empty())
+        );
+        assert_eq!(
+            sanitized.translation.default_profile_id,
+            sanitized.translation.profiles[0].id
+        );
+    }
     #[test]
     fn config_paths_land_under_appdata() {
         let paths = app_paths().expect("resolve paths");

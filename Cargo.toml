@@ -13,6 +13,7 @@ eframe = { version = "0.33.3", default-features = false, features = ["default_fo
 global-hotkey = "0.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+resvg = "0.45"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tao = "0.34"
@@ -23,3 +24,4 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tray-icon = "0.21"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 xcap = "0.9"
+
