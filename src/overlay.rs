@@ -7016,9 +7016,12 @@ fn alpha_blend(bg: u32, fg: u32) -> u32 {
         return bg;
     }
     let inv_a = 255 - a;
-    let r = (((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * inv_a) / 255;
-    let g = (((fg >> 8) & 0xff) * a + ((bg >> 8) & 0xff) * inv_a) / 255;
-    let b = ((fg & 0xff) * a + (bg & 0xff) * inv_a) / 255;
+    let r_val = ((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * inv_a;
+    let g_val = ((fg >> 8) & 0xff) * a + ((bg >> 8) & 0xff) * inv_a;
+    let b_val = (fg & 0xff) * a + (bg & 0xff) * inv_a;
+    let r = (r_val + 1 + (r_val >> 8)) >> 8;
+    let g = (g_val + 1 + (g_val >> 8)) >> 8;
+    let b = (b_val + 1 + (b_val >> 8)) >> 8;
     0xff00_0000 | (r << 16) | (g << 8) | b
 }
 
