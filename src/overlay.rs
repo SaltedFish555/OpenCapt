@@ -28,11 +28,11 @@ use windows::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
         Graphics::Gdi::{
             AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
-            BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
-            CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-            DeleteDC, DeleteObject, FF_DONTCARE, FONT_QUALITY, FW_NORMAL, GetTextExtentPoint32W,
-            HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, RGBQUAD, SelectObject, SetBkMode,
-            SetTextColor, TRANSPARENT, TextOutW,
+            BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+            DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, FF_DONTCARE,
+            FONT_QUALITY, FW_NORMAL, GetTextExtentPoint32W, HBITMAP, HDC, HFONT, HGDIOBJ,
+            OUT_DEFAULT_PRECIS, RGBQUAD, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+            TextOutW,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -5630,7 +5630,7 @@ fn measure_text_layout_styled(
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
+            text_raster_font_quality(),
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             font_face_name(font_family),
         )
@@ -5767,12 +5767,8 @@ fn font_weight(bold: bool) -> i32 {
     if bold { 700 } else { FW_NORMAL.0 as i32 }
 }
 
-fn text_preview_font_quality(show_caret: bool) -> FONT_QUALITY {
-    if show_caret {
-        ANTIALIASED_QUALITY
-    } else {
-        CLEARTYPE_QUALITY
-    }
+fn text_raster_font_quality() -> FONT_QUALITY {
+    ANTIALIASED_QUALITY
 }
 
 fn text_bitmap_coverage(pixel: u32) -> u8 {
@@ -5782,6 +5778,35 @@ fn text_bitmap_coverage(pixel: u32) -> u8 {
     red.max(green).max(blue)
 }
 
+fn blend_text_bitmap(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    dst_left: i32,
+    dst_top: i32,
+    pixels: &[u32],
+    bitmap_width: i32,
+    bitmap_height: i32,
+    color: u32,
+) {
+    for y in 0..bitmap_height {
+        for x in 0..bitmap_width {
+            let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
+            let coverage = text_bitmap_coverage(pixel);
+            if coverage != 0 {
+                blend_pixel(
+                    frame,
+                    width,
+                    height,
+                    dst_left + x,
+                    dst_top + y,
+                    color,
+                    coverage,
+                );
+            }
+        }
+    }
+}
 fn draw_gdi_text_centered_styled(
     frame: &mut [u32],
     width: u32,
@@ -5954,7 +5979,6 @@ fn draw_number_shape(
 ) {
     let radius = number_badge_radius(style);
     let border = contrast_ink(style.color);
-    draw_disc(frame, width, height, center.x, center.y, radius + 2, border);
     draw_disc(
         frame,
         width,
@@ -5964,6 +5988,13 @@ fn draw_number_shape(
         radius,
         style.color,
     );
+    let rect = NormalizedRect {
+        left: center.x - radius,
+        top: center.y - radius,
+        right: center.x + radius + 1,
+        bottom: center.y + radius + 1,
+    };
+    draw_ellipse_outline(frame, rect, width, height, 1, border);
     draw_gdi_text_centered(
         frame,
         width,
@@ -6123,7 +6154,7 @@ fn draw_text_box_shape(
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            text_preview_font_quality(show_caret),
+            text_raster_font_quality(),
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             font_face_name(font_family),
         )
@@ -6135,10 +6166,7 @@ fn draw_text_box_shape(
     };
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(
-            hdc,
-            colorref_from_rgb(if show_caret { 0xFFFFFF } else { style.color }),
-        );
+        let _ = SetTextColor(hdc, colorref_from_rgb(0xFFFFFF));
     }
     let pixels = unsafe {
         std::slice::from_raw_parts_mut(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
@@ -6152,34 +6180,17 @@ fn draw_text_box_shape(
         let y = line_index as i32 * (layout.metrics.line_height + layout.metrics.line_gap);
         let _ = unsafe { TextOutW(hdc, 0, y, &utf16) };
     }
-    for y in 0..bitmap_height {
-        for x in 0..bitmap_width {
-            let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
-            if show_caret {
-                let coverage = text_bitmap_coverage(pixel);
-                if coverage != 0 {
-                    blend_pixel(
-                        frame,
-                        width,
-                        height,
-                        content.left + x,
-                        content.top + y,
-                        style.color,
-                        coverage,
-                    );
-                }
-            } else if pixel != 0 {
-                put_pixel(
-                    frame,
-                    width,
-                    height,
-                    content.left + x,
-                    content.top + y,
-                    pixel,
-                );
-            }
-        }
-    }
+    blend_text_bitmap(
+        frame,
+        width,
+        height,
+        content.left,
+        content.top,
+        pixels,
+        bitmap_width,
+        bitmap_height,
+        style.color,
+    );
     if show_caret {
         let caret_line = (layout.metrics.line_count - 1).max(0);
         let caret_x = content.left + layout.metrics.last_line_width + 1;
@@ -6317,7 +6328,7 @@ fn draw_text_shape(
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            text_preview_font_quality(show_caret),
+            text_raster_font_quality(),
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             w!("Microsoft YaHei UI"),
         )
@@ -6329,10 +6340,7 @@ fn draw_text_shape(
     };
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(
-            hdc,
-            colorref_from_rgb(if show_caret { 0xFFFFFF } else { style.color }),
-        );
+        let _ = SetTextColor(hdc, colorref_from_rgb(0xFFFFFF));
     }
     let pixels = unsafe {
         std::slice::from_raw_parts_mut(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
@@ -6346,27 +6354,17 @@ fn draw_text_shape(
         let y = line_index as i32 * (metrics.line_height + metrics.line_gap);
         let _ = unsafe { TextOutW(hdc, 0, y, &utf16) };
     }
-    for y in 0..bitmap_height {
-        for x in 0..bitmap_width {
-            let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
-            if show_caret {
-                let coverage = text_bitmap_coverage(pixel);
-                if coverage != 0 {
-                    blend_pixel(
-                        frame,
-                        width,
-                        height,
-                        anchor.x + x,
-                        anchor.y + y,
-                        style.color,
-                        coverage,
-                    );
-                }
-            } else if pixel != 0 {
-                put_pixel(frame, width, height, anchor.x + x, anchor.y + y, pixel);
-            }
-        }
-    }
+    blend_text_bitmap(
+        frame,
+        width,
+        height,
+        anchor.x,
+        anchor.y,
+        pixels,
+        bitmap_width,
+        bitmap_height,
+        style.color,
+    );
     if show_caret {
         let caret_line = (metrics.line_count - 1).max(0);
         let caret_x = anchor.x + metrics.last_line_width + 1;
