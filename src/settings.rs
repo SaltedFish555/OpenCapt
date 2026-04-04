@@ -20,6 +20,20 @@ const SETTINGS_TITLE: &str = "OpenCapt 设置";
 const SETTINGS_MIN_SIZE: [f32; 2] = [780.0, 560.0];
 const SETTINGS_SIZE: [f32; 2] = [920.0, 660.0];
 
+fn default_ocr_profile(index: usize, id: String) -> OcrProfile {
+    let provider = OcrProviderKind::OpenAiCompatible;
+    OcrProfile {
+        id,
+        display_name: format!("模型{}", index),
+        provider_kind: provider,
+        base_url: provider.default_base_url().to_string(),
+        api_key: String::new(),
+        secret_key: String::new(),
+        model: provider.default_model().to_string(),
+        bbox_scale_mode: provider.default_bbox_scale_mode(),
+    }
+}
+
 pub fn open_or_focus() -> Result<()> {
     if focus_existing_settings_window() {
         return Ok(());
@@ -602,15 +616,10 @@ impl SettingsApp {
                 if ui.button("新增模型").clicked() {
                     let index = self.draft.ocr.profiles.len() + 1;
                     let id = self.next_ocr_profile_id();
-                    self.draft.ocr.profiles.push(OcrProfile {
-                        id: id.clone(),
-                        display_name: format!("模型{}", index),
-                        provider_kind: OcrProviderKind::OpenAiCompatible,
-                        base_url: "https://api.openai.com/v1".to_string(),
-                        api_key: String::new(),
-                        model: "gpt-4.1-mini".to_string(),
-                        bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
-                    });
+                    self.draft
+                        .ocr
+                        .profiles
+                        .push(default_ocr_profile(index, id.clone()));
                     self.selected_ocr_profile = Some(self.draft.ocr.profiles.len() - 1);
                     if self.draft.ocr.default_profile_id.is_empty() {
                         self.draft.ocr.default_profile_id = id;
@@ -668,6 +677,32 @@ impl SettingsApp {
                             ui.label(egui::RichText::new("模型详情").strong());
                             ui.add_space(8.0);
 
+                            let previous_provider = profile.provider_kind;
+
+                            egui::ComboBox::from_label("Provider")
+                                .selected_text(profile.provider_kind.label())
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    for kind in OcrProviderKind::ALL {
+                                        ui.selectable_value(
+                                            &mut profile.provider_kind,
+                                            kind,
+                                            kind.label(),
+                                        );
+                                    }
+                                });
+
+                            if profile.provider_kind != previous_provider {
+                                profile.base_url =
+                                    profile.provider_kind.default_base_url().to_string();
+                                profile.model = profile.provider_kind.default_model().to_string();
+                                profile.bbox_scale_mode =
+                                    profile.provider_kind.default_bbox_scale_mode();
+                                if !profile.provider_kind.uses_secret_key() {
+                                    profile.secret_key.clear();
+                                }
+                            }
+
                             ui.label(label_text("显示名称"));
                             ui.add(
                                 egui::TextEdit::singleline(&mut profile.display_name)
@@ -687,9 +722,20 @@ impl SettingsApp {
                                     .password(true),
                             );
 
-                            ui.label(label_text("模型名称"));
+                            if profile.provider_kind.uses_secret_key() {
+                                ui.label(label_text("Secret Key"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut profile.secret_key)
+                                        .desired_width(360.0)
+                                        .password(true),
+                                );
+                            }
+
+                            ui.label(label_text(profile.provider_kind.model_field_label()));
                             ui.add(
-                                egui::TextEdit::singleline(&mut profile.model).desired_width(280.0),
+                                egui::TextEdit::singleline(&mut profile.model)
+                                    .desired_width(280.0)
+                                    .hint_text(profile.provider_kind.model_field_hint()),
                             );
 
                             egui::ComboBox::from_label("坐标范围")

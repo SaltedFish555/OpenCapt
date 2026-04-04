@@ -55,6 +55,58 @@ pub enum OcrProviderKind {
     #[default]
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "baidu_ocr")]
+    BaiduOcr,
+}
+
+impl OcrProviderKind {
+    pub const ALL: [Self; 2] = [Self::OpenAiCompatible, Self::BaiduOcr];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OpenAI Compatible",
+            Self::BaiduOcr => "百度 OCR",
+        }
+    }
+
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "https://api.openai.com/v1",
+            Self::BaiduOcr => "https://aip.baidubce.com",
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "gpt-4.1-mini",
+            Self::BaiduOcr => "general",
+        }
+    }
+
+    pub fn default_bbox_scale_mode(self) -> OcrBboxScaleMode {
+        match self {
+            Self::OpenAiCompatible => OcrBboxScaleMode::ZeroTo1000,
+            Self::BaiduOcr => OcrBboxScaleMode::PixelAbsolute,
+        }
+    }
+
+    pub fn model_field_label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "模型名称",
+            Self::BaiduOcr => "接口名称",
+        }
+    }
+
+    pub fn model_field_hint(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "例如 gpt-4.1-mini / deepseek-ocr",
+            Self::BaiduOcr => "例如 general / accurate / general_basic",
+        }
+    }
+
+    pub fn uses_secret_key(self) -> bool {
+        matches!(self, Self::BaiduOcr)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -133,6 +185,8 @@ pub struct OcrProfile {
     pub provider_kind: OcrProviderKind,
     pub base_url: String,
     pub api_key: String,
+    #[serde(default)]
+    pub secret_key: String,
     pub model: String,
     pub bbox_scale_mode: OcrBboxScaleMode,
 }
@@ -289,11 +343,26 @@ impl AppConfig {
             if profile.base_url.trim().is_empty() {
                 bail!("ocr profile base_url may not be empty");
             }
-            if profile.api_key.trim().is_empty() {
-                bail!("ocr profile api_key may not be empty");
-            }
-            if profile.model.trim().is_empty() {
-                bail!("ocr profile model may not be empty");
+            match profile.provider_kind {
+                OcrProviderKind::OpenAiCompatible => {
+                    if profile.api_key.trim().is_empty() {
+                        bail!("ocr profile api_key may not be empty");
+                    }
+                    if profile.model.trim().is_empty() {
+                        bail!("ocr profile model may not be empty");
+                    }
+                }
+                OcrProviderKind::BaiduOcr => {
+                    if profile.api_key.trim().is_empty() {
+                        bail!("baidu ocr profile api_key may not be empty");
+                    }
+                    if profile.secret_key.trim().is_empty() {
+                        bail!("baidu ocr profile secret_key may not be empty");
+                    }
+                    if profile.model.trim().is_empty() {
+                        bail!("baidu ocr profile api path may not be empty");
+                    }
+                }
             }
         }
 
@@ -793,6 +862,7 @@ mod tests {
             provider_kind: OcrProviderKind::OpenAiCompatible,
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "test-key".to_string(),
+            secret_key: String::new(),
             model: "gpt-4.1-mini".to_string(),
             bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
         });
@@ -893,6 +963,7 @@ model = "gpt-4.1-mini"
                 provider_kind: OcrProviderKind::OpenAiCompatible,
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: "a".to_string(),
+                secret_key: String::new(),
                 model: "gpt-4.1-mini".to_string(),
                 bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
             },
@@ -902,6 +973,7 @@ model = "gpt-4.1-mini"
                 provider_kind: OcrProviderKind::OpenAiCompatible,
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: "b".to_string(),
+                secret_key: String::new(),
                 model: "gpt-4.1-mini".to_string(),
                 bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
             },
@@ -911,6 +983,7 @@ model = "gpt-4.1-mini"
                 provider_kind: OcrProviderKind::OpenAiCompatible,
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: "c".to_string(),
+                secret_key: String::new(),
                 model: "gpt-4.1-mini".to_string(),
                 bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
             },
@@ -957,6 +1030,25 @@ model = "gpt-4.1-mini"
 "#,
         );
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn missing_baidu_secret_key_is_rejected() {
+        let mut config = AppConfig::default();
+        config.ocr.enabled = true;
+        config.ocr.default_profile_id = "baidu".to_string();
+        config.ocr.profiles.push(OcrProfile {
+            id: "baidu".to_string(),
+            display_name: "百度".to_string(),
+            provider_kind: OcrProviderKind::BaiduOcr,
+            base_url: "https://aip.baidubce.com".to_string(),
+            api_key: "api-key".to_string(),
+            secret_key: String::new(),
+            model: "general".to_string(),
+            bbox_scale_mode: OcrBboxScaleMode::PixelAbsolute,
+        });
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

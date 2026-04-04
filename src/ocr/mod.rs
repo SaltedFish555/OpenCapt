@@ -55,6 +55,9 @@ pub trait OcrProvider {
 #[derive(Default)]
 pub struct OpenAiCompatibleProvider;
 
+#[derive(Default)]
+pub struct BaiduOcrProvider;
+
 impl OcrProvider for OpenAiCompatibleProvider {
     fn recognize_raw(
         &self,
@@ -127,6 +130,65 @@ impl OcrProvider for OpenAiCompatibleProvider {
             }
         }
         Ok(())
+    }
+}
+impl OcrProvider for BaiduOcrProvider {
+    fn recognize_raw(
+        &self,
+        profile: &OcrProfile,
+        request: &OcrRecognizeRequest,
+    ) -> Result<OcrResultRaw> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(request.timeout_ms.max(1_000)))
+            .build()
+            .context("failed to build http client")?;
+
+        let access_token = fetch_baidu_access_token(&client, profile, request.timeout_ms)?;
+        let url = baidu_ocr_url(profile, &access_token);
+        let image_base64 = general_purpose::STANDARD.encode(&request.image_png);
+        let mut form_fields = vec![
+            ("image".to_string(), image_base64),
+            ("detect_direction".to_string(), "true".to_string()),
+            ("probability".to_string(), "true".to_string()),
+        ];
+        if let Some(language_hint) = request.language_hint.as_deref() {
+            let language_hint = language_hint.trim();
+            if !language_hint.is_empty() {
+                form_fields.push(("language_type".to_string(), language_hint.to_string()));
+            }
+        }
+
+        let response = match client.post(url).form(&form_fields).send() {
+            Ok(response) => response,
+            Err(error) => {
+                if error.is_timeout() {
+                    bail!("百度 OCR 请求超时（{} ms）", request.timeout_ms.max(1_000));
+                }
+                return Err(anyhow!("百度 OCR 请求失败: {}", error));
+            }
+        };
+
+        let status = response.status();
+        let body = response
+            .text()
+            .context("failed to read baidu ocr response body")?;
+        if !status.is_success() {
+            bail!(
+                "百度 OCR 请求失败（{}）: {}",
+                status,
+                baidu_error_summary(&body)
+            );
+        }
+
+        parse_baidu_ocr_response(&body)
+    }
+
+    fn test_connection(&self, profile: &OcrProfile, timeout_ms: u64) -> Result<()> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(timeout_ms.max(1_000)))
+            .build()
+            .context("failed to build http client")?;
+        fetch_baidu_access_token(&client, profile, timeout_ms).map(|_| ())
     }
 }
 
@@ -224,9 +286,97 @@ pub fn test_profile(profile: &OcrProfile, timeout_ms: u64) -> Result<()> {
 fn provider_for(kind: OcrProviderKind) -> Box<dyn OcrProvider + Send + Sync> {
     match kind {
         OcrProviderKind::OpenAiCompatible => Box::<OpenAiCompatibleProvider>::default(),
+        OcrProviderKind::BaiduOcr => Box::<BaiduOcrProvider>::default(),
     }
 }
 
+fn fetch_baidu_access_token(
+    client: &Client,
+    profile: &OcrProfile,
+    timeout_ms: u64,
+) -> Result<String> {
+    let url = endpoint_url(&profile.base_url, "oauth/2.0/token");
+    let response = match client
+        .post(url)
+        .query(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", profile.api_key.trim()),
+            ("client_secret", profile.secret_key.trim()),
+        ])
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            if error.is_timeout() {
+                bail!("百度 OCR 鉴权超时（{} ms）", timeout_ms.max(1_000));
+            }
+            return Err(anyhow!("百度 OCR 鉴权失败: {}", error));
+        }
+    };
+
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read baidu auth response body")?;
+    if !status.is_success() {
+        bail!(
+            "百度 OCR 鉴权失败（{}）: {}",
+            status,
+            baidu_error_summary(&body)
+        );
+    }
+
+    let parsed: BaiduAccessTokenResponse =
+        serde_json::from_str(&body).context("invalid baidu auth response")?;
+    if !parsed.access_token.trim().is_empty() {
+        return Ok(parsed.access_token);
+    }
+    bail!("百度 OCR 鉴权失败: {}", baidu_error_summary(&body))
+}
+
+fn baidu_ocr_url(profile: &OcrProfile, access_token: &str) -> String {
+    let path = profile.model.trim();
+    let endpoint = if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else if path.contains("rest/2.0/ocr/") {
+        endpoint_url(&profile.base_url, path)
+    } else {
+        endpoint_url(&profile.base_url, &format!("rest/2.0/ocr/v1/{}", path))
+    };
+
+    if endpoint.contains('?') {
+        format!("{}&access_token={}", endpoint, access_token)
+    } else {
+        format!("{}?access_token={}", endpoint, access_token)
+    }
+}
+
+fn baidu_error_summary(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return body.trim().to_string();
+    };
+
+    let code = value
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .map(|code| code.to_string())
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let message = value
+        .get("error_msg")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("error_description").and_then(Value::as_str))
+        .unwrap_or(body.trim());
+
+    match code {
+        Some(code) if !code.is_empty() => format!("{}: {}", code, message),
+        _ => message.to_string(),
+    }
+}
 fn normalize_result(
     raw: OcrResultRaw,
     scale_mode: OcrBboxScaleMode,
@@ -302,6 +452,76 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
     format!("{}/{}", trimmed, path.trim_start_matches('/'))
 }
 
+#[derive(Debug, Deserialize)]
+struct BaiduAccessTokenResponse {
+    #[serde(default)]
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaiduOcrResponse {
+    #[serde(default)]
+    words_result: Vec<BaiduOcrWord>,
+    error_code: Option<i64>,
+    error_msg: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaiduOcrWord {
+    #[serde(default)]
+    words: String,
+    location: Option<BaiduOcrLocation>,
+    probability: Option<BaiduOcrProbability>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaiduOcrLocation {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaiduOcrProbability {
+    average: Option<f32>,
+}
+
+fn parse_baidu_ocr_response(body: &str) -> Result<OcrResultRaw> {
+    let response: BaiduOcrResponse =
+        serde_json::from_str(body).context("invalid baidu ocr response")?;
+    if let Some(code) = response.error_code {
+        let message = response.error_msg.unwrap_or_else(|| "未知错误".to_string());
+        bail!("百度 OCR 识别失败（{}）：{}", code, message);
+    }
+
+    let mut full_text_parts = Vec::new();
+    let mut blocks = Vec::new();
+    for item in response.words_result {
+        let text = item.words.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        full_text_parts.push(text.clone());
+        if let Some(location) = item.location {
+            blocks.push(OcrTextBlockRaw {
+                text,
+                bbox_raw: [
+                    location.left,
+                    location.top,
+                    location.left + location.width,
+                    location.top + location.height,
+                ],
+                confidence: item.probability.and_then(|probability| probability.average),
+            });
+        }
+    }
+
+    Ok(OcrResultRaw {
+        full_text: full_text_parts.join("\n"),
+        blocks,
+    })
+}
 #[derive(Debug, Deserialize)]
 struct ParsedOcrPayload {
     #[serde(default)]
@@ -651,9 +871,35 @@ mod tests {
             provider_kind: OcrProviderKind::OpenAiCompatible,
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key: "k".to_string(),
+            secret_key: String::new(),
             model: "deepseek-ocr".to_string(),
             bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
         };
         assert!(is_deepseek_ocr_model(&profile));
+    }
+
+    #[test]
+    fn parses_baidu_ocr_response_blocks() {
+        let body = serde_json::json!({
+            "words_result": [
+                {
+                    "words": "OpenCapt",
+                    "location": { "left": 10.0, "top": 20.0, "width": 80.0, "height": 18.0 },
+                    "probability": { "average": 0.98 }
+                },
+                {
+                    "words": "百度OCR",
+                    "location": { "left": 12.0, "top": 50.0, "width": 60.0, "height": 16.0 }
+                }
+            ]
+        })
+        .to_string();
+
+        let parsed = parse_baidu_ocr_response(&body).expect("parse baidu ocr response");
+        assert_eq!(parsed.full_text, "OpenCapt\n百度OCR");
+        assert_eq!(parsed.blocks.len(), 2);
+        assert_eq!(parsed.blocks[0].bbox_raw, [10.0, 20.0, 90.0, 38.0]);
+        assert_eq!(parsed.blocks[0].confidence, Some(0.98));
+        assert_eq!(parsed.blocks[1].bbox_raw, [12.0, 50.0, 72.0, 66.0]);
     }
 }

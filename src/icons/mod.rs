@@ -58,7 +58,6 @@ pub struct RasterizedIcon {
     pub alpha: Vec<u8>,
 }
 
-
 #[derive(Debug, Default)]
 pub struct IconCache {
     icons: HashMap<IconRasterKey, RasterizedIcon>,
@@ -170,7 +169,7 @@ fn rasterize_svg_icon(id: IconId, size_px: u32) -> Result<RasterizedIcon> {
         .ok_or_else(|| anyhow!("failed to allocate pixmap for icon {:?}", id))?;
     let transform = tiny_skia::Transform::from_scale(scale, scale);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    
+
     // Extract the alpha channel directly (tiny_skia uses RGBA natively)
     let alpha: Vec<u8> = pixmap.data().iter().skip(3).step_by(4).cloned().collect();
 

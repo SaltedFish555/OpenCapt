@@ -4258,7 +4258,9 @@ fn fill_rect(frame: &mut [u32], width: u32, height: u32, rect: IntRect, color: u
     let ex = rect.right.min(width as i32).max(0) as usize;
     let ey = rect.bottom.min(height as i32).max(0) as usize;
     let a = effective_alpha(color);
-    if a == 0 { return; }
+    if a == 0 {
+        return;
+    }
     let w = width as usize;
     if a == 255 {
         let c = color | 0xff00_0000;
@@ -4296,7 +4298,6 @@ fn rounded_rect_radius(rect: IntRect, radius: i32) -> i32 {
     radius.max(0).min(max_radius)
 }
 
-
 fn rounded_rect_row_span(rect: IntRect, radius: i32, y: i32) -> (i32, i32) {
     if radius <= 0 {
         return (rect.left, rect.right);
@@ -4306,7 +4307,11 @@ fn rounded_rect_row_span(rect: IntRect, radius: i32, y: i32) -> (i32, i32) {
     if y >= inner_top && y <= inner_bottom {
         return (rect.left, rect.right);
     }
-    let corner_y = if y < inner_top { inner_top } else { inner_bottom };
+    let corner_y = if y < inner_top {
+        inner_top
+    } else {
+        inner_bottom
+    };
     let dy = y - corner_y;
     let r_sq = radius * radius;
     let dy_sq = dy * dy;
@@ -4328,7 +4333,9 @@ fn fill_rounded_rect(
     color: u32,
 ) {
     let a = effective_alpha(color);
-    if a == 0 { return; }
+    if a == 0 {
+        return;
+    }
     let radius = rounded_rect_radius(rect, radius);
     let sy = rect.top.max(0);
     let ey = rect.bottom.min(height as i32);
@@ -4392,10 +4399,14 @@ fn stroke_rounded_rect(
         let xl = rl.max(clip_left);
         let xr = rr.min(clip_right);
         for x in xl..xr {
-            let is_border = x == rl || x == rr - 1
-                || y == rect.top || y == rect.bottom - 1
-                || x < rl_above || x >= rr_above
-                || x < rl_below || x >= rr_below;
+            let is_border = x == rl
+                || x == rr - 1
+                || y == rect.top
+                || y == rect.bottom - 1
+                || x < rl_above
+                || x >= rr_above
+                || x < rl_below
+                || x >= rr_below;
             if is_border {
                 put_pixel(frame, width, height, x, y, color);
             }
