@@ -2,8 +2,9 @@ use crate::hotkey;
 use anyhow::{Context, Result, anyhow, bail};
 use directories_next::{BaseDirs, UserDirs};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::process;
 
 const APP_NAME: &str = "OpenCapt";
 pub const ANNOTATION_COLOR_PRESETS: [u32; 5] = [0xF14C4C, 0xFF8C00, 0xF2C94C, 0x2ECC71, 0x4F8CFF];
@@ -114,6 +115,59 @@ pub enum TranslationProviderKind {
     #[default]
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "baidu_image_translate")]
+    BaiduImageTranslate,
+}
+
+impl TranslationProviderKind {
+    pub const ALL: [Self; 2] = [Self::OpenAiCompatible, Self::BaiduImageTranslate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OpenAI Compatible",
+            Self::BaiduImageTranslate => "百度图片翻译",
+        }
+    }
+
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "https://api.openai.com/v1",
+            Self::BaiduImageTranslate => "https://aip.baidubce.com",
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "gpt-4.1-mini",
+            Self::BaiduImageTranslate => "file/2.0/mt/pictrans/v1",
+        }
+    }
+
+    pub fn model_field_label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "模型名称",
+            Self::BaiduImageTranslate => "接口路径",
+        }
+    }
+
+    pub fn model_field_hint(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "例如 gpt-4.1-mini",
+            Self::BaiduImageTranslate => "例如 file/2.0/mt/pictrans/v1",
+        }
+    }
+
+    pub fn uses_secret_key(self) -> bool {
+        matches!(self, Self::BaiduImageTranslate)
+    }
+
+    pub fn uses_prompt_template(self) -> bool {
+        matches!(self, Self::OpenAiCompatible)
+    }
+
+    pub fn supports_image_output(self) -> bool {
+        matches!(self, Self::BaiduImageTranslate)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -153,6 +207,7 @@ pub struct GeneralConfig {
     pub hotkey: String,
     pub auto_copy: bool,
     pub auto_save: bool,
+    pub launch_at_startup: bool,
     pub save_dir: PathBuf,
 }
 
@@ -207,8 +262,17 @@ pub struct TranslationProfile {
     pub provider_kind: TranslationProviderKind,
     pub base_url: String,
     pub api_key: String,
+    #[serde(default)]
+    pub secret_key: String,
     pub model: String,
+    #[serde(default)]
     pub prompt_template: String,
+    #[serde(default)]
+    pub source_lang: String,
+    #[serde(default)]
+    pub target_lang: String,
+    #[serde(default)]
+    pub use_translated_image: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -242,6 +306,7 @@ impl Default for GeneralConfig {
             hotkey: "Ctrl+Shift+A".to_string(),
             auto_copy: true,
             auto_save: true,
+            launch_at_startup: false,
             save_dir: default_save_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\Users\Public\Pictures\OpenCapt")),
         }
@@ -411,14 +476,35 @@ impl AppConfig {
             if profile.base_url.trim().is_empty() {
                 bail!("translation profile base_url may not be empty");
             }
-            if profile.api_key.trim().is_empty() {
-                bail!("translation profile api_key may not be empty");
-            }
-            if profile.model.trim().is_empty() {
-                bail!("translation profile model may not be empty");
-            }
-            if profile.prompt_template.trim().is_empty() {
-                bail!("translation profile prompt_template may not be empty");
+            match profile.provider_kind {
+                TranslationProviderKind::OpenAiCompatible => {
+                    if profile.api_key.trim().is_empty() {
+                        bail!("translation profile api_key may not be empty");
+                    }
+                    if profile.model.trim().is_empty() {
+                        bail!("translation profile model may not be empty");
+                    }
+                    if profile.prompt_template.trim().is_empty() {
+                        bail!("translation profile prompt_template may not be empty");
+                    }
+                }
+                TranslationProviderKind::BaiduImageTranslate => {
+                    if profile.api_key.trim().is_empty() {
+                        bail!("baidu translation profile api_key may not be empty");
+                    }
+                    if profile.secret_key.trim().is_empty() {
+                        bail!("baidu translation profile secret_key may not be empty");
+                    }
+                    if profile.model.trim().is_empty() {
+                        bail!("baidu translation profile api path may not be empty");
+                    }
+                    if profile.source_lang.trim().is_empty() {
+                        bail!("baidu translation profile source_lang may not be empty");
+                    }
+                    if profile.target_lang.trim().is_empty() {
+                        bail!("baidu translation profile target_lang may not be empty");
+                    }
+                }
             }
         }
 
@@ -493,6 +579,29 @@ impl AppConfig {
             .request_timeout_ms
             .clamp(TRANSLATION_TIMEOUT_MIN_MS, TRANSLATION_TIMEOUT_MAX_MS);
         normalize_translation_profile_ids(&mut self.translation.profiles);
+        for profile in &mut self.translation.profiles {
+            if matches!(
+                profile.provider_kind,
+                TranslationProviderKind::BaiduImageTranslate
+            ) {
+                if profile.source_lang.trim().is_empty() {
+                    profile.source_lang = "auto".to_string();
+                }
+                if profile.target_lang.trim().is_empty() {
+                    profile.target_lang = "zh".to_string();
+                }
+                if profile.model.trim().is_empty() {
+                    profile.model = TranslationProviderKind::BaiduImageTranslate
+                        .default_model()
+                        .to_string();
+                }
+                if profile.base_url.trim().is_empty() {
+                    profile.base_url = TranslationProviderKind::BaiduImageTranslate
+                        .default_base_url()
+                        .to_string();
+                }
+            }
+        }
 
         if self.translation.profiles.is_empty() {
             self.translation.enabled = false;
@@ -579,6 +688,7 @@ struct AppConfigCompat {
     hotkey: Option<String>,
     auto_copy: Option<bool>,
     auto_save: Option<bool>,
+    launch_at_startup: Option<bool>,
     save_dir: Option<PathBuf>,
 }
 
@@ -588,6 +698,7 @@ struct GeneralConfigCompat {
     hotkey: Option<String>,
     auto_copy: Option<bool>,
     auto_save: Option<bool>,
+    launch_at_startup: Option<bool>,
     save_dir: Option<PathBuf>,
 }
 
@@ -660,6 +771,9 @@ impl AppConfigCompat {
         if let Some(auto_save) = self.auto_save {
             config.general.auto_save = auto_save;
         }
+        if let Some(launch_at_startup) = self.launch_at_startup {
+            config.general.launch_at_startup = launch_at_startup;
+        }
         if let Some(save_dir) = self.save_dir {
             config.general.save_dir = save_dir;
         }
@@ -677,6 +791,9 @@ fn apply_general(target: &mut GeneralConfig, value: GeneralConfigCompat) {
     }
     if let Some(auto_save) = value.auto_save {
         target.auto_save = auto_save;
+    }
+    if let Some(launch_at_startup) = value.launch_at_startup {
+        target.launch_at_startup = launch_at_startup;
     }
     if let Some(save_dir) = value.save_dir {
         target.save_dir = save_dir;
@@ -814,6 +931,31 @@ pub fn write_config(path: &Path, config: &AppConfig) -> Result<()> {
 }
 
 fn app_paths() -> Result<AppPaths> {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let portable_paths = portable_app_paths(exe_dir);
+            if path_is_writable(&portable_paths.config_dir) {
+                return Ok(portable_paths);
+            }
+        }
+    }
+
+    appdata_app_paths()
+}
+
+fn portable_app_paths(exe_dir: &Path) -> AppPaths {
+    let config_dir = exe_dir.to_path_buf();
+    let config_file = config_dir.join("config.toml");
+    let log_dir = config_dir.join("logs");
+
+    AppPaths {
+        config_dir,
+        config_file,
+        log_dir,
+    }
+}
+
+fn appdata_app_paths() -> Result<AppPaths> {
     let base_dirs =
         BaseDirs::new().ok_or_else(|| anyhow!("failed to discover base directories"))?;
     let config_dir = base_dirs.config_dir().join(APP_NAME);
@@ -825,6 +967,26 @@ fn app_paths() -> Result<AppPaths> {
         config_file,
         log_dir,
     })
+}
+
+fn path_is_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+
+    let probe_path = dir.join(format!(".opencapt_write_test_{}", process::id()));
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe_path)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe_path);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn default_save_dir() -> Option<PathBuf> {
@@ -841,6 +1003,7 @@ mod tests {
         assert_eq!(config.general.hotkey, "Ctrl+Shift+A");
         assert!(config.general.auto_copy);
         assert!(config.general.auto_save);
+        assert!(!config.general.launch_at_startup);
         assert!(config.general.save_dir.ends_with("OpenCapt"));
         assert_eq!(config.annotation_defaults.default_color_index, 4);
         assert_eq!(config.pin_defaults.opacity_percent, 100);
@@ -875,8 +1038,13 @@ mod tests {
             provider_kind: TranslationProviderKind::OpenAiCompatible,
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "translate-key".to_string(),
+            secret_key: String::new(),
             model: "gpt-4.1-mini".to_string(),
-            prompt_template: "Translate the following text into Chinese. Return only the translated text without explanation.\n{{text}}".to_string(),
+            prompt_template: "Translate the following text into Chinese. Return only the translated text without explanation.
+{{text}}".to_string(),
+            source_lang: "auto".to_string(),
+            target_lang: "zh".to_string(),
+            use_translated_image: false,
         });
         config.translation.enabled = true;
         config.translation.default_profile_id = "tr_default".to_string();
@@ -901,6 +1069,7 @@ save_dir = "C:\\Shots"
         assert_eq!(parsed.general.hotkey, "Alt+Shift+Z");
         assert!(!parsed.general.auto_copy);
         assert!(parsed.general.auto_save);
+        assert!(!parsed.general.launch_at_startup);
         assert_eq!(parsed.general.save_dir, PathBuf::from(r"C:\Shots"));
         assert_eq!(
             parsed.annotation_defaults.text_font_family,
@@ -920,6 +1089,7 @@ hotkey = "Alt+Shift+S"
 
         assert_eq!(parsed.general.hotkey, "Alt+Shift+S");
         assert!(parsed.general.auto_copy);
+        assert!(!parsed.general.launch_at_startup);
         assert_eq!(
             parsed.annotation_defaults.stroke_width,
             DEFAULT_STROKE_WIDTH
@@ -1028,8 +1198,9 @@ base_url = "https://api.openai.com/v1"
 api_key = "abc"
 model = "gpt-4.1-mini"
 "#,
-        );
-        assert!(parsed.is_err());
+        )
+        .expect("parse translation config");
+        assert!(parsed.validate().is_err());
     }
 
     #[test]
@@ -1063,6 +1234,10 @@ model = "gpt-4.1-mini"
                 api_key: "a".to_string(),
                 model: "gpt-4.1-mini".to_string(),
                 prompt_template: "{{texts}}".to_string(),
+                secret_key: String::new(),
+                source_lang: "auto".to_string(),
+                target_lang: "zh".to_string(),
+                use_translated_image: false,
             },
             TranslationProfile {
                 id: "translate_profile_1".to_string(),
@@ -1072,6 +1247,10 @@ model = "gpt-4.1-mini"
                 api_key: "b".to_string(),
                 model: "gpt-4.1-mini".to_string(),
                 prompt_template: "{{texts}}".to_string(),
+                secret_key: String::new(),
+                source_lang: "auto".to_string(),
+                target_lang: "zh".to_string(),
+                use_translated_image: false,
             },
             TranslationProfile {
                 id: "translate_profile_1".to_string(),
@@ -1081,6 +1260,10 @@ model = "gpt-4.1-mini"
                 api_key: "c".to_string(),
                 model: "gpt-4.1-mini".to_string(),
                 prompt_template: "{{texts}}".to_string(),
+                secret_key: String::new(),
+                source_lang: "auto".to_string(),
+                target_lang: "zh".to_string(),
+                use_translated_image: false,
             },
         ];
         config.translation.default_profile_id = "missing".to_string();
@@ -1106,8 +1289,17 @@ model = "gpt-4.1-mini"
         );
     }
     #[test]
-    fn config_paths_land_under_appdata() {
-        let paths = app_paths().expect("resolve paths");
+    fn portable_paths_place_config_next_to_exe() {
+        let exe_dir = Path::new(r"C:\Apps\OpenCapt");
+        let paths = portable_app_paths(exe_dir);
+        assert_eq!(paths.config_dir, exe_dir);
+        assert_eq!(paths.config_file, exe_dir.join("config.toml"));
+        assert_eq!(paths.log_dir, exe_dir.join("logs"));
+    }
+
+    #[test]
+    fn appdata_paths_land_under_appdata() {
+        let paths = appdata_app_paths().expect("resolve paths");
         assert!(paths.config_dir.ends_with("OpenCapt"));
         assert_eq!(
             paths.config_file.file_name().and_then(|name| name.to_str()),
