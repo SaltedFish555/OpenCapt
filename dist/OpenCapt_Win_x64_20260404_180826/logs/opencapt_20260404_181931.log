@@ -1,0 +1,7 @@
+2026-04-04T10:19:31.269827Z  INFO opencapt: OpenCapt starting startup_mode=Run
+2026-04-04T10:19:31.328550Z  INFO opencapt::app: registered global hotkey hotkey=HotKey { mods: Modifiers(CONTROL | SHIFT), key: KeyA, id: 34078739 }
+2026-04-04T10:19:31.400752Z  WARN opencapt::overlay: failed to exclude overlay window from capture error=Error { code: HRESULT(0x80070008), message: "内存资源不足，无法处理此命令。" }
+2026-04-04T10:19:31.401251Z  INFO opencapt::app: overlay prewarmed
+2026-04-04T10:19:33.912661Z  INFO opencapt::overlay: overlay opened viewport_x=0 viewport_y=0 viewport_width=2560 viewport_height=1440
+2026-04-04T10:19:34.158587Z  INFO opencapt::app: overlay opened startup=Run
+2026-04-04T10:19:43.640066Z  INFO opencapt::app: selection cancelled startup=Run

@@ -1,0 +1,7 @@
+2026-04-04T11:08:46.077460Z  INFO opencapt: OpenCapt starting startup_mode=Run
+2026-04-04T11:08:46.203133Z ERROR opencapt::app: failed to register hotkey error=failed to register hotkey Ctrl+Shift+A
+
+Caused by:
+    HotKey already registered: HotKey { mods: Modifiers(CONTROL | SHIFT), key: KeyA, id: 34078739 } hotkey="Ctrl+Shift+A"
+2026-04-04T11:08:46.290583Z  WARN opencapt::overlay: failed to exclude overlay window from capture error=Error { code: HRESULT(0x80070008), message: "内存资源不足，无法处理此命令。" }
+2026-04-04T11:08:46.291059Z  INFO opencapt::app: overlay prewarmed

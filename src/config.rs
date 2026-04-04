@@ -2,8 +2,9 @@ use crate::hotkey;
 use anyhow::{Context, Result, anyhow, bail};
 use directories_next::{BaseDirs, UserDirs};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::process;
 
 const APP_NAME: &str = "OpenCapt";
 pub const ANNOTATION_COLOR_PRESETS: [u32; 5] = [0xF14C4C, 0xFF8C00, 0xF2C94C, 0x2ECC71, 0x4F8CFF];
@@ -206,6 +207,7 @@ pub struct GeneralConfig {
     pub hotkey: String,
     pub auto_copy: bool,
     pub auto_save: bool,
+    pub launch_at_startup: bool,
     pub save_dir: PathBuf,
 }
 
@@ -304,6 +306,7 @@ impl Default for GeneralConfig {
             hotkey: "Ctrl+Shift+A".to_string(),
             auto_copy: true,
             auto_save: true,
+            launch_at_startup: false,
             save_dir: default_save_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\Users\Public\Pictures\OpenCapt")),
         }
@@ -685,6 +688,7 @@ struct AppConfigCompat {
     hotkey: Option<String>,
     auto_copy: Option<bool>,
     auto_save: Option<bool>,
+    launch_at_startup: Option<bool>,
     save_dir: Option<PathBuf>,
 }
 
@@ -694,6 +698,7 @@ struct GeneralConfigCompat {
     hotkey: Option<String>,
     auto_copy: Option<bool>,
     auto_save: Option<bool>,
+    launch_at_startup: Option<bool>,
     save_dir: Option<PathBuf>,
 }
 
@@ -766,6 +771,9 @@ impl AppConfigCompat {
         if let Some(auto_save) = self.auto_save {
             config.general.auto_save = auto_save;
         }
+        if let Some(launch_at_startup) = self.launch_at_startup {
+            config.general.launch_at_startup = launch_at_startup;
+        }
         if let Some(save_dir) = self.save_dir {
             config.general.save_dir = save_dir;
         }
@@ -783,6 +791,9 @@ fn apply_general(target: &mut GeneralConfig, value: GeneralConfigCompat) {
     }
     if let Some(auto_save) = value.auto_save {
         target.auto_save = auto_save;
+    }
+    if let Some(launch_at_startup) = value.launch_at_startup {
+        target.launch_at_startup = launch_at_startup;
     }
     if let Some(save_dir) = value.save_dir {
         target.save_dir = save_dir;
@@ -920,6 +931,31 @@ pub fn write_config(path: &Path, config: &AppConfig) -> Result<()> {
 }
 
 fn app_paths() -> Result<AppPaths> {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let portable_paths = portable_app_paths(exe_dir);
+            if path_is_writable(&portable_paths.config_dir) {
+                return Ok(portable_paths);
+            }
+        }
+    }
+
+    appdata_app_paths()
+}
+
+fn portable_app_paths(exe_dir: &Path) -> AppPaths {
+    let config_dir = exe_dir.to_path_buf();
+    let config_file = config_dir.join("config.toml");
+    let log_dir = config_dir.join("logs");
+
+    AppPaths {
+        config_dir,
+        config_file,
+        log_dir,
+    }
+}
+
+fn appdata_app_paths() -> Result<AppPaths> {
     let base_dirs =
         BaseDirs::new().ok_or_else(|| anyhow!("failed to discover base directories"))?;
     let config_dir = base_dirs.config_dir().join(APP_NAME);
@@ -931,6 +967,26 @@ fn app_paths() -> Result<AppPaths> {
         config_file,
         log_dir,
     })
+}
+
+fn path_is_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+
+    let probe_path = dir.join(format!(".opencapt_write_test_{}", process::id()));
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe_path)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe_path);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn default_save_dir() -> Option<PathBuf> {
@@ -947,6 +1003,7 @@ mod tests {
         assert_eq!(config.general.hotkey, "Ctrl+Shift+A");
         assert!(config.general.auto_copy);
         assert!(config.general.auto_save);
+        assert!(!config.general.launch_at_startup);
         assert!(config.general.save_dir.ends_with("OpenCapt"));
         assert_eq!(config.annotation_defaults.default_color_index, 4);
         assert_eq!(config.pin_defaults.opacity_percent, 100);
@@ -1012,6 +1069,7 @@ save_dir = "C:\\Shots"
         assert_eq!(parsed.general.hotkey, "Alt+Shift+Z");
         assert!(!parsed.general.auto_copy);
         assert!(parsed.general.auto_save);
+        assert!(!parsed.general.launch_at_startup);
         assert_eq!(parsed.general.save_dir, PathBuf::from(r"C:\Shots"));
         assert_eq!(
             parsed.annotation_defaults.text_font_family,
@@ -1031,6 +1089,7 @@ hotkey = "Alt+Shift+S"
 
         assert_eq!(parsed.general.hotkey, "Alt+Shift+S");
         assert!(parsed.general.auto_copy);
+        assert!(!parsed.general.launch_at_startup);
         assert_eq!(
             parsed.annotation_defaults.stroke_width,
             DEFAULT_STROKE_WIDTH
@@ -1230,8 +1289,17 @@ model = "gpt-4.1-mini"
         );
     }
     #[test]
-    fn config_paths_land_under_appdata() {
-        let paths = app_paths().expect("resolve paths");
+    fn portable_paths_place_config_next_to_exe() {
+        let exe_dir = Path::new(r"C:\Apps\OpenCapt");
+        let paths = portable_app_paths(exe_dir);
+        assert_eq!(paths.config_dir, exe_dir);
+        assert_eq!(paths.config_file, exe_dir.join("config.toml"));
+        assert_eq!(paths.log_dir, exe_dir.join("logs"));
+    }
+
+    #[test]
+    fn appdata_paths_land_under_appdata() {
+        let paths = appdata_app_paths().expect("resolve paths");
         assert!(paths.config_dir.ends_with("OpenCapt"));
         assert_eq!(
             paths.config_file.file_name().and_then(|name| name.to_str()),

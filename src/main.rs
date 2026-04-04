@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
 mod capture;
 mod config;
@@ -9,12 +10,13 @@ mod output;
 mod overlay;
 mod pin;
 mod settings;
+mod startup;
 mod translation;
 mod tray;
 
 use anyhow::Result;
 use std::env;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupMode {
@@ -28,6 +30,10 @@ fn main() -> Result<()> {
     let startup_mode = parse_startup_mode(env::args())?;
     let (config, paths) = config::load_or_create()?;
     let _logging_guard = logging::init(&paths.log_dir)?;
+
+    if let Err(error) = startup::sync_launch_at_startup(config.general.launch_at_startup) {
+        warn!(?error, "failed to sync launch-at-startup state");
+    }
 
     info!(?startup_mode, "OpenCapt starting");
 

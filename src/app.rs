@@ -5,7 +5,7 @@ use crate::{
     output,
     overlay::{OverlaySession, OverlaySignal, PinnedCapture},
     pin::PinWindow,
-    settings,
+    settings, startup,
     tray::{TrayAction, TrayHandles},
 };
 use global_hotkey::GlobalHotKeyEvent;
@@ -215,6 +215,7 @@ impl App {
 
     fn apply_runtime_config(&mut self, next: AppConfig) -> anyhow::Result<()> {
         fs::create_dir_all(&next.general.save_dir)?;
+        startup::sync_launch_at_startup(next.general.launch_at_startup)?;
         if self.config.general.hotkey != next.general.hotkey {
             let replacement = RegisteredHotkey::register(&next.general.hotkey)?;
             self.hotkey = Some(replacement);

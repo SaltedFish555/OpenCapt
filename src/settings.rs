@@ -6,7 +6,7 @@ use crate::{
         TranslationProviderKind,
     },
     hotkey::RegisteredHotkey,
-    ocr, translation,
+    ocr, startup, translation,
 };
 use anyhow::{Context, Result, bail};
 use eframe::{App, CreationContext, NativeOptions, egui};
@@ -352,6 +352,8 @@ impl SettingsApp {
                 next.general.save_dir.display()
             )
         })?;
+        startup::sync_launch_at_startup(next.general.launch_at_startup)
+            .context("更新开机自启失败")?;
         crate::config::write_config(&self.paths.config_file, &next)?;
 
         self.original = next.clone();
@@ -525,6 +527,13 @@ impl SettingsApp {
                 &mut self.draft.general.auto_save,
                 "截图完成后自动保存到文件",
             );
+            ui.checkbox(
+                &mut self.draft.general.launch_at_startup,
+                "开机时自动启动 OpenCapt",
+            );
+            ui.label(label_text(
+                "仅对当前 Windows 用户生效，保存后立即更新系统自启动项",
+            ));
         });
 
         section_card(ui, "保存目录", |ui| {
