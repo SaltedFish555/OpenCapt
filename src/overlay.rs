@@ -3703,6 +3703,56 @@ fn paint_selection(state: &mut OverlayState) {
     }
 }
 
+fn sample_region_avg_color(
+    base_frame: &[u32],
+    width: u32,
+    height: u32,
+    rect: &IntRect,
+) -> u32 {
+    let x0 = rect.left.max(0) as usize;
+    let y0 = rect.top.max(0) as usize;
+    let x1 = rect.right.min(width as i32) as usize;
+    let y1 = rect.bottom.min(height as i32) as usize;
+    if x1 <= x0 || y1 <= y0 {
+        return 0xF0F0F0;
+    }
+    let step = ((x1 - x0).max(y1 - y0) / 12).max(1);
+    let mut sum_r: u64 = 0;
+    let mut sum_g: u64 = 0;
+    let mut sum_b: u64 = 0;
+    let mut count: u64 = 0;
+    let w = width as usize;
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            let pixel = base_frame[y * w + x];
+            sum_r += ((pixel >> 16) & 0xff) as u64;
+            sum_g += ((pixel >> 8) & 0xff) as u64;
+            sum_b += (pixel & 0xff) as u64;
+            count += 1;
+            x += step;
+        }
+        y += step;
+    }
+    if count == 0 {
+        return 0xF0F0F0;
+    }
+    let avg_r = (sum_r / count) as u32;
+    let avg_g = (sum_g / count) as u32;
+    let avg_b = (sum_b / count) as u32;
+    (avg_r << 16) | (avg_g << 8) | avg_b
+}
+
+fn ocr_overlay_bg_color(avg_color: u32) -> u32 {
+    let r = ((avg_color >> 16) & 0xff) as u32;
+    let g = ((avg_color >> 8) & 0xff) as u32;
+    let b = (avg_color & 0xff) as u32;
+    let mix = |c: u32| ((c * 80 + 255 * 20) / 100).min(255);
+    let alpha = 0xE8u32;
+    (alpha << 24) | (mix(r) << 16) | (mix(g) << 8) | mix(b)
+}
+
 fn paint_ocr_blocks(state: &mut OverlayState) {
     if state.ocr_blocks.is_empty() {
         return;
@@ -3717,6 +3767,35 @@ fn paint_ocr_blocks(state: &mut OverlayState) {
 
     for (index, block) in state.ocr_blocks.iter().enumerate() {
         let active = state.ocr_selected_block == Some(index) || hovered_index == Some(index);
+
+        let label = IntRect {
+            left: block.rect.left,
+            top: block.rect.top,
+            right: block.rect.right,
+            bottom: block.rect.bottom,
+        };
+        let h = label.bottom - label.top;
+        if label.width() < 10 || h < 10 {
+            continue;
+        }
+
+        let avg_color = sample_region_avg_color(
+            &state.base_opaque_frame,
+            state.target.width,
+            state.target.height,
+            &label,
+        );
+        let bg_color = ocr_overlay_bg_color(avg_color);
+
+        fill_rounded_rect(
+            &mut state.frame,
+            state.target.width,
+            state.target.height,
+            label,
+            0,
+            bg_color,
+        );
+
         draw_rect_outline(
             &mut state.frame,
             block.rect,
@@ -3741,32 +3820,13 @@ fn paint_ocr_blocks(state: &mut OverlayState) {
         if raw_text.is_empty() {
             continue;
         }
-        let text = if raw_text.chars().count() > 18 {
-            let mut short = raw_text.chars().take(17).collect::<String>();
-            short.push('…');
-            short
-        } else {
-            raw_text.to_string()
-        };
 
-        let label = IntRect {
-            left: block.rect.left + 3,
-            top: block.rect.top + 3,
-            right: (block.rect.right - 3).max(block.rect.left + 22),
-            bottom: (block.rect.top + 24).min(block.rect.bottom - 3),
-        };
-        if label.width() < 20 || (label.bottom - label.top) < 12 {
-            continue;
-        }
-        fill_rounded_rect(
-            &mut state.frame,
-            state.target.width,
-            state.target.height,
-            label,
-            5,
-            0x0F1725,
-        );
-        draw_gdi_text_centered(
+        let font_height = ((h as f32) * 0.82).round() as i32;
+        let font_height = font_height.clamp(14, 96);
+
+        let text_color = contrast_ink(bg_color & 0x00FF_FFFF);
+
+        draw_gdi_text_centered_styled(
             &mut state.frame,
             state.target.width,
             state.target.height,
@@ -3774,9 +3834,12 @@ fn paint_ocr_blocks(state: &mut OverlayState) {
                 x: (label.left + label.right) / 2,
                 y: (label.top + label.bottom) / 2,
             },
-            &text,
-            13,
-            TOOLBAR_TEXT,
+            raw_text,
+            font_height,
+            text_color,
+            false,
+            false,
+            TextFontFamily::DengXian,
         );
     }
 }
@@ -5814,7 +5877,7 @@ fn draw_gdi_text_centered_styled(
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
+            ANTIALIASED_QUALITY,
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             font_face_name(font_family),
         )
@@ -5865,21 +5928,23 @@ fn draw_gdi_text_centered_styled(
         }
     };
     let old_bitmap = unsafe { SelectObject(hdc, bitmap.into()) };
+    let pixels = unsafe {
+        std::slice::from_raw_parts_mut(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
+    };
+    pixels.fill(0);
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, colorref_from_rgb(color));
+        let _ = SetTextColor(hdc, colorref_from_rgb(0xFFFFFF)); // White text to extract coverage
         let _ = TextOutW(hdc, 0, ((bitmap_height - size.cy) / 2).max(0), &utf16);
     }
-    let pixels = unsafe {
-        std::slice::from_raw_parts(bits.cast::<u32>(), (bitmap_width * bitmap_height) as usize)
-    };
     let start_x = center.x - bitmap_width / 2;
     let start_y = center.y - bitmap_height / 2;
     for y in 0..bitmap_height {
         for x in 0..bitmap_width {
             let pixel = pixels[(y * bitmap_width + x) as usize] & 0x00ff_ffff;
-            if pixel != 0 {
-                put_pixel(frame, width, height, start_x + x, start_y + y, pixel);
+            let coverage = text_bitmap_coverage(pixel);
+            if coverage != 0 {
+                blend_pixel(frame, width, height, start_x + x, start_y + y, color, coverage);
             }
         }
     }
