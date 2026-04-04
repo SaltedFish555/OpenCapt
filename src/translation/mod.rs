@@ -1,6 +1,8 @@
 use crate::config::{TranslationProfile, TranslationProviderKind};
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::blocking::Client;
+use base64::{Engine as _, engine::general_purpose};
+use reqwest::blocking::{Client, multipart};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -14,6 +16,29 @@ const SYSTEM_PROMPT: &str = "You are a translation engine. Translate only the pr
 pub const DEFAULT_PROMPT_TEMPLATE: &str = "Translate the following text into Chinese. Return only the translated text without explanation.\n{{text}}";
 const MAX_PARALLEL_REQUESTS: usize = 4;
 
+#[derive(Debug, Clone)]
+pub struct ImageTranslateRequest {
+    pub image_png: Vec<u8>,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranslationBlock {
+    pub source_text: String,
+    pub translated_text: String,
+    pub bbox_norm: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageTranslationResult {
+    pub source_full_text: String,
+    pub translated_full_text: String,
+    pub blocks: Vec<TranslationBlock>,
+    pub pasted_image: Option<Vec<u8>>,
+}
+
 pub trait TranslationProvider {
     fn translate_one(
         &self,
@@ -22,11 +47,22 @@ pub trait TranslationProvider {
         timeout_ms: u64,
     ) -> Result<String>;
 
+    fn translate_image(
+        &self,
+        _profile: &TranslationProfile,
+        _request: &ImageTranslateRequest,
+    ) -> Result<ImageTranslationResult> {
+        bail!("当前翻译模型不支持图片翻译")
+    }
+
     fn test_connection(&self, profile: &TranslationProfile, timeout_ms: u64) -> Result<()>;
 }
 
 #[derive(Default)]
 pub struct OpenAiCompatibleTranslationProvider;
+
+#[derive(Default)]
+pub struct BaiduImageTranslationProvider;
 
 impl TranslationProvider for OpenAiCompatibleTranslationProvider {
     fn translate_one(
@@ -77,6 +113,84 @@ impl TranslationProvider for OpenAiCompatibleTranslationProvider {
             }
         }
         Ok(())
+    }
+}
+
+impl TranslationProvider for BaiduImageTranslationProvider {
+    fn translate_one(
+        &self,
+        _profile: &TranslationProfile,
+        _text: &str,
+        _timeout_ms: u64,
+    ) -> Result<String> {
+        bail!("百度图片翻译不支持纯文本块翻译")
+    }
+
+    fn translate_image(
+        &self,
+        profile: &TranslationProfile,
+        request: &ImageTranslateRequest,
+    ) -> Result<ImageTranslationResult> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(request.timeout_ms.max(1_000)))
+            .build()
+            .context("failed to build http client")?;
+        let access_token = fetch_baidu_access_token(&client, profile, request.timeout_ms)?;
+        let url = baidu_pictrans_url(profile, &access_token);
+        let image_part = multipart::Part::bytes(request.image_png.clone())
+            .file_name("capture.png")
+            .mime_str("image/png")
+            .context("failed to prepare png upload")?;
+        let paste_value = if profile.use_translated_image {
+            "1"
+        } else {
+            "0"
+        };
+        let form = multipart::Form::new()
+            .text("from", normalize_baidu_language(&profile.source_lang))
+            .text("to", normalize_baidu_language(&profile.target_lang))
+            .text("paste", paste_value.to_string())
+            .part("image", image_part);
+
+        let response = match client.post(url).multipart(form).send() {
+            Ok(response) => response,
+            Err(error) => {
+                if error.is_timeout() {
+                    bail!(
+                        "百度图片翻译请求超时（{} ms）",
+                        request.timeout_ms.max(1_000)
+                    );
+                }
+                return Err(anyhow!("百度图片翻译请求失败: {}", error));
+            }
+        };
+
+        let status = response.status();
+        let body = response
+            .text()
+            .context("failed to read baidu image translation response body")?;
+        if !status.is_success() {
+            bail!(
+                "百度图片翻译请求失败（{}）: {}",
+                status,
+                baidu_error_summary(&body)
+            );
+        }
+
+        parse_baidu_image_translation_response(
+            &body,
+            request.image_width,
+            request.image_height,
+            profile.use_translated_image,
+        )
+    }
+
+    fn test_connection(&self, profile: &TranslationProfile, timeout_ms: u64) -> Result<()> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(timeout_ms.max(1_000)))
+            .build()
+            .context("failed to build http client")?;
+        fetch_baidu_access_token(&client, profile, timeout_ms).map(|_| ())
     }
 }
 
@@ -169,6 +283,14 @@ pub fn translate_blocks_parallel(
     Ok(result)
 }
 
+pub fn translate_image_with_profile(
+    profile: &TranslationProfile,
+    request: &ImageTranslateRequest,
+) -> Result<ImageTranslationResult> {
+    let provider = provider_for(profile.provider_kind);
+    provider.translate_image(profile, request)
+}
+
 pub fn test_profile(profile: &TranslationProfile, timeout_ms: u64) -> Result<()> {
     let provider = provider_for(profile.provider_kind);
     provider.test_connection(profile, timeout_ms)
@@ -178,6 +300,9 @@ fn provider_for(kind: TranslationProviderKind) -> Box<dyn TranslationProvider + 
     match kind {
         TranslationProviderKind::OpenAiCompatible => {
             Box::<OpenAiCompatibleTranslationProvider>::default()
+        }
+        TranslationProviderKind::BaiduImageTranslate => {
+            Box::<BaiduImageTranslationProvider>::default()
         }
     }
 }
@@ -226,6 +351,349 @@ fn send_chat_completion(
         bail!("empty translation response content");
     }
     Ok(content)
+}
+
+fn fetch_baidu_access_token(
+    client: &Client,
+    profile: &TranslationProfile,
+    timeout_ms: u64,
+) -> Result<String> {
+    let url = endpoint_url(&profile.base_url, "oauth/2.0/token");
+    let response = match client
+        .post(url)
+        .query(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", profile.api_key.trim()),
+            ("client_secret", profile.secret_key.trim()),
+        ])
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            if error.is_timeout() {
+                bail!("百度图片翻译鉴权超时（{} ms）", timeout_ms.max(1_000));
+            }
+            return Err(anyhow!("百度图片翻译鉴权失败: {}", error));
+        }
+    };
+
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read baidu auth response body")?;
+    if !status.is_success() {
+        bail!(
+            "百度图片翻译鉴权失败（{}）: {}",
+            status,
+            baidu_error_summary(&body)
+        );
+    }
+
+    let parsed: BaiduAccessTokenResponse =
+        serde_json::from_str(&body).context("invalid baidu auth response")?;
+    if !parsed.access_token.trim().is_empty() {
+        return Ok(parsed.access_token);
+    }
+    bail!("百度图片翻译鉴权失败: {}", baidu_error_summary(&body))
+}
+
+fn baidu_pictrans_url(profile: &TranslationProfile, access_token: &str) -> String {
+    let path = profile.model.trim();
+    let endpoint = if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        endpoint_url(&profile.base_url, path)
+    };
+
+    if endpoint.contains('?') {
+        format!("{}&access_token={}", endpoint, access_token)
+    } else {
+        format!("{}?access_token={}", endpoint, access_token)
+    }
+}
+
+fn normalize_baidu_language(language: &str) -> String {
+    let trimmed = language.trim();
+    if trimmed.is_empty() {
+        "auto".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn parse_baidu_image_translation_response(
+    body: &str,
+    image_width: u32,
+    image_height: u32,
+    prefer_pasted_image: bool,
+) -> Result<ImageTranslationResult> {
+    let value: Value =
+        serde_json::from_str(body).context("invalid baidu image translation response")?;
+    let data = value.get("data").unwrap_or(&value);
+
+    let mut source_full_text = data
+        .get("sumSrc")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut translated_full_text = data
+        .get("sumDst")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let mut blocks = Vec::new();
+    if let Some(items) = data.get("content").and_then(Value::as_array) {
+        for item in items {
+            let source_text = item
+                .get("src")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let translated_text = item
+                .get("dst")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if source_text.is_empty() && translated_text.is_empty() {
+                continue;
+            }
+            let Some(bbox_norm) = parse_baidu_bbox(
+                item.get("rect"),
+                item.get("points"),
+                image_width,
+                image_height,
+            ) else {
+                continue;
+            };
+            blocks.push(TranslationBlock {
+                source_text,
+                translated_text,
+                bbox_norm,
+            });
+        }
+    }
+
+    if source_full_text.is_empty() {
+        source_full_text = blocks
+            .iter()
+            .map(|block| block.source_text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+    }
+    if translated_full_text.is_empty() {
+        translated_full_text = blocks
+            .iter()
+            .map(|block| block.translated_text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+    }
+
+    let pasted_image = if prefer_pasted_image {
+        let payload = data
+            .get("pasteImg")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("pasteImg").and_then(Value::as_str))
+            .unwrap_or("");
+        decode_base64_image(payload).ok()
+    } else {
+        None
+    };
+
+    Ok(ImageTranslationResult {
+        source_full_text,
+        translated_full_text,
+        blocks,
+        pasted_image,
+    })
+}
+
+fn parse_baidu_bbox(
+    rect: Option<&Value>,
+    points: Option<&Value>,
+    image_width: u32,
+    image_height: u32,
+) -> Option<[f32; 4]> {
+    parse_baidu_rect(rect)
+        .or_else(|| parse_baidu_points(points))
+        .map(|bbox| normalize_pixel_bbox(bbox, image_width, image_height))
+        .filter(|bbox| (bbox[2] - bbox[0]) > 0.001 && (bbox[3] - bbox[1]) > 0.001)
+}
+
+fn parse_baidu_rect(rect: Option<&Value>) -> Option<[f32; 4]> {
+    let rect = rect?;
+    if let Some(text) = rect.as_str() {
+        let numbers = parse_numeric_sequence(text);
+        if numbers.len() >= 4 {
+            return Some([
+                numbers[0],
+                numbers[1],
+                numbers[0] + numbers[2],
+                numbers[1] + numbers[3],
+            ]);
+        }
+    }
+    if let Some(items) = rect.as_array() {
+        let numbers = items.iter().filter_map(value_to_f32).collect::<Vec<_>>();
+        if numbers.len() >= 4 {
+            return Some([
+                numbers[0],
+                numbers[1],
+                numbers[0] + numbers[2],
+                numbers[1] + numbers[3],
+            ]);
+        }
+    }
+    if let Some(obj) = rect.as_object() {
+        let left = obj.get("left").and_then(value_to_f32)?;
+        let top = obj.get("top").and_then(value_to_f32)?;
+        let width = obj.get("width").and_then(value_to_f32)?;
+        let height = obj.get("height").and_then(value_to_f32)?;
+        return Some([left, top, left + width, top + height]);
+    }
+    None
+}
+
+fn parse_baidu_points(points: Option<&Value>) -> Option<[f32; 4]> {
+    let points = points?;
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    if let Some(items) = points.as_array() {
+        for item in items {
+            if let Some(pair) = item.as_array() {
+                if pair.len() >= 2 {
+                    if let (Some(x), Some(y)) = (value_to_f32(&pair[0]), value_to_f32(&pair[1])) {
+                        xs.push(x);
+                        ys.push(y);
+                    }
+                }
+                continue;
+            }
+            if let Some(obj) = item.as_object() {
+                let x = obj
+                    .get("x")
+                    .or_else(|| obj.get("left"))
+                    .and_then(value_to_f32);
+                let y = obj
+                    .get("y")
+                    .or_else(|| obj.get("top"))
+                    .and_then(value_to_f32);
+                if let (Some(x), Some(y)) = (x, y) {
+                    xs.push(x);
+                    ys.push(y);
+                }
+            }
+        }
+    }
+    if xs.is_empty() || ys.is_empty() {
+        return None;
+    }
+    Some([
+        xs.iter().copied().fold(f32::INFINITY, f32::min),
+        ys.iter().copied().fold(f32::INFINITY, f32::min),
+        xs.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        ys.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+    ])
+}
+
+fn value_to_f32(value: &Value) -> Option<f32> {
+    value
+        .as_f64()
+        .map(|value| value as f32)
+        .or_else(|| value.as_i64().map(|value| value as f32))
+        .or_else(|| value.as_u64().map(|value| value as f32))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<f32>().ok())
+        })
+}
+
+fn parse_numeric_sequence(text: &str) -> Vec<f32> {
+    text.split(|ch: char| !matches!(ch, '0'..='9' | '.' | '-'))
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                None
+            } else {
+                part.parse::<f32>().ok()
+            }
+        })
+        .collect()
+}
+
+fn normalize_pixel_bbox(raw_bbox: [f32; 4], image_width: u32, image_height: u32) -> [f32; 4] {
+    let width = image_width.max(1) as f32;
+    let height = image_height.max(1) as f32;
+    let mut x1 = raw_bbox[0] / width;
+    let mut y1 = raw_bbox[1] / height;
+    let mut x2 = raw_bbox[2] / width;
+    let mut y2 = raw_bbox[3] / height;
+    if x1 > x2 {
+        std::mem::swap(&mut x1, &mut x2);
+    }
+    if y1 > y2 {
+        std::mem::swap(&mut y1, &mut y2);
+    }
+    [
+        x1.clamp(0.0, 1.0),
+        y1.clamp(0.0, 1.0),
+        x2.clamp(0.0, 1.0),
+        y2.clamp(0.0, 1.0),
+    ]
+}
+
+fn decode_base64_image(payload: &str) -> Result<Vec<u8>> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        bail!("empty pasted image payload");
+    }
+    let encoded = trimmed
+        .split_once(',')
+        .map(|(_, tail)| tail)
+        .unwrap_or(trimmed)
+        .trim();
+    general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(encoded))
+        .context("invalid base64 pasted image")
+}
+
+fn baidu_error_summary(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return body.trim().to_string();
+    };
+    let code = value
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .map(|code| code.to_string())
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let message = value
+        .get("error_msg")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("error_description").and_then(Value::as_str))
+        .unwrap_or(body.trim());
+    match code {
+        Some(code) if !code.is_empty() => format!("{}: {}", code, message),
+        _ => message.to_string(),
+    }
 }
 
 fn normalize_translated_output(translated: &str, source: &str) -> String {
@@ -511,6 +979,12 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
     format!("{}/{}", trimmed, path.trim_start_matches('/'))
 }
 
+#[derive(Debug, Deserialize)]
+struct BaiduAccessTokenResponse {
+    #[serde(default)]
+    access_token: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +1037,65 @@ mod tests {
             text,
             "textual input such as category names (e.g., \"the red car\")"
         );
+    }
+
+    #[test]
+    fn parse_baidu_rect_string_to_norm_bbox() {
+        let value = Value::String("79 23 246 43".to_string());
+        let bbox = parse_baidu_bbox(Some(&value), None, 400, 200).expect("bbox");
+        assert_eq!(bbox, [0.1975, 0.115, 0.8125, 0.33]);
+    }
+
+    #[test]
+    fn parse_baidu_translation_response_uses_blocks_and_paste_img() {
+        let body = r#"{
+  "data": {
+    "sumSrc": "Grounding-DINO",
+    "sumDst": "Grounding-DINO（译）",
+    "pasteImg": "aGVsbG8=",
+    "content": [
+      {
+        "src": "Overview",
+        "dst": "概述",
+        "rect": "10 20 30 40"
+      }
+    ]
+  }
+}"#;
+        let result = parse_baidu_image_translation_response(body, 200, 100, true)
+            .expect("parse baidu response");
+        assert_eq!(result.source_full_text, "Grounding-DINO");
+        assert_eq!(result.translated_full_text, "Grounding-DINO（译）");
+        assert_eq!(result.blocks.len(), 1);
+        assert_eq!(result.blocks[0].source_text, "Overview");
+        assert_eq!(result.blocks[0].translated_text, "概述");
+        assert_eq!(result.blocks[0].bbox_norm, [0.05, 0.2, 0.2, 0.6]);
+        assert_eq!(result.pasted_image.as_deref(), Some(b"hello".as_slice()));
+    }
+
+    #[test]
+    fn parse_baidu_translation_response_falls_back_to_joined_text() {
+        let body = r#"{
+  "data": {
+    "content": [
+      {
+        "src": "A",
+        "dst": "甲",
+        "points": [[0, 0], [20, 0], [20, 10], [0, 10]]
+      },
+      {
+        "src": "B",
+        "dst": "乙",
+        "rect": [30, 10, 20, 20]
+      }
+    ]
+  }
+}"#;
+        let result = parse_baidu_image_translation_response(body, 100, 100, false)
+            .expect("parse baidu response");
+        assert_eq!(result.source_full_text, "A\nB");
+        assert_eq!(result.translated_full_text, "甲\n乙");
+        assert_eq!(result.blocks.len(), 2);
+        assert!(result.pasted_image.is_none());
     }
 }

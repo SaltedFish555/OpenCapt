@@ -11,8 +11,8 @@ chrono = { version = "0.4", features = ["clock"] }
 directories-next = "2.0"
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"] }
 global-hotkey = "0.7"
-image = { version = "0.25", default-features = false, features = ["ico", "png"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+image = { version = "0.25", default-features = false, features = ["ico", "png", "jpeg", "webp"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 resvg = { version = "0.45", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

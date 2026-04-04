@@ -1,0 +1,10 @@
+C:\Users\CodexSandboxOffline\.codex\.sandbox\cwd\b22994db47d97734\target-codex-verify\debug\deps\zerovec_derive-be8c9a45ce59af93.d: C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\lib.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\make_ule.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\make_varule.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\ule.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\utils.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\varule.rs
+
+C:\Users\CodexSandboxOffline\.codex\.sandbox\cwd\b22994db47d97734\target-codex-verify\debug\deps\zerovec_derive-be8c9a45ce59af93.dll: C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\lib.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\make_ule.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\make_varule.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\ule.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\utils.rs C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\varule.rs
+
+C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\lib.rs:
+C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\make_ule.rs:
+C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\make_varule.rs:
+C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\ule.rs:
+C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\utils.rs:
+C:\Users\cy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\zerovec-derive-0.11.2\src\varule.rs:

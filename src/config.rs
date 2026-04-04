@@ -114,6 +114,59 @@ pub enum TranslationProviderKind {
     #[default]
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "baidu_image_translate")]
+    BaiduImageTranslate,
+}
+
+impl TranslationProviderKind {
+    pub const ALL: [Self; 2] = [Self::OpenAiCompatible, Self::BaiduImageTranslate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OpenAI Compatible",
+            Self::BaiduImageTranslate => "百度图片翻译",
+        }
+    }
+
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "https://api.openai.com/v1",
+            Self::BaiduImageTranslate => "https://aip.baidubce.com",
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "gpt-4.1-mini",
+            Self::BaiduImageTranslate => "file/2.0/mt/pictrans/v1",
+        }
+    }
+
+    pub fn model_field_label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "模型名称",
+            Self::BaiduImageTranslate => "接口路径",
+        }
+    }
+
+    pub fn model_field_hint(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "例如 gpt-4.1-mini",
+            Self::BaiduImageTranslate => "例如 file/2.0/mt/pictrans/v1",
+        }
+    }
+
+    pub fn uses_secret_key(self) -> bool {
+        matches!(self, Self::BaiduImageTranslate)
+    }
+
+    pub fn uses_prompt_template(self) -> bool {
+        matches!(self, Self::OpenAiCompatible)
+    }
+
+    pub fn supports_image_output(self) -> bool {
+        matches!(self, Self::BaiduImageTranslate)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -207,8 +260,17 @@ pub struct TranslationProfile {
     pub provider_kind: TranslationProviderKind,
     pub base_url: String,
     pub api_key: String,
+    #[serde(default)]
+    pub secret_key: String,
     pub model: String,
+    #[serde(default)]
     pub prompt_template: String,
+    #[serde(default)]
+    pub source_lang: String,
+    #[serde(default)]
+    pub target_lang: String,
+    #[serde(default)]
+    pub use_translated_image: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -411,14 +473,35 @@ impl AppConfig {
             if profile.base_url.trim().is_empty() {
                 bail!("translation profile base_url may not be empty");
             }
-            if profile.api_key.trim().is_empty() {
-                bail!("translation profile api_key may not be empty");
-            }
-            if profile.model.trim().is_empty() {
-                bail!("translation profile model may not be empty");
-            }
-            if profile.prompt_template.trim().is_empty() {
-                bail!("translation profile prompt_template may not be empty");
+            match profile.provider_kind {
+                TranslationProviderKind::OpenAiCompatible => {
+                    if profile.api_key.trim().is_empty() {
+                        bail!("translation profile api_key may not be empty");
+                    }
+                    if profile.model.trim().is_empty() {
+                        bail!("translation profile model may not be empty");
+                    }
+                    if profile.prompt_template.trim().is_empty() {
+                        bail!("translation profile prompt_template may not be empty");
+                    }
+                }
+                TranslationProviderKind::BaiduImageTranslate => {
+                    if profile.api_key.trim().is_empty() {
+                        bail!("baidu translation profile api_key may not be empty");
+                    }
+                    if profile.secret_key.trim().is_empty() {
+                        bail!("baidu translation profile secret_key may not be empty");
+                    }
+                    if profile.model.trim().is_empty() {
+                        bail!("baidu translation profile api path may not be empty");
+                    }
+                    if profile.source_lang.trim().is_empty() {
+                        bail!("baidu translation profile source_lang may not be empty");
+                    }
+                    if profile.target_lang.trim().is_empty() {
+                        bail!("baidu translation profile target_lang may not be empty");
+                    }
+                }
             }
         }
 
@@ -493,6 +576,29 @@ impl AppConfig {
             .request_timeout_ms
             .clamp(TRANSLATION_TIMEOUT_MIN_MS, TRANSLATION_TIMEOUT_MAX_MS);
         normalize_translation_profile_ids(&mut self.translation.profiles);
+        for profile in &mut self.translation.profiles {
+            if matches!(
+                profile.provider_kind,
+                TranslationProviderKind::BaiduImageTranslate
+            ) {
+                if profile.source_lang.trim().is_empty() {
+                    profile.source_lang = "auto".to_string();
+                }
+                if profile.target_lang.trim().is_empty() {
+                    profile.target_lang = "zh".to_string();
+                }
+                if profile.model.trim().is_empty() {
+                    profile.model = TranslationProviderKind::BaiduImageTranslate
+                        .default_model()
+                        .to_string();
+                }
+                if profile.base_url.trim().is_empty() {
+                    profile.base_url = TranslationProviderKind::BaiduImageTranslate
+                        .default_base_url()
+                        .to_string();
+                }
+            }
+        }
 
         if self.translation.profiles.is_empty() {
             self.translation.enabled = false;
@@ -875,8 +981,13 @@ mod tests {
             provider_kind: TranslationProviderKind::OpenAiCompatible,
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "translate-key".to_string(),
+            secret_key: String::new(),
             model: "gpt-4.1-mini".to_string(),
-            prompt_template: "Translate the following text into Chinese. Return only the translated text without explanation.\n{{text}}".to_string(),
+            prompt_template: "Translate the following text into Chinese. Return only the translated text without explanation.
+{{text}}".to_string(),
+            source_lang: "auto".to_string(),
+            target_lang: "zh".to_string(),
+            use_translated_image: false,
         });
         config.translation.enabled = true;
         config.translation.default_profile_id = "tr_default".to_string();
@@ -1028,8 +1139,9 @@ base_url = "https://api.openai.com/v1"
 api_key = "abc"
 model = "gpt-4.1-mini"
 "#,
-        );
-        assert!(parsed.is_err());
+        )
+        .expect("parse translation config");
+        assert!(parsed.validate().is_err());
     }
 
     #[test]
@@ -1063,6 +1175,10 @@ model = "gpt-4.1-mini"
                 api_key: "a".to_string(),
                 model: "gpt-4.1-mini".to_string(),
                 prompt_template: "{{texts}}".to_string(),
+                secret_key: String::new(),
+                source_lang: "auto".to_string(),
+                target_lang: "zh".to_string(),
+                use_translated_image: false,
             },
             TranslationProfile {
                 id: "translate_profile_1".to_string(),
@@ -1072,6 +1188,10 @@ model = "gpt-4.1-mini"
                 api_key: "b".to_string(),
                 model: "gpt-4.1-mini".to_string(),
                 prompt_template: "{{texts}}".to_string(),
+                secret_key: String::new(),
+                source_lang: "auto".to_string(),
+                target_lang: "zh".to_string(),
+                use_translated_image: false,
             },
             TranslationProfile {
                 id: "translate_profile_1".to_string(),
@@ -1081,6 +1201,10 @@ model = "gpt-4.1-mini"
                 api_key: "c".to_string(),
                 model: "gpt-4.1-mini".to_string(),
                 prompt_template: "{{texts}}".to_string(),
+                secret_key: String::new(),
+                source_lang: "auto".to_string(),
+                target_lang: "zh".to_string(),
+                use_translated_image: false,
             },
         ];
         config.translation.default_profile_id = "missing".to_string();
