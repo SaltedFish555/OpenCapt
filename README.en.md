@@ -143,6 +143,13 @@ See [docs/en/ocr-translation.md](docs/en/ocr-translation.md) for details.
 - [docs/en/ocr-translation.md](docs/en/ocr-translation.md) OCR / translation design
 - [docs/en/development.md](docs/en/development.md) development and debugging guide
 
+## Contributing
+
+Issues, suggestions, and pull requests are welcome.
+
+- English contributing guide: [CONTRIBUTING.en.md](CONTRIBUTING.en.md)
+- 中文贡献说明：[CONTRIBUTING.md](CONTRIBUTING.md)
+
 ## Current Status
 
 OpenCapt is already a practical Windows screenshot tool. The next high-value areas are:
@@ -151,3 +158,7 @@ OpenCapt is already a practical Windows screenshot tool. The next high-value are
 - better history management
 - installer, code signing, and release workflow
 - more OCR / translation providers
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).

@@ -143,6 +143,13 @@ flowchart LR
 - [docs/ocr-translation.md](docs/ocr-translation.md) OCR / 翻译设计
 - [docs/development.md](docs/development.md) 开发与调试说明
 
+## 参与贡献
+
+欢迎提交 issue、改进建议和 pull request。
+
+- 中文贡献说明：[CONTRIBUTING.md](CONTRIBUTING.md)
+- English contributing guide: [CONTRIBUTING.en.md](CONTRIBUTING.en.md)
+
 ## 当前状态
 
 当前版本已经是一套可正常投入使用的 Windows 截图工具。后续更适合继续投入的方向通常是：
@@ -151,3 +158,7 @@ flowchart LR
 - 更完整的历史记录与管理
 - 安装包、代码签名与正式发布流程
 - 更多 OCR / 翻译 provider
+
+## 开源许可
+
+本项目使用 [Apache License 2.0](LICENSE) 开源。
