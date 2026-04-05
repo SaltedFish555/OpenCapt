@@ -1,4 +1,4 @@
-use crate::overlay::SelectionRect;
+use crate::geometry::SelectionRect;
 use anyhow::{Context, Result, anyhow};
 use image::{RgbaImage, imageops};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE};

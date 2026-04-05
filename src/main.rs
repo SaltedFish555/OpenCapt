@@ -2,6 +2,7 @@
 mod app;
 mod capture;
 mod config;
+mod geometry;
 mod hotkey;
 mod icons;
 mod logging;

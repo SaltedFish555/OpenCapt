@@ -7,6 +7,7 @@ use crate::{
         AnnotationDefaults, OcrConfig, OcrProfile, TextFontFamily, TranslationConfig,
         TranslationProfile, TranslationProviderKind,
     },
+    geometry::SelectionRect,
     icons::{self, IconCache, IconId},
     ocr, translation,
 };
@@ -113,14 +114,6 @@ const OCR_BLOCK_BORDER: u32 = 0x36A3FF;
 const OCR_BLOCK_ACTIVE: u32 = 0xF6B10A;
 
 type OverlayEmitter = Arc<dyn Fn(OverlaySignal) + Send + Sync + 'static>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SelectionRect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
 
 #[derive(Debug, Clone)]
 pub struct PinnedCapture {
@@ -1589,30 +1582,7 @@ impl OverlayState {
 
 impl SelectionRect {
     fn from_points(start: CursorPoint, end: CursorPoint) -> Option<Self> {
-        let left = start.x.min(end.x).max(0);
-        let top = start.y.min(end.y).max(0);
-        let right = start.x.max(end.x).max(0);
-        let bottom = start.y.max(end.y).max(0);
-        let width = (right - left) as u32;
-        let height = (bottom - top) as u32;
-        if width == 0 || height == 0 {
-            None
-        } else {
-            Some(Self {
-                x: left,
-                y: top,
-                width,
-                height,
-            })
-        }
-    }
-
-    #[cfg(test)]
-    fn contains(self, x: i32, y: i32) -> bool {
-        x >= self.x
-            && x < self.x + self.width as i32
-            && y >= self.y
-            && y < self.y + self.height as i32
+        Self::from_coords(start.x, start.y, end.x, end.y)
     }
 }
 
