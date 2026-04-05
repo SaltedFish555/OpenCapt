@@ -110,7 +110,7 @@ fn send_chat_completion(
     Ok(content)
 }
 
-pub(in crate::translation) fn build_single_prompt(template: &str, text: &str) -> String {
+fn build_single_prompt(template: &str, text: &str) -> String {
     if should_force_plain_text_prompt(template) {
         return DEFAULT_PROMPT_TEMPLATE.replace("{{text}}", text);
     }
@@ -128,4 +128,31 @@ fn should_force_plain_text_prompt(template: &str) -> bool {
     lower.contains("json")
         || lower.contains("\"translations\"")
         || (lower.contains("translations") && lower.contains("index"))
+}
+#[cfg(test)]
+mod tests {
+    use super::build_single_prompt;
+
+    #[test]
+    fn single_prompt_uses_text_placeholder() {
+        let prompt = build_single_prompt("translate:\n{{text}}", "hello");
+        assert_eq!(prompt, "translate:\nhello");
+    }
+
+    #[test]
+    fn single_prompt_accepts_legacy_texts_placeholder() {
+        let prompt = build_single_prompt("translate:\n{{texts}}", "hello");
+        assert_eq!(prompt, "translate:\nhello");
+    }
+
+    #[test]
+    fn legacy_json_prompt_is_replaced_with_plain_text_prompt() {
+        let prompt = build_single_prompt(
+            "Translate each line to Chinese. Return JSON only: {\"translations\":[{\"index\":0,\"text\":\"...\"}]}\n{{texts}}",
+            "hello",
+        );
+        assert!(!prompt.contains("JSON only"));
+        assert!(prompt.contains("hello"));
+        assert!(!prompt.contains("{{text}}"));
+    }
 }

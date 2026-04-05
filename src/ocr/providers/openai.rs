@@ -150,7 +150,7 @@ fn build_chat_payload(
     }
 }
 
-pub(in crate::ocr) fn is_deepseek_ocr_model(profile: &OcrProfile) -> bool {
+fn is_deepseek_ocr_model(profile: &OcrProfile) -> bool {
     let model = profile.model.to_ascii_lowercase();
     if model.contains("deepseek") && model.contains("ocr") {
         return true;

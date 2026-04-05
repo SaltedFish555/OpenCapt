@@ -505,31 +505,6 @@ fn strip_line_prefix(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translation::providers::build_single_prompt;
-
-    #[test]
-    fn single_prompt_uses_text_placeholder() {
-        let prompt = build_single_prompt("translate:\n{{text}}", "hello");
-        assert_eq!(prompt, "translate:\nhello");
-    }
-
-    #[test]
-    fn single_prompt_accepts_legacy_texts_placeholder() {
-        let prompt = build_single_prompt("translate:\n{{texts}}", "hello");
-        assert_eq!(prompt, "translate:\nhello");
-    }
-
-    #[test]
-    fn legacy_json_prompt_is_replaced_with_plain_text_prompt() {
-        let prompt = build_single_prompt(
-            "Translate each line to Chinese. Return JSON only: {\"translations\":[{\"index\":0,\"text\":\"...\"}]}\n{{texts}}",
-            "hello",
-        );
-        assert!(!prompt.contains("JSON only"));
-        assert!(prompt.contains("hello"));
-        assert!(!prompt.contains("{{text}}"));
-    }
-
     #[test]
     fn parse_single_prefers_plain_text() {
         let text = parse_single_translation_content("你好世界").expect("single parse");
