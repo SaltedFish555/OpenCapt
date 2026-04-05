@@ -71,29 +71,6 @@ pub(super) fn render_pinned_capture(state: &OverlayState) -> Option<PinnedCaptur
     })
 }
 
-pub(super) fn register_overlay_class() -> Result<()> {
-    static REGISTERED: OnceLock<()> = OnceLock::new();
-    if REGISTERED.get().is_some() {
-        return Ok(());
-    }
-    let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.map_err(windows_error)?.0);
-    let cursor = unsafe { LoadCursorW(None, IDC_CROSS) }.map_err(windows_error)?;
-    let class = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-        lpfnWndProc: Some(overlay_wndproc),
-        hInstance: instance,
-        hCursor: cursor,
-        lpszClassName: CLASS_NAME,
-        ..Default::default()
-    };
-    let atom = unsafe { RegisterClassW(&class) };
-    if atom == 0 {
-        return Err(anyhow!("failed to register overlay window class"));
-    }
-    let _ = REGISTERED.set(());
-    Ok(())
-}
-
 pub(super) fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
     let preview_selection = state.preview_selection_rect();
     if state.mode == OverlayMode::Annotating {
