@@ -13,7 +13,7 @@ use std::{
 use tracing::warn;
 
 const SYSTEM_PROMPT: &str = "You are a translation engine. Translate only the provided text segment and return only the translated text. Do not return JSON, Markdown, numbering, labels, or explanations.";
-pub const DEFAULT_PROMPT_TEMPLATE: &str = "Translate the following text into Chinese. Return only the translated text without explanation.\n{{text}}";
+pub use crate::config::DEFAULT_TRANSLATION_PROMPT_TEMPLATE as DEFAULT_PROMPT_TEMPLATE;
 const MAX_PARALLEL_REQUESTS: usize = 4;
 
 #[derive(Debug, Clone)]

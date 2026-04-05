@@ -27,6 +27,7 @@ pub const OCR_TIMEOUT_DEFAULT_MS: u64 = 20_000;
 pub const TRANSLATION_TIMEOUT_MIN_MS: u64 = 2_000;
 pub const TRANSLATION_TIMEOUT_MAX_MS: u64 = 120_000;
 pub const TRANSLATION_TIMEOUT_DEFAULT_MS: u64 = 20_000;
+pub const DEFAULT_TRANSLATION_PROMPT_TEMPLATE: &str = "Translate the following text into Chinese. Return only the translated text without explanation.\n{{text}}";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TextFontFamily {
@@ -361,6 +362,36 @@ impl Default for TranslationConfig {
     }
 }
 
+pub fn default_ocr_profile(index: usize, id: String) -> OcrProfile {
+    let provider = OcrProviderKind::OpenAiCompatible;
+    OcrProfile {
+        id,
+        display_name: format!("模型{}", index),
+        provider_kind: provider,
+        base_url: provider.default_base_url().to_string(),
+        api_key: String::new(),
+        secret_key: String::new(),
+        model: provider.default_model().to_string(),
+        bbox_scale_mode: provider.default_bbox_scale_mode(),
+    }
+}
+
+pub fn default_translation_profile(index: usize, id: String) -> TranslationProfile {
+    let provider = TranslationProviderKind::OpenAiCompatible;
+    TranslationProfile {
+        id,
+        display_name: format!("翻译模型{}", index),
+        provider_kind: provider,
+        base_url: provider.default_base_url().to_string(),
+        api_key: String::new(),
+        secret_key: String::new(),
+        model: provider.default_model().to_string(),
+        prompt_template: DEFAULT_TRANSLATION_PROMPT_TEMPLATE.to_string(),
+        source_lang: "auto".to_string(),
+        target_lang: "zh".to_string(),
+        use_translated_image: false,
+    }
+}
 impl Default for AppConfig {
     fn default() -> Self {
         Self {

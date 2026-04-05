@@ -1,9 +1,9 @@
 use crate::{
     config::{
-        ANNOTATION_COLOR_PRESETS, AppConfig, AppPaths, GeneralConfig, OCR_TIMEOUT_MAX_MS,
-        OCR_TIMEOUT_MIN_MS, OcrBboxScaleMode, OcrProfile, OcrProviderKind, PIN_OPACITY_OPTIONS,
-        TRANSLATION_TIMEOUT_MAX_MS, TRANSLATION_TIMEOUT_MIN_MS, TextFontFamily, TranslationProfile,
-        TranslationProviderKind,
+        ANNOTATION_COLOR_PRESETS, AppConfig, AppPaths, DEFAULT_TRANSLATION_PROMPT_TEMPLATE,
+        GeneralConfig, OCR_TIMEOUT_MAX_MS, OCR_TIMEOUT_MIN_MS, OcrBboxScaleMode, OcrProviderKind,
+        PIN_OPACITY_OPTIONS, TRANSLATION_TIMEOUT_MAX_MS, TRANSLATION_TIMEOUT_MIN_MS,
+        TextFontFamily, TranslationProviderKind, default_ocr_profile, default_translation_profile,
     },
     hotkey::RegisteredHotkey,
     ocr, startup, translation,
@@ -43,20 +43,6 @@ const BAIDU_TRANSLATION_TARGET_LANG_OPTIONS: [(&str, &str); 8] = [
     ("de", "德语"),
 ];
 
-fn default_ocr_profile(index: usize, id: String) -> OcrProfile {
-    let provider = OcrProviderKind::OpenAiCompatible;
-    OcrProfile {
-        id,
-        display_name: format!("模型{}", index),
-        provider_kind: provider,
-        base_url: provider.default_base_url().to_string(),
-        api_key: String::new(),
-        secret_key: String::new(),
-        model: provider.default_model().to_string(),
-        bbox_scale_mode: provider.default_bbox_scale_mode(),
-    }
-}
-
 fn baidu_lang_label(options: &[(&str, &str)], value: &str, empty_label: &str) -> String {
     let trimmed = value.trim();
     options
@@ -70,23 +56,6 @@ fn baidu_lang_label(options: &[(&str, &str)], value: &str, empty_label: &str) ->
                 trimmed.to_string()
             }
         })
-}
-
-fn default_translation_profile(index: usize, id: String) -> TranslationProfile {
-    let provider = TranslationProviderKind::OpenAiCompatible;
-    TranslationProfile {
-        id,
-        display_name: format!("翻译模型{}", index),
-        provider_kind: provider,
-        base_url: provider.default_base_url().to_string(),
-        api_key: String::new(),
-        secret_key: String::new(),
-        model: provider.default_model().to_string(),
-        prompt_template: translation::DEFAULT_PROMPT_TEMPLATE.to_string(),
-        source_lang: "auto".to_string(),
-        target_lang: "zh".to_string(),
-        use_translated_image: false,
-    }
 }
 
 fn settings_window_icon() -> Result<egui::IconData> {
@@ -988,7 +957,7 @@ impl SettingsApp {
                                     && profile.prompt_template.trim().is_empty()
                                 {
                                     profile.prompt_template =
-                                        translation::DEFAULT_PROMPT_TEMPLATE.to_string();
+                                        DEFAULT_TRANSLATION_PROMPT_TEMPLATE.to_string();
                                 }
                                 if profile.provider_kind.supports_image_output() {
                                     if profile.source_lang.trim().is_empty() {
