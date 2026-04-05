@@ -21,7 +21,6 @@ pub struct CaptureTarget {
     pub height: u32,
     pub scale_factor: f32,
     pub background: RgbaImage,
-    pub base_frame: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,7 +456,6 @@ fn create_target(monitor: Monitor) -> Result<CaptureTarget> {
     let background = monitor
         .capture_image()
         .context("failed to capture monitor background")?;
-    let base_frame = rgba_to_framebuffer(&background);
 
     Ok(CaptureTarget {
         origin_x,
@@ -466,21 +464,7 @@ fn create_target(monitor: Monitor) -> Result<CaptureTarget> {
         height,
         scale_factor,
         background,
-        base_frame,
     })
-}
-
-fn rgba_to_framebuffer(image: &RgbaImage) -> Vec<u32> {
-    image
-        .as_raw()
-        .chunks_exact(4)
-        .map(|rgba| {
-            let red = rgba[0] as u32;
-            let green = rgba[1] as u32;
-            let blue = rgba[2] as u32;
-            (red << 16) | (green << 8) | blue
-        })
-        .collect()
 }
 
 #[cfg(test)]

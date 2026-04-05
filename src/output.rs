@@ -11,11 +11,15 @@ use std::{
 
 #[derive(Debug)]
 pub struct CaptureResult {
-    pub image: RgbaImage,
+    pub width: u32,
+    pub height: u32,
     pub saved_path: Option<PathBuf>,
 }
 
 pub fn process_capture(image: RgbaImage, config: &AppConfig) -> Result<CaptureResult> {
+    let width = image.width();
+    let height = image.height();
+
     if config.general.auto_copy {
         copy_to_clipboard(&image)?;
     }
@@ -26,7 +30,11 @@ pub fn process_capture(image: RgbaImage, config: &AppConfig) -> Result<CaptureRe
         None
     };
 
-    Ok(CaptureResult { image, saved_path })
+    Ok(CaptureResult {
+        width,
+        height,
+        saved_path,
+    })
 }
 
 pub fn copy_to_clipboard(image: &RgbaImage) -> Result<()> {
@@ -35,7 +43,7 @@ pub fn copy_to_clipboard(image: &RgbaImage) -> Result<()> {
         .set_image(ImageData {
             width: image.width() as usize,
             height: image.height() as usize,
-            bytes: Cow::Owned(image.as_raw().clone()),
+            bytes: Cow::Borrowed(image.as_raw()),
         })
         .context("failed to copy image to clipboard")
 }

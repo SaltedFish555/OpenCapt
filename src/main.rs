@@ -5,6 +5,7 @@ mod config;
 mod hotkey;
 mod icons;
 mod logging;
+mod memory;
 mod ocr;
 mod output;
 mod overlay;

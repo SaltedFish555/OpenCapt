@@ -2,7 +2,7 @@ use crate::{
     StartupMode, capture,
     config::{AppConfig, AppPaths},
     hotkey::RegisteredHotkey,
-    output,
+    memory, output,
     overlay::{OverlaySession, OverlaySignal, PinnedCapture},
     pin::PinWindow,
     settings, startup,
@@ -158,7 +158,6 @@ impl App {
         }
 
         self.spawn_config_watcher();
-        self.prewarm_overlay();
     }
 
     fn spawn_config_watcher(&self) {
@@ -231,31 +230,6 @@ impl App {
         }
     }
 
-    fn prewarm_overlay(&mut self) {
-        if self.overlay.is_some() {
-            return;
-        }
-
-        let target = match capture::current_monitor_target() {
-            Ok(target) => target,
-            Err(error) => {
-                warn!(?error, "failed to prepare hidden overlay cache");
-                return;
-            }
-        };
-
-        let proxy = self.event_proxy.clone();
-        match OverlaySession::new(target, move |signal| {
-            let _ = proxy.send_event(UserEvent::Overlay(signal));
-        }) {
-            Ok(overlay) => {
-                self.overlay = Some(overlay);
-                info!("overlay prewarmed");
-            }
-            Err(error) => warn!(?error, "failed to create overlay window"),
-        }
-    }
-
     fn handle_hotkey_event(&mut self, event: GlobalHotKeyEvent) {
         if self.state != AppState::Idle {
             return;
@@ -295,7 +269,7 @@ impl App {
                 }
             }
             TrayAction::Exit => {
-                self.hide_overlay();
+                self.release_overlay();
                 self.close_pin_windows();
                 self.state = AppState::Exiting;
                 *control_flow = ControlFlow::Exit;
@@ -327,17 +301,40 @@ impl App {
             }
         };
 
-        if self.overlay.is_none() {
-            self.prewarm_overlay();
+        if let Some(overlay) = self.overlay.as_mut() {
+            match overlay.show(
+                target,
+                cursor_x,
+                cursor_y,
+                &self.config.annotation_defaults,
+                &self.config.ocr,
+                &self.config.translation,
+            ) {
+                Ok(()) => {
+                    self.state = AppState::Selecting;
+                    info!(startup = ?self.startup_mode, "overlay opened");
+                }
+                Err(error) => {
+                    error!(?error, "failed to activate overlay window");
+                    self.state = AppState::Idle;
+                }
+            }
+            return;
         }
 
-        let Some(overlay) = self.overlay.as_mut() else {
-            self.state = AppState::Idle;
-            return;
+        let proxy = self.event_proxy.clone();
+        let mut overlay = match OverlaySession::new(target, move |signal| {
+            let _ = proxy.send_event(UserEvent::Overlay(signal));
+        }) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                error!(?error, "failed to create overlay window");
+                self.state = AppState::Idle;
+                return;
+            }
         };
 
-        match overlay.show(
-            target,
+        match overlay.show_prepared(
             cursor_x,
             cursor_y,
             &self.config.annotation_defaults,
@@ -345,6 +342,7 @@ impl App {
             &self.config.translation,
         ) {
             Ok(()) => {
+                self.overlay = Some(overlay);
                 self.state = AppState::Selecting;
                 info!(startup = ?self.startup_mode, "overlay opened");
             }
@@ -376,22 +374,28 @@ impl App {
     fn handle_overlay_signal(&mut self, signal: OverlaySignal) {
         match signal {
             OverlaySignal::Cancelled => {
+                self.release_overlay();
+                memory::trim_working_set();
                 info!(startup = ?self.startup_mode, "selection cancelled");
                 self.state = AppState::Idle;
             }
             OverlaySignal::Completed(image) => {
+                self.release_overlay();
                 self.finish_capture(image);
+                memory::trim_working_set();
                 self.state = AppState::Idle;
             }
             OverlaySignal::Pinned(capture) => {
+                self.release_overlay();
                 self.show_pin_window(capture);
+                memory::trim_working_set();
                 self.state = AppState::Idle;
             }
         }
     }
 
-    fn hide_overlay(&mut self) {
-        if let Some(overlay) = self.overlay.as_mut() {
+    fn release_overlay(&mut self) {
+        if let Some(mut overlay) = self.overlay.take() {
             overlay.hide();
         }
     }
@@ -431,12 +435,13 @@ impl App {
         self.state = AppState::Capturing;
         match output::process_capture(image, &self.config) {
             Ok(result) => {
-                info!(path = ?result.saved_path, image_width = result.image.width(), image_height = result.image.height(), "capture completed");
+                info!(path = ?result.saved_path, image_width = result.width, image_height = result.height, "capture completed");
             }
             Err(error) => {
                 error!(?error, "failed to process capture output");
             }
         }
+        memory::trim_working_set();
         self.state = AppState::Idle;
     }
 }

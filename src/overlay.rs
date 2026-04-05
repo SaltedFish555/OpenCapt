@@ -394,10 +394,7 @@ struct OverlayState {
     emitter: OverlayEmitter,
     target: CaptureTarget,
     frame: Vec<u32>,
-    base_opaque_frame: Vec<u32>,
     dimmed_frame: Vec<u32>,
-    composed_frame: Vec<u32>,
-    dimmed_composed_frame: Vec<u32>,
     composed_dirty: bool,
     surface: LayeredSurface,
     mode: OverlayMode,
@@ -489,16 +486,12 @@ impl OverlaySession {
         let target_width = target.width;
         let target_height = target.height;
         let surface = LayeredSurface::new(target_width as i32, target_height as i32)?;
-        let base_opaque_frame = opaque_frame_from_rgb(&target.base_frame);
-        let dimmed_frame = dimmed_opaque_frame_from_rgb(&target.base_frame);
+        let dimmed_frame = dimmed_opaque_frame_from_image(&target.background);
         let mut state = Box::new(OverlayState {
             emitter,
             target,
-            frame: vec![0; target_width as usize * target_height as usize],
-            base_opaque_frame: base_opaque_frame.clone(),
-            dimmed_frame: dimmed_frame.clone(),
-            composed_frame: base_opaque_frame,
-            dimmed_composed_frame: dimmed_frame,
+            frame: dimmed_frame.clone(),
+            dimmed_frame,
             composed_dirty: false,
             surface,
             mode: OverlayMode::Selecting,
@@ -577,7 +570,6 @@ impl OverlaySession {
         ocr_config: &OcrConfig,
         translation_config: &TranslationConfig,
     ) -> Result<()> {
-        let hwnd = self.hwnd;
         let state = self.state_mut();
         state.target = target;
         state
@@ -588,6 +580,19 @@ impl OverlaySession {
             0,
         );
         state.rebuild_base_frames();
+        self.show_prepared(cursor_x, cursor_y, defaults, ocr_config, translation_config)
+    }
+
+    pub fn show_prepared(
+        &mut self,
+        cursor_x: i32,
+        cursor_y: i32,
+        defaults: &AnnotationDefaults,
+        ocr_config: &OcrConfig,
+        translation_config: &TranslationConfig,
+    ) -> Result<()> {
+        let hwnd = self.hwnd;
+        let state = self.state_mut();
         state.reset_for_show(
             cursor_x - state.target.origin_x,
             cursor_y - state.target.origin_y,
@@ -726,36 +731,10 @@ impl OverlayState {
     }
 
     fn rebuild_base_frames(&mut self) {
-        self.base_opaque_frame = opaque_frame_from_rgb(&self.target.base_frame);
-        self.dimmed_frame = dimmed_opaque_frame_from_rgb(&self.target.base_frame);
-        self.composed_frame = self.base_opaque_frame.clone();
-        self.dimmed_composed_frame = self.dimmed_frame.clone();
+        self.dimmed_frame = dimmed_opaque_frame_from_image(&self.target.background);
         self.composed_dirty = false;
     }
 
-    fn ensure_composed_frames(&mut self) {
-        if !self.composed_dirty {
-            return;
-        }
-        self.composed_frame.copy_from_slice(&self.base_opaque_frame);
-        self.dimmed_composed_frame
-            .copy_from_slice(&self.dimmed_frame);
-        for shape in &self.shapes {
-            draw_shape_image(
-                &mut self.composed_frame,
-                self.target.width,
-                self.target.height,
-                shape,
-            );
-            draw_shape_image(
-                &mut self.dimmed_composed_frame,
-                self.target.width,
-                self.target.height,
-                shape,
-            );
-        }
-        self.composed_dirty = false;
-    }
     fn current_style(&self) -> ShapeStyle {
         ShapeStyle {
             color: COLOR_PRESETS[self.color_index],
@@ -3217,13 +3196,8 @@ fn start_ocr_request(hwnd: HWND, state: &mut OverlayState) {
 
     let selection_width = selection.width().max(1) as u32;
     let selection_height = selection.height().max(1) as u32;
-    let source = framebuffer_to_image(
-        state.target.base_frame.clone(),
-        state.target.width,
-        state.target.height,
-    );
     let crop = imageops::crop_imm(
-        &source,
+        &state.target.background,
         selection.left.max(0) as u32,
         selection.top.max(0) as u32,
         selection_width,
@@ -3316,13 +3290,8 @@ fn start_translation_request(hwnd: HWND, state: &mut OverlayState) {
 
     let selection_width = selection.width().max(1) as u32;
     let selection_height = selection.height().max(1) as u32;
-    let source = framebuffer_to_image(
-        state.target.base_frame.clone(),
-        state.target.width,
-        state.target.height,
-    );
     let crop = imageops::crop_imm(
-        &source,
+        &state.target.background,
         selection.left.max(0) as u32,
         selection.top.max(0) as u32,
         selection_width,
@@ -3462,45 +3431,48 @@ fn finish_with_signal(hwnd: HWND, state: &mut OverlayState, signal: OverlaySigna
 
 fn render_annotated_capture(state: &OverlayState) -> Option<(SelectionRect, RgbaImage)> {
     let selection = state.selection_rect()?.to_selection_rect()?;
-    let mut framebuffer = state.target.base_frame.clone();
-    if let Some(translated_image) = state.translated_selection_image.as_ref() {
-        blit_rgba_image_to_frame(
-            &mut framebuffer,
-            state.target.width,
-            state.target.height,
-            selection.x,
-            selection.y,
-            translated_image,
-        );
-    }
-    for shape in &state.shapes {
-        draw_shape_image(
-            &mut framebuffer,
-            state.target.width,
-            state.target.height,
-            shape,
-        );
-    }
-    if state.translated_selection_image.is_none() && !state.translated_full_text.trim().is_empty() {
-        paint_ocr_blocks_to_frame(
-            &mut framebuffer,
-            &state.base_opaque_frame,
-            state.target.width,
-            state.target.height,
-            &state.ocr_blocks,
-            None,
-            None,
-        );
-    }
-    let composed = framebuffer_to_image(framebuffer, state.target.width, state.target.height);
-    let image = imageops::crop_imm(
-        &composed,
+    let selection_image = imageops::crop_imm(
+        &state.target.background,
         selection.x.max(0) as u32,
         selection.y.max(0) as u32,
         selection.width,
         selection.height,
     )
     .to_image();
+    let mut framebuffer = opaque_frame_from_image(&selection_image);
+    if let Some(translated_image) = state.translated_selection_image.as_ref() {
+        blit_rgba_image_to_frame(
+            &mut framebuffer,
+            selection.width,
+            selection.height,
+            0,
+            0,
+            translated_image,
+        );
+    }
+    for shape in &state.shapes {
+        let shifted = shape.translated(-selection.x, -selection.y);
+        draw_shape_image(
+            &mut framebuffer,
+            selection.width,
+            selection.height,
+            &shifted,
+        );
+    }
+    if state.translated_selection_image.is_none() && !state.translated_full_text.trim().is_empty() {
+        paint_ocr_blocks_to_frame(
+            &mut framebuffer,
+            &selection_image,
+            selection.width,
+            selection.height,
+            &state.ocr_blocks,
+            None,
+            None,
+            selection.x,
+            selection.y,
+        );
+    }
+    let image = framebuffer_to_image(framebuffer, selection.width, selection.height);
     Some((selection, image))
 }
 
@@ -3543,11 +3515,13 @@ fn register_overlay_class() -> Result<()> {
 fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
     let preview_selection = state.preview_selection_rect();
     if state.mode == OverlayMode::Annotating {
-        state.ensure_composed_frames();
-        state.frame.copy_from_slice(&state.dimmed_composed_frame);
+        if state.composed_dirty {
+            state.composed_dirty = false;
+        }
+        state.frame.copy_from_slice(&state.dimmed_frame);
         if let Some(selection) = preview_selection {
-            restore_selection_region(
-                &state.composed_frame,
+            restore_selection_region_from_image(
+                &state.target.background,
                 &mut state.frame,
                 state.target.width,
                 selection,
@@ -3563,6 +3537,14 @@ fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
                 );
             }
         }
+        for shape in &state.shapes {
+            draw_shape_image(
+                &mut state.frame,
+                state.target.width,
+                state.target.height,
+                shape,
+            );
+        }
         paint_dynamic_shapes(state);
         paint_selection(state);
         if state.translated_selection_image.is_none() {
@@ -3572,8 +3554,8 @@ fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()> {
     } else {
         state.frame.copy_from_slice(&state.dimmed_frame);
         if let Some(selection) = preview_selection {
-            restore_selection_region(
-                &state.base_opaque_frame,
+            restore_selection_region_from_image(
+                &state.target.background,
                 &mut state.frame,
                 state.target.width,
                 selection,
@@ -3726,7 +3708,7 @@ fn paint_selection(state: &mut OverlayState) {
     }
 }
 
-fn sample_region_avg_color(base_frame: &[u32], width: u32, height: u32, rect: &IntRect) -> u32 {
+fn sample_region_avg_color(base_image: &RgbaImage, width: u32, height: u32, rect: &IntRect) -> u32 {
     let x0 = rect.left.max(0) as usize;
     let y0 = rect.top.max(0) as usize;
     let x1 = rect.right.min(width as i32) as usize;
@@ -3744,10 +3726,11 @@ fn sample_region_avg_color(base_frame: &[u32], width: u32, height: u32, rect: &I
     while y < y1 {
         let mut x = x0;
         while x < x1 {
-            let pixel = base_frame[y * w + x];
-            sum_r += ((pixel >> 16) & 0xff) as u64;
-            sum_g += ((pixel >> 8) & 0xff) as u64;
-            sum_b += (pixel & 0xff) as u64;
+            let offset = (y * w + x) * 4;
+            let bytes = base_image.as_raw();
+            sum_r += bytes[offset] as u64;
+            sum_g += bytes[offset + 1] as u64;
+            sum_b += bytes[offset + 2] as u64;
             count += 1;
             x += step;
         }
@@ -3785,46 +3768,56 @@ fn paint_ocr_blocks(state: &mut OverlayState) {
 
     paint_ocr_blocks_to_frame(
         &mut state.frame,
-        &state.base_opaque_frame,
+        &state.target.background,
         state.target.width,
         state.target.height,
         &state.ocr_blocks,
         state.ocr_selected_block,
         hovered_index,
+        0,
+        0,
     );
 }
 
 fn paint_ocr_blocks_to_frame(
     frame: &mut [u32],
-    base_frame: &[u32],
+    base_image: &RgbaImage,
     width: u32,
     height: u32,
     blocks: &[OcrOverlayBlock],
     selected_index: Option<usize>,
     hovered_index: Option<usize>,
+    offset_x: i32,
+    offset_y: i32,
 ) {
     for (index, block) in blocks.iter().enumerate() {
         let active = selected_index == Some(index) || hovered_index == Some(index);
 
+        let local_rect = NormalizedRect {
+            left: block.rect.left - offset_x,
+            top: block.rect.top - offset_y,
+            right: block.rect.right - offset_x,
+            bottom: block.rect.bottom - offset_y,
+        };
         let label = IntRect {
-            left: block.rect.left,
-            top: block.rect.top,
-            right: block.rect.right,
-            bottom: block.rect.bottom,
+            left: local_rect.left,
+            top: local_rect.top,
+            right: local_rect.right,
+            bottom: local_rect.bottom,
         };
         let h = label.bottom - label.top;
         if label.width() < 10 || h < 10 {
             continue;
         }
 
-        let avg_color = sample_region_avg_color(base_frame, width, height, &label);
+        let avg_color = sample_region_avg_color(base_image, width, height, &label);
         let bg_color = ocr_overlay_bg_color(avg_color);
 
         fill_rounded_rect(frame, width, height, label, 0, bg_color);
 
         draw_rect_outline(
             frame,
-            block.rect,
+            local_rect,
             width,
             height,
             if active { 2 } else { 1 },
@@ -4257,20 +4250,37 @@ fn compose_preview_frame(
     }
 }
 
-fn opaque_frame_from_rgb(source: &[u32]) -> Vec<u32> {
-    source.iter().copied().map(opaque).collect()
-}
-
-fn dimmed_opaque_frame_from_rgb(source: &[u32]) -> Vec<u32> {
-    source
-        .iter()
-        .copied()
-        .map(|pixel| opaque(dim_color(pixel, PREVIEW_BRIGHTNESS_PERCENT)))
+fn opaque_frame_from_image(image: &RgbaImage) -> Vec<u32> {
+    image
+        .as_raw()
+        .chunks_exact(4)
+        .map(|rgba| {
+            let red = rgba[0] as u32;
+            let green = rgba[1] as u32;
+            let blue = rgba[2] as u32;
+            opaque((red << 16) | (green << 8) | blue)
+        })
         .collect()
 }
 
-fn restore_selection_region(
-    source: &[u32],
+fn dimmed_opaque_frame_from_image(image: &RgbaImage) -> Vec<u32> {
+    image
+        .as_raw()
+        .chunks_exact(4)
+        .map(|rgba| {
+            let red = rgba[0] as u32;
+            let green = rgba[1] as u32;
+            let blue = rgba[2] as u32;
+            opaque(dim_color(
+                (red << 16) | (green << 8) | blue,
+                PREVIEW_BRIGHTNESS_PERCENT,
+            ))
+        })
+        .collect()
+}
+
+fn restore_selection_region_from_image(
+    source: &RgbaImage,
     destination: &mut [u32],
     width: u32,
     selection: SelectionRect,
@@ -4280,10 +4290,15 @@ fn restore_selection_region(
     let top = selection.y.max(0) as usize;
     let right = left + selection.width as usize;
     let bottom = top + selection.height as usize;
+    let bytes = source.as_raw();
     for row in top..bottom {
-        let start = row * row_width + left;
-        let end = row * row_width + right;
-        destination[start..end].copy_from_slice(&source[start..end]);
+        for col in left..right {
+            let src = (row * row_width + col) * 4;
+            let red = bytes[src] as u32;
+            let green = bytes[src + 1] as u32;
+            let blue = bytes[src + 2] as u32;
+            destination[row * row_width + col] = opaque((red << 16) | (green << 8) | blue);
+        }
     }
 }
 fn draw_panel(frame: &mut [u32], width: u32, height: u32, rect: IntRect) {
