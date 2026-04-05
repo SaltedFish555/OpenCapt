@@ -1,3 +1,21 @@
-/target
-/target-codex-verify
-/dist
+# Rust build artifacts
+/target/
+/target-codex-verify/
+/dist/
+
+# Portable runtime artifacts
+/config.toml
+/logs/
+
+# Local editor / tooling state
+/.codex/
+/.idea/
+/.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
