@@ -221,7 +221,7 @@ pub(in crate::settings) fn page_translation(app: &mut SettingsApp, ui: &mut egui
                                 "优先直接使用接口返回的译图（pasteImg）",
                             );
                             ui.label(label_text(
-                                "关闭该选项时，会使用返回的文本块和坐标，按 OpenCapt 当前 OCR 覆盖层样式渲染译文。",
+                                "该选项依赖 provider 实际返回 pasteImg；若未返回或译图无效，OpenCapt 会回退为文本块渲染并在状态栏提示原因。",
                             ));
                         }
 

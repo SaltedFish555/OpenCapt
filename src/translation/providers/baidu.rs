@@ -45,6 +45,7 @@ impl TranslationProvider for BaiduImageTranslationProvider {
         let form = multipart::Form::new()
             .text("from", normalize_baidu_language(&profile.source_lang))
             .text("to", normalize_baidu_language(&profile.target_lang))
+            .text("v", "3")
             .text("paste", paste_value.to_string())
             .part("image", image_part);
 

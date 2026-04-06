@@ -469,6 +469,7 @@ enum TranslationWorkerResult {
         translated_full_text: String,
         blocks: Vec<translation::TranslationBlock>,
         translated_image: Option<RgbaImage>,
+        pasted_image_status: translation::PastedImageStatus,
         selection: NormalizedRect,
     },
     Failure(String),
@@ -843,12 +844,10 @@ fn start_translation_request(hwnd: HWND, state: &mut OverlayState) {
                                 .collect::<Vec<_>>();
                             TranslationWorkerResult::Success {
                                 source_full_text: output.full_text,
-                                translated_full_text: translated_blocks.join(
-                                    "
-",
-                                ),
+                                translated_full_text: translated_blocks.join("\n"),
                                 blocks,
                                 translated_image: None,
+                                pasted_image_status: translation::PastedImageStatus::NotRequested,
                                 selection,
                             }
                         }
@@ -866,16 +865,30 @@ fn start_translation_request(hwnd: HWND, state: &mut OverlayState) {
             };
             match translation::translate_image_with_profile(&translation_profile, &request) {
                 Ok(output) => {
-                    let translated_image = output.pasted_image.as_ref().and_then(|bytes| {
-                        image::load_from_memory(bytes)
-                            .ok()
-                            .map(|image| image.into_rgba8())
-                    });
+                    let mut pasted_image_status = output.pasted_image_status;
+                    let translated_image =
+                        if matches!(pasted_image_status, translation::PastedImageStatus::Applied) {
+                            match output.pasted_image.as_ref().and_then(|bytes| {
+                                image::load_from_memory(bytes)
+                                    .ok()
+                                    .map(|image| image.into_rgba8())
+                            }) {
+                                Some(image) => Some(image),
+                                None => {
+                                    pasted_image_status =
+                                        translation::PastedImageStatus::InvalidImage;
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
                     TranslationWorkerResult::Success {
                         source_full_text: output.source_full_text,
                         translated_full_text: output.translated_full_text,
                         blocks: output.blocks,
                         translated_image,
+                        pasted_image_status,
                         selection,
                     }
                 }

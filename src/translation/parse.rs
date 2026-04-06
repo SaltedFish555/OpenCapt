@@ -1,4 +1,4 @@
-use super::{ImageTranslationResult, TranslationBlock};
+use super::{ImageTranslationResult, PastedImageStatus, TranslationBlock};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::Value;
@@ -66,10 +66,7 @@ pub(in crate::translation) fn parse_baidu_image_translation_response(
             .map(|block| block.source_text.trim())
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+            .join("\n");
     }
     if translated_full_text.is_empty() {
         translated_full_text = blocks
@@ -77,21 +74,25 @@ pub(in crate::translation) fn parse_baidu_image_translation_response(
             .map(|block| block.translated_text.trim())
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+            .join("\n");
     }
 
-    let pasted_image = if prefer_pasted_image {
+    let (pasted_image, pasted_image_status) = if prefer_pasted_image {
         let payload = data
             .get("pasteImg")
             .and_then(Value::as_str)
             .or_else(|| value.get("pasteImg").and_then(Value::as_str))
             .unwrap_or("");
-        decode_base64_image(payload).ok()
+        if payload.trim().is_empty() {
+            (None, PastedImageStatus::Missing)
+        } else {
+            match decode_base64_image(payload) {
+                Ok(bytes) => (Some(bytes), PastedImageStatus::Applied),
+                Err(status) => (None, status),
+            }
+        }
     } else {
-        None
+        (None, PastedImageStatus::NotRequested)
     };
 
     Ok(ImageTranslationResult {
@@ -99,6 +100,7 @@ pub(in crate::translation) fn parse_baidu_image_translation_response(
         translated_full_text,
         blocks,
         pasted_image,
+        pasted_image_status,
     })
 }
 
@@ -237,20 +239,22 @@ fn normalize_pixel_bbox(raw_bbox: [f32; 4], image_width: u32, image_height: u32)
     ]
 }
 
-fn decode_base64_image(payload: &str) -> Result<Vec<u8>> {
+fn decode_base64_image(payload: &str) -> std::result::Result<Vec<u8>, PastedImageStatus> {
     let trimmed = payload.trim();
     if trimmed.is_empty() {
-        bail!("empty pasted image payload");
+        return Err(PastedImageStatus::Missing);
     }
     let encoded = trimmed
         .split_once(',')
         .map(|(_, tail)| tail)
         .unwrap_or(trimmed)
         .trim();
-    general_purpose::STANDARD
+    let bytes = general_purpose::STANDARD
         .decode(encoded)
         .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(encoded))
-        .context("invalid base64 pasted image")
+        .map_err(|_| PastedImageStatus::InvalidBase64)?;
+    image::load_from_memory(&bytes).map_err(|_| PastedImageStatus::InvalidImage)?;
+    Ok(bytes)
 }
 
 pub(in crate::translation) fn parse_single_translation_content(content: &str) -> Result<String> {
@@ -505,6 +509,7 @@ fn strip_line_prefix(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn parse_single_prefers_plain_text() {
         let text = parse_single_translation_content("你好世界").expect("single parse");
@@ -539,23 +544,39 @@ mod tests {
         assert_eq!(bbox, [0.1975, 0.115, 0.8125, 0.33]);
     }
 
+    fn valid_png_base64() -> String {
+        use base64::{Engine as _, engine::general_purpose};
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+        use std::io::Cursor;
+
+        let image = RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255]));
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode png");
+        general_purpose::STANDARD.encode(bytes)
+    }
+
     #[test]
     fn parse_baidu_translation_response_uses_blocks_and_paste_img() {
-        let body = r#"{
-  "data": {
+        let body = format!(
+            r#"{{
+  "data": {{
     "sumSrc": "Grounding-DINO",
     "sumDst": "Grounding-DINO（译）",
-    "pasteImg": "aGVsbG8=",
+    "pasteImg": "{}",
     "content": [
-      {
+      {{
         "src": "Overview",
         "dst": "概述",
         "rect": "10 20 30 40"
-      }
+      }}
     ]
-  }
-}"#;
-        let result = parse_baidu_image_translation_response(body, 200, 100, true)
+  }}
+}}"#,
+            &valid_png_base64()
+        );
+        let result = parse_baidu_image_translation_response(&body, 200, 100, true)
             .expect("parse baidu response");
         assert_eq!(result.source_full_text, "Grounding-DINO");
         assert_eq!(result.translated_full_text, "Grounding-DINO（译）");
@@ -563,32 +584,85 @@ mod tests {
         assert_eq!(result.blocks[0].source_text, "Overview");
         assert_eq!(result.blocks[0].translated_text, "概述");
         assert_eq!(result.blocks[0].bbox_norm, [0.05, 0.2, 0.2, 0.6]);
-        assert_eq!(result.pasted_image.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(result.pasted_image_status, PastedImageStatus::Applied);
+        assert!(result.pasted_image.is_some());
     }
 
     #[test]
-    fn parse_baidu_translation_response_falls_back_to_joined_text() {
+    fn parse_baidu_translation_response_reports_missing_paste_img() {
         let body = r#"{
   "data": {
     "content": [
       {
         "src": "A",
         "dst": "甲",
-        "points": [[0, 0], [20, 0], [20, 10], [0, 10]]
-      },
-      {
-        "src": "B",
-        "dst": "乙",
-        "rect": [30, 10, 20, 20]
+        "rect": [0, 0, 20, 10]
       }
     ]
   }
 }"#;
-        let result = parse_baidu_image_translation_response(body, 100, 100, false)
+        let result = parse_baidu_image_translation_response(body, 100, 100, true)
+            .expect("parse baidu response");
+        assert_eq!(result.pasted_image_status, PastedImageStatus::Missing);
+        assert!(result.pasted_image.is_none());
+    }
+
+    #[test]
+    fn parse_baidu_translation_response_reports_invalid_base64_paste_img() {
+        let body = r#"{
+  "data": {
+    "pasteImg": "!!!",
+    "content": []
+  }
+}"#;
+        let result = parse_baidu_image_translation_response(body, 100, 100, true)
+            .expect("parse baidu response");
+        assert_eq!(result.pasted_image_status, PastedImageStatus::InvalidBase64);
+        assert!(result.pasted_image.is_none());
+    }
+
+    #[test]
+    fn parse_baidu_translation_response_reports_invalid_image_paste_img() {
+        let body = r#"{
+  "data": {
+    "pasteImg": "aGVsbG8=",
+    "content": []
+  }
+}"#;
+        let result = parse_baidu_image_translation_response(body, 100, 100, true)
+            .expect("parse baidu response");
+        assert_eq!(result.pasted_image_status, PastedImageStatus::InvalidImage);
+        assert!(result.pasted_image.is_none());
+    }
+
+    #[test]
+    fn parse_baidu_translation_response_ignores_paste_img_when_not_requested() {
+        let body = format!(
+            r#"{{
+  "data": {{
+    "pasteImg": "{}",
+    "content": [
+      {{
+        "src": "A",
+        "dst": "甲",
+        "points": [[0, 0], [20, 0], [20, 10], [0, 10]]
+      }},
+      {{
+        "src": "B",
+        "dst": "乙",
+        "rect": [30, 10, 20, 20]
+      }}
+    ]
+  }}
+}}"#,
+            &valid_png_base64()
+        );
+        let result = parse_baidu_image_translation_response(&body, 100, 100, false)
             .expect("parse baidu response");
         assert_eq!(result.source_full_text, "A\nB");
         assert_eq!(result.translated_full_text, "甲\n乙");
         assert_eq!(result.blocks.len(), 2);
+        assert_eq!(result.pasted_image_status, PastedImageStatus::NotRequested);
         assert!(result.pasted_image.is_none());
     }
 }

@@ -482,6 +482,7 @@ impl OverlayState {
                 translated_full_text,
                 blocks,
                 translated_image,
+                pasted_image_status,
                 selection,
             } => {
                 self.ocr_full_text = source_full_text;
@@ -510,10 +511,22 @@ impl OverlayState {
                     }
                 }
                 self.ocr_selected_block = None;
-                self.ocr_status = Some(if self.translated_selection_image.is_some() {
-                    "翻译完成：已使用接口返回的译图".to_string()
-                } else {
-                    format!("翻译完成：生成 {} 个文本块译文", self.ocr_blocks.len())
+                self.ocr_status = Some(match pasted_image_status {
+                    translation::PastedImageStatus::Applied => {
+                        "翻译完成：已使用接口返回的译图".to_string()
+                    }
+                    translation::PastedImageStatus::Missing => {
+                        "翻译完成：接口未返回 pasteImg，已回退为文本块渲染".to_string()
+                    }
+                    translation::PastedImageStatus::InvalidBase64 => {
+                        "翻译完成：pasteImg 解码失败，已回退为文本块渲染".to_string()
+                    }
+                    translation::PastedImageStatus::InvalidImage => {
+                        "翻译完成：pasteImg 图像无效，已回退为文本块渲染".to_string()
+                    }
+                    translation::PastedImageStatus::NotRequested => {
+                        format!("翻译完成：生成 {} 个文本块译文", self.ocr_blocks.len())
+                    }
                 });
             }
             TranslationWorkerResult::Failure(error) => {

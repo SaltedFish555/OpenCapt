@@ -24,12 +24,22 @@ pub struct TranslationBlock {
     pub bbox_norm: [f32; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastedImageStatus {
+    NotRequested,
+    Applied,
+    Missing,
+    InvalidBase64,
+    InvalidImage,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageTranslationResult {
     pub source_full_text: String,
     pub translated_full_text: String,
     pub blocks: Vec<TranslationBlock>,
     pub pasted_image: Option<Vec<u8>>,
+    pub pasted_image_status: PastedImageStatus,
 }
 
 pub trait TranslationProvider {
