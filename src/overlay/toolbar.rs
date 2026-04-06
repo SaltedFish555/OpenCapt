@@ -29,6 +29,7 @@ pub(super) fn paint_toolbar(state: &mut OverlayState) {
         }
     }
     paint_ocr_status(state);
+    paint_toolbar_tooltip(state);
 }
 
 pub(super) fn paint_toolbar_item(state: &mut OverlayState, item: ToolbarItem) {
@@ -321,4 +322,149 @@ pub(super) fn paint_svg_toolbar_icon(
         color,
     );
     true
+}
+
+fn paint_toolbar_tooltip(state: &mut OverlayState) {
+    let Some(item) = hovered_toolbar_item(state) else {
+        return;
+    };
+    let Some(text) = toolbar_action_tooltip_text(state, item.action) else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let style = ShapeStyle {
+        color: TOOLBAR_TEXT,
+        stroke: 15,
+    };
+    let metrics = measure_text_layout_styled(&text, style, false, false, TextFontFamily::DengXian)
+        .unwrap_or_else(|| {
+            fallback_text_metrics_styled(&text, style, false, false, TextFontFamily::DengXian)
+        });
+
+    let padding_x = 10;
+    let padding_y = 6;
+    let panel_width = (metrics.max_width + padding_x * 2).clamp(84, 320);
+    let panel_height = (metrics.total_height + padding_y * 2).clamp(28, 42);
+    let tooltip_gap = 10;
+    let max_left = (state.target.width as i32 - panel_width - WINDOW_MARGIN).max(WINDOW_MARGIN);
+    let mut left =
+        ((item.rect.left + item.rect.right) / 2 - panel_width / 2).clamp(WINDOW_MARGIN, max_left);
+    let prefer_top = item.rect.top - tooltip_gap - panel_height;
+    let top = if prefer_top >= WINDOW_MARGIN {
+        prefer_top
+    } else {
+        (item.rect.bottom + tooltip_gap)
+            .min((state.target.height as i32 - panel_height - WINDOW_MARGIN).max(WINDOW_MARGIN))
+    };
+    left = left.clamp(WINDOW_MARGIN, max_left);
+
+    let panel = IntRect {
+        left,
+        top,
+        right: left + panel_width,
+        bottom: top + panel_height,
+    };
+
+    fill_rounded_rect(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        panel,
+        10,
+        0xE8_0F1725,
+    );
+    stroke_rounded_rect(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        panel,
+        10,
+        0x55_FFFFFF,
+    );
+    draw_gdi_text_centered_styled(
+        &mut state.frame,
+        state.target.width,
+        state.target.height,
+        CursorPoint {
+            x: (panel.left + panel.right) / 2,
+            y: (panel.top + panel.bottom) / 2,
+        },
+        &text,
+        15,
+        TOOLBAR_TEXT,
+        false,
+        false,
+        TextFontFamily::DengXian,
+    );
+}
+
+fn hovered_toolbar_item(state: &OverlayState) -> Option<ToolbarItem> {
+    if let Some(layout) = state.text_dropdown_layout() {
+        if let Some(item) = layout
+            .items
+            .into_iter()
+            .find(|item| item.rect.contains(state.last_cursor))
+        {
+            return Some(item);
+        }
+    }
+    let layout = state.toolbar_layout()?;
+    layout
+        .items
+        .into_iter()
+        .find(|item| item.rect.contains(state.last_cursor))
+}
+
+fn toolbar_action_tooltip_text(state: &OverlayState, action: ToolbarAction) -> Option<String> {
+    match action {
+        ToolbarAction::MouseTool => Some("鼠标：默认安全模式，不进行标注".to_string()),
+        ToolbarAction::SelectTool => Some("选择：选中并调整已有标注".to_string()),
+        ToolbarAction::RectangleTool => Some("矩形：绘制矩形标注".to_string()),
+        ToolbarAction::EllipseTool => Some("椭圆：绘制椭圆标注".to_string()),
+        ToolbarAction::LineTool => Some("直线：绘制直线标注".to_string()),
+        ToolbarAction::ArrowTool => Some("箭头：绘制箭头标注".to_string()),
+        ToolbarAction::MosaicTool => Some("马赛克：对区域打码".to_string()),
+        ToolbarAction::TextTool => Some("文字：添加或编辑文字标注".to_string()),
+        ToolbarAction::NumberTool => Some("序号：添加编号标注".to_string()),
+        ToolbarAction::OcrRun => Some("OCR：识别当前选区文字".to_string()),
+        ToolbarAction::TranslateRun => Some("翻译：翻译当前选区内容".to_string()),
+        ToolbarAction::OcrCopyAll => Some("复制全文：复制 OCR 或翻译结果".to_string()),
+        ToolbarAction::TextBoldToggle => Some("加粗：切换文字粗体".to_string()),
+        ToolbarAction::TextItalicToggle => Some("斜体：切换文字斜体".to_string()),
+        ToolbarAction::TextFontDropdown => Some("字体：选择文字字体".to_string()),
+        ToolbarAction::TextSizeDropdown => Some("字号：选择文字大小".to_string()),
+        ToolbarAction::TextFontOption(font_family) => {
+            Some(format!("字体选项：{}", font_face_label(font_family)))
+        }
+        ToolbarAction::TextSizeOption(size) => Some(format!("字号选项：{}", size)),
+        ToolbarAction::Color(index) => Some(color_tooltip_text(index).to_string()),
+        ToolbarAction::StyleControl => Some(style_control_tooltip_text(state).to_string()),
+        ToolbarAction::Undo => Some("撤销：回退上一步操作".to_string()),
+        ToolbarAction::Pin => Some("贴图：将当前选区固定到桌面".to_string()),
+        ToolbarAction::Confirm => Some("完成：复制并保存当前截图".to_string()),
+        ToolbarAction::Cancel => Some("取消：放弃当前截图".to_string()),
+    }
+}
+
+fn color_tooltip_text(index: usize) -> &'static str {
+    match index {
+        0 => "颜色：红色",
+        1 => "颜色：橙色",
+        2 => "颜色：黄色",
+        3 => "颜色：绿色",
+        4 => "颜色：蓝色",
+        _ => "颜色",
+    }
+}
+
+fn style_control_tooltip_text(state: &OverlayState) -> &'static str {
+    match state.style_control_target() {
+        StyleControlTarget::Stroke => "样式：调整线宽",
+        StyleControlTarget::Mosaic => "样式：调整马赛克块大小",
+        StyleControlTarget::Text => "样式：调整文字大小",
+        StyleControlTarget::Badge => "样式：调整序号大小",
+    }
 }
