@@ -126,6 +126,27 @@ pub(super) fn handle_mouse_move(hwnd: HWND, state: &mut OverlayState, point: Cur
     }
 }
 
+pub(super) fn handle_right_click(
+    hwnd: HWND,
+    state: &mut OverlayState,
+    _point: CursorPoint,
+) -> bool {
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    match state.mode {
+        OverlayMode::Selecting => {
+            finish_with_signal(hwnd, state, OverlaySignal::Cancelled);
+            true
+        }
+        OverlayMode::Annotating => {
+            cancel_text_input(state);
+            state.step_back_to_selecting();
+            false
+        }
+    }
+}
+
 pub(super) fn handle_mouse_down(hwnd: HWND, state: &mut OverlayState, point: CursorPoint) -> bool {
     match state.mode {
         OverlayMode::Selecting => {
@@ -323,23 +344,13 @@ pub(super) fn handle_mouse_up(hwnd: HWND, state: &mut OverlayState, point: Curso
                 } else {
                     rect
                 };
-                state.mode = OverlayMode::Annotating;
-                state.selection = Some(NormalizedRect::from_selection_rect(selected_rect));
-                state.hover_selection = None;
-                state.tool = AnnotationTool::Mouse;
-                state.draft = None;
-                state.text_input = None;
-                state.selected_shape = None;
+                state.enter_annotating_for_selection(NormalizedRect::from_selection_rect(
+                    selected_rect,
+                ));
                 return false;
             }
             if let Some(hover) = state.hover_selection {
-                state.mode = OverlayMode::Annotating;
-                state.selection = Some(hover);
-                state.hover_selection = None;
-                state.tool = AnnotationTool::Mouse;
-                state.draft = None;
-                state.text_input = None;
-                state.selected_shape = None;
+                state.enter_annotating_for_selection(hover);
                 return false;
             }
             finish_with_signal(hwnd, state, OverlaySignal::Cancelled);

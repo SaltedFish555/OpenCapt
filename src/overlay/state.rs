@@ -82,6 +82,47 @@ impl OverlayState {
             .unwrap_or(0)
             .saturating_add(1);
     }
+    pub(super) fn clear_selection_bound_content(&mut self) {
+        self.ocr_blocks.clear();
+        self.ocr_full_text.clear();
+        self.translated_full_text.clear();
+        self.translated_selection_image = None;
+        self.ocr_selected_block = None;
+        self.ocr_status = None;
+        self.draft = None;
+        self.text_input = None;
+        self.selected_shape = None;
+    }
+
+    pub(super) fn enter_annotating_for_selection(&mut self, selection: NormalizedRect) {
+        if self.selection != Some(selection) {
+            self.clear_selection_bound_content();
+        } else {
+            self.draft = None;
+            self.text_input = None;
+            self.selected_shape = None;
+            self.ocr_selected_block = None;
+        }
+        self.mode = OverlayMode::Annotating;
+        self.selection = Some(selection);
+        self.hover_selection = None;
+        self.uia_hover_selection = None;
+        self.tool = AnnotationTool::Mouse;
+        self.open_text_dropdown = None;
+        self.active_drag = None;
+    }
+
+    pub(super) fn step_back_to_selecting(&mut self) {
+        self.mode = OverlayMode::Selecting;
+        self.hover_selection = self.selection;
+        self.uia_hover_selection = None;
+        self.tool = AnnotationTool::Mouse;
+        self.draft = None;
+        self.selected_shape = None;
+        self.ocr_selected_block = None;
+        self.open_text_dropdown = None;
+        self.active_drag = None;
+    }
 
     pub(super) fn rebuild_base_frames(&mut self) {
         self.dimmed_frame = dimmed_opaque_frame_from_image(&self.target.background);
