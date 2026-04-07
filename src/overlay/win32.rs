@@ -194,6 +194,20 @@ pub(super) unsafe extern "system" fn overlay_wndproc(
             }
             LRESULT(0)
         }
+        WM_RBUTTONDOWN => {
+            if let Some(state) = overlay_state(hwnd) {
+                let point = point_from_lparam(lparam).clamp(
+                    state.target.width.saturating_sub(1) as i32,
+                    state.target.height.saturating_sub(1) as i32,
+                );
+                state.last_cursor = point;
+                if !handle_right_click(hwnd, state, point) {
+                    let _ = render_overlay(hwnd, state);
+                }
+                update_overlay_cursor(state);
+            }
+            LRESULT(0)
+        }
         WM_CHAR => {
             if let Some(state) = overlay_state(hwnd) {
                 if !handle_char_input(state, wparam.0 as u16) {

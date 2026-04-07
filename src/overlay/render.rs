@@ -112,6 +112,7 @@ pub(super) fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()>
         paint_toolbar(state);
     } else {
         state.frame.copy_from_slice(&state.dimmed_frame);
+        let saved_selection = state.selection.and_then(NormalizedRect::to_selection_rect);
         if let Some(selection) = preview_selection {
             restore_selection_region_from_image(
                 &state.target.background,
@@ -119,6 +120,39 @@ pub(super) fn render_overlay(hwnd: HWND, state: &mut OverlayState) -> Result<()>
                 state.target.width,
                 selection,
             );
+        }
+        if let Some(saved_selection) = saved_selection {
+            if preview_selection != Some(saved_selection) {
+                restore_selection_region_from_image(
+                    &state.target.background,
+                    &mut state.frame,
+                    state.target.width,
+                    saved_selection,
+                );
+            }
+            if let Some(translated_image) = state.translated_selection_image.as_ref() {
+                blit_rgba_image_to_frame(
+                    &mut state.frame,
+                    state.target.width,
+                    state.target.height,
+                    saved_selection.x,
+                    saved_selection.y,
+                    translated_image,
+                );
+            }
+            for shape in &state.shapes {
+                draw_shape_image(
+                    &mut state.frame,
+                    state.target.width,
+                    state.target.height,
+                    shape,
+                );
+            }
+            if state.translated_selection_image.is_none() {
+                paint_ocr_blocks(state);
+            }
+        }
+        if let Some(selection) = preview_selection {
             let norm_rect = NormalizedRect::from_selection_rect(selection);
             draw_selection_frame(state, norm_rect);
         }
