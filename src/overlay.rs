@@ -142,6 +142,7 @@ pub struct PinnedCapture {
 pub enum OverlaySignal {
     Completed(RgbaImage),
     Pinned(PinnedCapture),
+    TextCopied,
     Cancelled,
 }
 
@@ -433,6 +434,7 @@ struct OverlayState {
     ocr_blocks: Vec<OcrOverlayBlock>,
     ocr_full_text: String,
     translated_full_text: String,
+    full_text_kind: Option<FullTextKind>,
     translated_selection_image: Option<RgbaImage>,
     ocr_selected_block: Option<usize>,
     ocr_running: bool,
@@ -474,6 +476,28 @@ enum TranslationWorkerResult {
         selection: NormalizedRect,
     },
     Failure(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullTextKind {
+    Ocr,
+    Translation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FullTextCopyPolicy {
+    copy_on_completion: bool,
+    exit_after_copy: bool,
+}
+
+impl FullTextCopyPolicy {
+    fn should_copy_on_completion(self) -> bool {
+        self.copy_on_completion
+    }
+
+    fn should_exit(self, copy_succeeded: bool) -> bool {
+        copy_succeeded && self.exit_after_copy
+    }
 }
 
 struct LayeredSurface {
@@ -531,6 +555,7 @@ impl OverlaySession {
             ocr_blocks: Vec::new(),
             ocr_full_text: String::new(),
             translated_full_text: String::new(),
+            full_text_kind: None,
             translated_selection_image: None,
             ocr_selected_block: None,
             ocr_running: false,
@@ -963,6 +988,39 @@ mod tests {
         let multi = text_bounds(CursorPoint { x: 10, y: 10 }, "Hello\nWorld", style);
         assert!(multi.height() > single.height());
     }
+
+    #[test]
+    fn full_text_copy_policy_links_copy_and_exit_independently() {
+        let manual_exit = FullTextCopyPolicy {
+            copy_on_completion: false,
+            exit_after_copy: true,
+        };
+        assert!(!manual_exit.should_copy_on_completion());
+        assert!(manual_exit.should_exit(true));
+        assert!(!manual_exit.should_exit(false));
+
+        let automatic_stay = FullTextCopyPolicy {
+            copy_on_completion: true,
+            exit_after_copy: false,
+        };
+        assert!(automatic_stay.should_copy_on_completion());
+        assert!(!automatic_stay.should_exit(true));
+
+        let automatic_exit = FullTextCopyPolicy {
+            copy_on_completion: true,
+            exit_after_copy: true,
+        };
+        assert!(automatic_exit.should_copy_on_completion());
+        assert!(automatic_exit.should_exit(true));
+
+        let manual_stay = FullTextCopyPolicy {
+            copy_on_completion: false,
+            exit_after_copy: false,
+        };
+        assert!(!manual_stay.should_copy_on_completion());
+        assert!(!manual_stay.should_exit(true));
+    }
+
     #[test]
     fn preview_composition_restores_selection_pixels() {
         let source = vec![0x112233, 0x445566, 0x778899, 0xaabbcc];

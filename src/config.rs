@@ -24,8 +24,12 @@ mod tests {
         assert_eq!(config.annotation_defaults.default_color_index, 4);
         assert_eq!(config.pin_defaults.opacity_percent, 100);
         assert!(!config.ocr.enabled);
+        assert!(!config.ocr.auto_copy_full_text);
+        assert!(config.ocr.auto_exit_after_copy);
         assert_eq!(config.ocr.request_timeout_ms, OCR_TIMEOUT_DEFAULT_MS);
         assert!(!config.translation.enabled);
+        assert!(!config.translation.auto_copy_full_text);
+        assert!(config.translation.auto_exit_after_copy);
         assert_eq!(
             config.translation.request_timeout_ms,
             TRANSLATION_TIMEOUT_DEFAULT_MS
@@ -46,6 +50,8 @@ mod tests {
             bbox_scale_mode: OcrBboxScaleMode::ZeroTo1000,
         });
         config.ocr.enabled = true;
+        config.ocr.auto_copy_full_text = true;
+        config.ocr.auto_exit_after_copy = false;
         config.ocr.default_profile_id = "default".to_string();
 
         config.translation.profiles.push(TranslationProfile {
@@ -63,6 +69,8 @@ mod tests {
             use_translated_image: false,
         });
         config.translation.enabled = true;
+        config.translation.auto_copy_full_text = true;
+        config.translation.auto_exit_after_copy = false;
         config.translation.default_profile_id = "tr_default".to_string();
 
         let serialized = toml::to_string_pretty(&config).expect("serialize config");
@@ -91,6 +99,10 @@ save_dir = "C:\\Shots"
             parsed.annotation_defaults.text_font_family,
             TextFontFamily::YaHei
         );
+        assert!(!parsed.ocr.auto_copy_full_text);
+        assert!(parsed.ocr.auto_exit_after_copy);
+        assert!(!parsed.translation.auto_copy_full_text);
+        assert!(parsed.translation.auto_exit_after_copy);
     }
 
     #[test]
@@ -110,6 +122,10 @@ hotkey = "Alt+Shift+S"
             parsed.annotation_defaults.stroke_width,
             DEFAULT_STROKE_WIDTH
         );
+        assert!(!parsed.ocr.auto_copy_full_text);
+        assert!(parsed.ocr.auto_exit_after_copy);
+        assert!(!parsed.translation.auto_copy_full_text);
+        assert!(parsed.translation.auto_exit_after_copy);
     }
 
     #[test]

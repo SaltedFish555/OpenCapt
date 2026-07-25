@@ -64,6 +64,8 @@ struct PinDefaultsCompat {
 #[serde(default)]
 struct OcrConfigCompat {
     enabled: Option<bool>,
+    auto_copy_full_text: Option<bool>,
+    auto_exit_after_copy: Option<bool>,
     default_profile_id: Option<String>,
     request_timeout_ms: Option<u64>,
     profiles: Option<Vec<OcrProfile>>,
@@ -73,6 +75,8 @@ struct OcrConfigCompat {
 #[serde(default)]
 struct TranslationConfigCompat {
     enabled: Option<bool>,
+    auto_copy_full_text: Option<bool>,
+    auto_exit_after_copy: Option<bool>,
     default_profile_id: Option<String>,
     request_timeout_ms: Option<u64>,
     profiles: Option<Vec<TranslationProfile>>,
@@ -182,6 +186,12 @@ fn apply_ocr(target: &mut OcrConfig, value: OcrConfigCompat) {
     if let Some(enabled) = value.enabled {
         target.enabled = enabled;
     }
+    if let Some(auto_copy_full_text) = value.auto_copy_full_text {
+        target.auto_copy_full_text = auto_copy_full_text;
+    }
+    if let Some(auto_exit_after_copy) = value.auto_exit_after_copy {
+        target.auto_exit_after_copy = auto_exit_after_copy;
+    }
     if let Some(default_profile_id) = value.default_profile_id {
         target.default_profile_id = default_profile_id;
     }
@@ -196,6 +206,12 @@ fn apply_ocr(target: &mut OcrConfig, value: OcrConfigCompat) {
 fn apply_translation(target: &mut TranslationConfig, value: TranslationConfigCompat) {
     if let Some(enabled) = value.enabled {
         target.enabled = enabled;
+    }
+    if let Some(auto_copy_full_text) = value.auto_copy_full_text {
+        target.auto_copy_full_text = auto_copy_full_text;
+    }
+    if let Some(auto_exit_after_copy) = value.auto_exit_after_copy {
+        target.auto_exit_after_copy = auto_exit_after_copy;
     }
     if let Some(default_profile_id) = value.default_profile_id {
         target.default_profile_id = default_profile_id;

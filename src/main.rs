@@ -7,6 +7,7 @@ mod hotkey;
 mod icons;
 mod logging;
 mod memory;
+mod notification;
 mod ocr;
 mod output;
 mod overlay;

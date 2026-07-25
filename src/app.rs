@@ -2,7 +2,7 @@ use crate::{
     StartupMode, capture,
     config::{AppConfig, AppPaths},
     hotkey::RegisteredHotkey,
-    memory, output,
+    memory, notification, output,
     overlay::{OverlaySession, OverlaySignal, PinnedCapture},
     pin::PinWindow,
     settings, startup,
@@ -383,6 +383,15 @@ impl App {
                 self.release_overlay();
                 self.finish_capture(image);
                 memory::trim_working_set();
+                self.state = AppState::Idle;
+            }
+            OverlaySignal::TextCopied => {
+                self.release_overlay();
+                if let Err(error) = notification::show_copy_success() {
+                    warn!(?error, "failed to show copy success notification");
+                }
+                memory::trim_working_set();
+                info!("full text copied and overlay closed");
                 self.state = AppState::Idle;
             }
             OverlaySignal::Pinned(capture) => {

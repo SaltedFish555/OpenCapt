@@ -3,6 +3,17 @@ use super::super::*;
 pub(in crate::settings) fn page_translation(app: &mut SettingsApp, ui: &mut egui::Ui) {
     section_card(ui, "翻译总开关与请求超时", |ui| {
         ui.checkbox(&mut app.draft.translation.enabled, "启用翻译");
+        ui.checkbox(
+            &mut app.draft.translation.auto_copy_full_text,
+            "翻译后自动复制全文",
+        );
+        ui.checkbox(
+            &mut app.draft.translation.auto_exit_after_copy,
+            "复制全文后自动退出截图",
+        );
+        ui.label(label_text(
+            "自动退出同时适用于自动复制和手动点击“复制全文”；复制成功后退出并显示提示。",
+        ));
         ui.add_sized(
             [420.0, 0.0],
             egui::Slider::new(

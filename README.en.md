@@ -11,8 +11,8 @@ The project is already usable for daily work. It does not expose a traditional m
 - Capture: global hotkey, region selection, cancel, multi-monitor support, DPI-aware coordinates, auto copy, auto save
 - Annotation: move selection, 8 resize handles, rectangle, ellipse, line, arrow, mosaic, text, numbered markers, undo
 - Pin windows: multiple pinned images, drag, wheel zoom, context menu, always-on-top, border/shadow, opacity
-- OCR: OpenAI Compatible OCR, Baidu OCR, block overlay, click-to-copy, copy full text
-- Translation: OpenAI Compatible translation, Baidu image translation, block overlay, direct pasted translated image
+- OCR: OpenAI Compatible OCR, Baidu OCR, block overlay, click-to-copy, copy full text, auto-copy on completion
+- Translation: OpenAI Compatible translation, Baidu image translation, block overlay, direct pasted translated image, auto-copy on completion
 - Settings: General / Annotation / Pin / OCR / Translation pages with hotkey, defaults, model management, launch at startup
 
 ## Quick Start

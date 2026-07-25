@@ -247,6 +247,8 @@ pub struct OcrProfile {
 #[serde(default)]
 pub struct OcrConfig {
     pub enabled: bool,
+    pub auto_copy_full_text: bool,
+    pub auto_exit_after_copy: bool,
     pub default_profile_id: String,
     pub request_timeout_ms: u64,
     pub profiles: Vec<OcrProfile>,
@@ -276,6 +278,8 @@ pub struct TranslationProfile {
 #[serde(default)]
 pub struct TranslationConfig {
     pub enabled: bool,
+    pub auto_copy_full_text: bool,
+    pub auto_exit_after_copy: bool,
     pub default_profile_id: String,
     pub request_timeout_ms: u64,
     pub profiles: Vec<TranslationProfile>,
@@ -333,6 +337,8 @@ impl Default for OcrConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto_copy_full_text: false,
+            auto_exit_after_copy: true,
             default_profile_id: String::new(),
             request_timeout_ms: OCR_TIMEOUT_DEFAULT_MS,
             profiles: Vec::new(),
@@ -344,6 +350,8 @@ impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto_copy_full_text: false,
+            auto_exit_after_copy: true,
             default_profile_id: String::new(),
             request_timeout_ms: TRANSLATION_TIMEOUT_DEFAULT_MS,
             profiles: Vec::new(),

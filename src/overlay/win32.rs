@@ -230,17 +230,23 @@ pub(super) unsafe extern "system" fn overlay_wndproc(
         }
         WM_APP_OCR_READY => {
             if let Some(state) = overlay_state(hwnd) {
-                state.consume_ocr_worker_result();
-                let _ = render_overlay(hwnd, state);
-                update_overlay_cursor(state);
+                if state.consume_ocr_worker_result() {
+                    finish_with_signal(hwnd, state, OverlaySignal::TextCopied);
+                } else {
+                    let _ = render_overlay(hwnd, state);
+                    update_overlay_cursor(state);
+                }
             }
             LRESULT(0)
         }
         WM_APP_TRANSLATION_READY => {
             if let Some(state) = overlay_state(hwnd) {
-                state.consume_translation_worker_result();
-                let _ = render_overlay(hwnd, state);
-                update_overlay_cursor(state);
+                if state.consume_translation_worker_result() {
+                    finish_with_signal(hwnd, state, OverlaySignal::TextCopied);
+                } else {
+                    let _ = render_overlay(hwnd, state);
+                    update_overlay_cursor(state);
+                }
             }
             LRESULT(0)
         }

@@ -26,6 +26,7 @@ pub(super) fn handle_mouse_move(hwnd: HWND, state: &mut OverlayState, point: Cur
                 state.ocr_selected_block = None;
                 state.ocr_full_text.clear();
                 state.translated_full_text.clear();
+                state.full_text_kind = None;
                 state.translated_selection_image = None;
                 state.ocr_status = Some("选区已调整，请重新执行 OCR/翻译".to_string());
             }
@@ -41,6 +42,7 @@ pub(super) fn handle_mouse_move(hwnd: HWND, state: &mut OverlayState, point: Cur
                 state.ocr_selected_block = None;
                 state.ocr_full_text.clear();
                 state.translated_full_text.clear();
+                state.full_text_kind = None;
                 state.translated_selection_image = None;
                 state.ocr_status = Some("选区已调整，请重新执行 OCR/翻译".to_string());
             }
@@ -746,22 +748,9 @@ pub(super) fn handle_toolbar_action(
             start_translation_request(hwnd, state);
         }
         ToolbarAction::OcrCopyAll => {
-            let is_translated = !state.translated_full_text.trim().is_empty();
-            let text = if is_translated {
-                state.translated_full_text.as_str()
-            } else {
-                state.ocr_full_text.as_str()
-            };
-            if !text.trim().is_empty() {
-                if let Err(error) = copy_text_to_clipboard(text) {
-                    state.ocr_status = Some(format!("复制文本失败: {}", error));
-                } else if is_translated {
-                    state.ocr_status = Some("已复制全部翻译文本".to_string());
-                } else {
-                    state.ocr_status = Some("已复制全部 OCR 文本".to_string());
-                }
-            } else {
-                state.ocr_status = Some("暂无文本可复制".to_string());
+            if state.copy_current_full_text() {
+                finish_with_signal(hwnd, state, OverlaySignal::TextCopied);
+                return true;
             }
         }
         ToolbarAction::StyleControl => {}

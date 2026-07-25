@@ -112,6 +112,14 @@ Characteristics:
 - it displays the translated image returned by Baidu
 - this is closer to image-level translation replacement
 
+## Copy Full Text and Auto Exit
+
+The OCR and Translation settings pages each provide “auto-copy full text on completion” and
+“exit capture after copying full text.” Auto-copy defaults to off, while auto-exit defaults to on.
+The options are independent: with auto-copy disabled, manually choosing “Copy full text” still
+closes the overlay after a successful clipboard write. A short “Copy successful” notification then
+appears at the bottom of the current display. Missing text or clipboard errors keep the overlay open.
+
 ## Why Provider Layering Matters
 
 OCR and translation protocols differ a lot:

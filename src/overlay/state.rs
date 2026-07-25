@@ -42,6 +42,7 @@ impl OverlayState {
         self.ocr_blocks.clear();
         self.ocr_full_text.clear();
         self.translated_full_text.clear();
+        self.full_text_kind = None;
         self.translated_selection_image = None;
         self.ocr_selected_block = None;
         self.ocr_running = false;
@@ -86,6 +87,7 @@ impl OverlayState {
         self.ocr_blocks.clear();
         self.ocr_full_text.clear();
         self.translated_full_text.clear();
+        self.full_text_kind = None;
         self.translated_selection_image = None;
         self.ocr_selected_block = None;
         self.ocr_status = None;
@@ -451,15 +453,70 @@ impl OverlayState {
             .map(|(index, _)| index)
     }
 
-    pub(super) fn consume_ocr_worker_result(&mut self) {
+    fn full_text_copy_policy(&self, kind: FullTextKind) -> FullTextCopyPolicy {
+        match kind {
+            FullTextKind::Ocr => FullTextCopyPolicy {
+                copy_on_completion: self.ocr_config.auto_copy_full_text,
+                exit_after_copy: self.ocr_config.auto_exit_after_copy,
+            },
+            FullTextKind::Translation => FullTextCopyPolicy {
+                copy_on_completion: self.translation_config.auto_copy_full_text,
+                exit_after_copy: self.translation_config.auto_exit_after_copy,
+            },
+        }
+    }
+
+    fn copy_full_text(&mut self, kind: FullTextKind) -> bool {
+        let policy = self.full_text_copy_policy(kind);
+        let (text, success_message) = match kind {
+            FullTextKind::Ocr => (self.ocr_full_text.as_str(), "已复制全部 OCR 文本"),
+            FullTextKind::Translation => (self.translated_full_text.as_str(), "已复制全部翻译文本"),
+        };
+
+        if text.trim().is_empty() {
+            self.ocr_status = Some("暂无文本可复制".to_string());
+            return false;
+        }
+
+        match copy_text_to_clipboard(text) {
+            Ok(()) => {
+                self.ocr_status = Some(success_message.to_string());
+                policy.should_exit(true)
+            }
+            Err(error) => {
+                self.ocr_status = Some(format!("复制文本失败: {}", error));
+                false
+            }
+        }
+    }
+
+    fn maybe_auto_copy_full_text(&mut self, kind: FullTextKind) -> bool {
+        if !self.full_text_copy_policy(kind).should_copy_on_completion() {
+            return false;
+        }
+        self.copy_full_text(kind)
+    }
+
+    pub(super) fn copy_current_full_text(&mut self) -> bool {
+        let kind = self.full_text_kind.unwrap_or_else(|| {
+            if self.translated_full_text.trim().is_empty() {
+                FullTextKind::Ocr
+            } else {
+                FullTextKind::Translation
+            }
+        });
+        self.copy_full_text(kind)
+    }
+
+    pub(super) fn consume_ocr_worker_result(&mut self) -> bool {
         let result = {
             let Ok(mut worker) = self.ocr_worker.lock() else {
-                return;
+                return false;
             };
             worker.take()
         };
         let Some(result) = result else {
-            return;
+            return false;
         };
 
         self.ocr_running = false;
@@ -467,6 +524,7 @@ impl OverlayState {
             OcrWorkerResult::Success { output, selection } => {
                 self.ocr_full_text = output.full_text;
                 self.translated_full_text.clear();
+                self.full_text_kind = Some(FullTextKind::Ocr);
                 self.translated_selection_image = None;
                 self.ocr_blocks.clear();
                 let width = selection.width().max(1) as f32;
@@ -493,6 +551,7 @@ impl OverlayState {
                 self.ocr_selected_block = None;
                 self.ocr_status =
                     Some(format!("OCR 完成：识别 {} 个文本块", self.ocr_blocks.len()));
+                return self.maybe_auto_copy_full_text(FullTextKind::Ocr);
             }
             OcrWorkerResult::Failure(error) => {
                 self.ocr_status = Some(format!("OCR 失败：{}", error));
@@ -500,20 +559,22 @@ impl OverlayState {
                 self.ocr_selected_block = None;
                 self.ocr_full_text.clear();
                 self.translated_full_text.clear();
+                self.full_text_kind = None;
                 self.translated_selection_image = None;
             }
         }
+        false
     }
 
-    pub(super) fn consume_translation_worker_result(&mut self) {
+    pub(super) fn consume_translation_worker_result(&mut self) -> bool {
         let result = {
             let Ok(mut worker) = self.translation_worker.lock() else {
-                return;
+                return false;
             };
             worker.take()
         };
         let Some(result) = result else {
-            return;
+            return false;
         };
 
         self.translation_running = false;
@@ -528,6 +589,7 @@ impl OverlayState {
             } => {
                 self.ocr_full_text = source_full_text;
                 self.translated_full_text = translated_full_text;
+                self.full_text_kind = Some(FullTextKind::Translation);
                 self.translated_selection_image = translated_image;
                 self.ocr_blocks.clear();
                 let width = selection.width().max(1) as f32;
@@ -569,13 +631,20 @@ impl OverlayState {
                         format!("翻译完成：生成 {} 个文本块译文", self.ocr_blocks.len())
                     }
                 });
+                return self.maybe_auto_copy_full_text(FullTextKind::Translation);
             }
             TranslationWorkerResult::Failure(error) => {
                 self.ocr_status = Some(format!("翻译失败：{}", error));
                 self.translated_full_text.clear();
+                self.full_text_kind = if self.ocr_full_text.trim().is_empty() {
+                    None
+                } else {
+                    Some(FullTextKind::Ocr)
+                };
                 self.translated_selection_image = None;
             }
         }
+        false
     }
     pub(super) fn bounds(&self) -> NormalizedRect {
         NormalizedRect {
